@@ -1,0 +1,8 @@
+{
+  "repository": "https://github.com/maxvyshniakov/straylight",
+  "commit": "6852fe43b0b056911f76dc02ddceb4e920ddf371",
+  "path": "tools/machine-slot",
+  "sha256": "e29c8a28582cba027af86bd6c937d169e73b73329a5ea3065a69bf5639f7eadb",
+  "tests_path": "tools/test-machine-slot.py",
+  "note": "Initial extraction preserves tool bytes. Tests only relocate the tool path."
+}

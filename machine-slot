@@ -1,0 +1,566 @@
+#!/usr/bin/env python3
+"""machine-slot: one queue of leases on the machine's capacity, shared by every project and agent (#599).
+
+  machine-slot run [-n N|all] [--label L] [--wait S] [--] COMMAND...   run COMMAND holding N slots (default 1)
+  machine-slot status                                                  holders and waiters, in queue order
+  machine-slot available                                               slots a new request gets at once
+  machine-slot advise [--max N] [--exclusive]                          a job count for the load, as JSON
+
+Run heavy builds and tests through `machine-slot run -n <k> -- ...`: a test suite or build that keeps the
+machine busy takes 1 to 2 slots, a full gate that must not share the machine takes `-n all`.
+
+Slots: one per three cores, at least one, so `total = max(1, cores // 3)`: 4 on a 12-core M2 Max.
+MACHINE_SLOT_TOTAL replaces the total, MACHINE_SLOT_CORES the core count. A request above the total takes
+every slot.
+
+Requests are served strictly in arrival order: an all-slot request at the head of the queue is not overtaken
+by later 1-slot requests. A process that already runs under a lease (MACHINE_SLOT_LEASE, or a holder among its
+ancestors) runs without a second lease, so nested wrappers neither deadlock nor count twice. A lease whose
+holder died (its pid gone, or reused by a process with another start time) is reaped by the next queue
+operation. While memory is short (free swap under MACHINE_SLOT_MIN_FREE_SWAP_MB, default 512, or the kernel's
+memory-pressure level at warning or above), new leases wait for running ones; with nothing running they start.
+`--wait S` gives up after S seconds with exit 75 and leaves the queue. `run` exits with the command's status
+(128 + the signal when a signal ended it).
+
+`advise` sizes work for processes that take no lease: with each slot `cores / total` cores, the current load,
+min(load1, load5), less what the held slots account for, max(0, load - held x cores per slot), is load without a
+lease. Not load15: it still holds work whose leases ended minutes ago, and min() ignores a one-minute spike.
+The job count is the slots left after that load (and after the held slots, unless --exclusive: an all-slot
+request waits for them), a slot counting while at least half its cores are idle, never above --max (default
+the total) nor, without --exclusive, the free slots, and at least 1. MACHINE_SLOT_LOADAVG replaces the load
+averages: "load1 load5 load15", or one number for all three.
+
+State: ~/.local/state/machine-slots (MACHINE_SLOT_DIR replaces it; queue.log records grants, releases and
+reaps). Held leases in the queues listed in MACHINE_SLOT_LEGACY_DIRS (colon-separated; default Straylight's
+earlier ~/.local/state/straylight-verification/slots; empty to ignore) count as used, scaled from their 4
+slots, until their holders exit. MACHINE_SLOT_POLICY: normal (default), background (low QoS), or bypass (no
+lease; for a person who knows the machine is idle). Standard library only: install by copying or linking to
+~/.local/bin/machine-slot.
+"""
+from __future__ import annotations
+
+import contextlib
+import datetime
+import fcntl
+import json
+import math
+import os
+from pathlib import Path
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+DEFAULT_DIR = "~/.local/state/machine-slots"
+DEFAULT_LEGACY_DIRS = "~/.local/state/straylight-verification/slots"
+LEGACY_TOTAL = 4  # the earlier queue's fixed slot count
+CORES_PER_SLOT = 3
+MIN_FREE_SWAP_MB = 512
+MAX_PRESSURE_LEVEL = 1  # kern.memorystatus_vm_pressure_level: 1 normal, 2 warning, 4 critical
+POLICIES = ("normal", "background", "bypass")
+TIMED_OUT = 75  # EX_TEMPFAIL
+# The variables a lease hands its command; a client may add its own prefix (Straylight's STRAYLIGHT_SLOT_).
+LEASE_ENV_PREFIXES = ["MACHINE_SLOT_"]
+
+
+class SlotError(Exception):
+    pass
+
+
+class SlotTimeout(SlotError):
+    pass
+
+
+# Configuration
+
+def setting(name: str, default: str | None = None) -> str | None:
+    """MACHINE_SLOT_<name>, read when needed; a client that loads this file may replace this function to add its own
+    spellings (tools/slot_lease.py)."""
+    value = os.environ.get("MACHINE_SLOT_" + name)
+    return default if value is None else value
+
+
+def state_dir() -> Path:
+    return Path(os.path.expanduser(setting("DIR") or DEFAULT_DIR))
+
+
+def cores() -> int:
+    value = setting("CORES") or ""
+    return int(value) if value.isdigit() and int(value) > 0 else os.cpu_count() or 1
+
+
+def total() -> int:
+    value = setting("TOTAL") or ""
+    return int(value) if value.isdigit() and int(value) > 0 else max(1, cores() // CORES_PER_SLOT)
+
+
+def loads() -> tuple[float, float, float]:
+    """The 1, 5 and 15-minute load averages."""
+    value = (setting("LOADAVG") or "").split()
+    with contextlib.suppress(ValueError):
+        if len(value) == 1:
+            return (float(value[0]),) * 3
+        if len(value) == 3:
+            return tuple(float(v) for v in value)
+    return os.getloadavg()
+
+
+def legacy_dirs() -> list[Path]:
+    value = setting("LEGACY_DIRS", DEFAULT_LEGACY_DIRS)
+    own = state_dir().resolve()
+    paths = [Path(os.path.expanduser(p)) for p in value.split(":") if p]
+    return [p for p in paths if p.resolve() != own]
+
+
+def now() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# Processes
+
+def processes() -> dict[int, tuple[int, str]]:
+    """Live pid -> (ppid, start time); the start time tells a reused pid from the holder. Zombies are dead."""
+    result = subprocess.run(["ps", "-axo", "pid=,ppid=,stat=,lstart="], capture_output=True, text=True)
+    table = {}
+    for line in result.stdout.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) == 4 and parts[0].isdigit() and parts[1].isdigit() and not parts[2].startswith("Z"):
+            table[int(parts[0])] = (int(parts[1]), parts[3].strip())
+    return table
+
+
+def ancestors(table: dict, pid: int) -> set[int]:
+    found = set()
+    while pid in table and pid not in found and pid > 1:
+        found.add(pid)
+        pid = table[pid][0]
+    return found
+
+
+def alive(entry: dict, table: dict) -> bool:
+    process = table.get(entry.get("pid"))
+    return process is not None and entry.get("start") in ("", process[1])
+
+
+# Memory
+
+def memory_short() -> str | None:
+    """Why new leases should wait for memory, or None."""
+    seam = setting("MEMORY_FILE")  # test seam: "<free swap MB> <pressure level>"
+    if seam:
+        try:
+            free, level = (float(v) for v in Path(seam).read_text().split()[:2])
+        except (OSError, ValueError):
+            return None
+    else:
+        free, level = swap_free_mb(), pressure_level()
+    floor = float(setting("MIN_FREE_SWAP_MB") or MIN_FREE_SWAP_MB)
+    if free is not None and free < floor:
+        return f"free swap {free:.0f} MB is under {floor:.0f} MB"
+    if level is not None and level > MAX_PRESSURE_LEVEL:
+        return f"memory pressure level {level:.0f} (warning or critical)"
+    return None
+
+
+def sysctl(name: str) -> str | None:
+    try:
+        result = subprocess.run(["sysctl", "-n", name], capture_output=True, text=True)
+    except OSError:
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def swap_free_mb() -> float | None:
+    found = re.search(r"free = ([\d.]+)([MG])", sysctl("vm.swapusage") or "")
+    return float(found.group(1)) * (1024 if found.group(2) == "G" else 1) if found else None
+
+
+def pressure_level() -> float | None:
+    value = sysctl("kern.memorystatus_vm_pressure_level")
+    return float(value) if value and value.isdigit() else None
+
+
+# Queue
+
+@contextlib.contextmanager
+def locked(directory: Path):
+    (directory / "queue").mkdir(parents=True, exist_ok=True)
+    with open(directory / ".lock", "a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+
+
+def entries(directory: Path) -> list[tuple[Path, dict]]:
+    found = []
+    for path in sorted((directory / "queue").glob("*.json")):
+        try:
+            entry = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(entry, dict) and isinstance(entry.get("count"), int):
+            found.append((path, entry))
+    return found
+
+
+def write(path: Path, entry: dict) -> None:
+    pending = path.with_name(path.name + ".pending")
+    pending.write_text(json.dumps(entry) + "\n")
+    pending.replace(path)
+
+
+def reap(directory: Path, table: dict) -> list[tuple[Path, dict]]:
+    """Live entries in queue order; removes those whose holder exited or crashed."""
+    live = []
+    for path, entry in entries(directory):
+        if alive(entry, table):
+            live.append((path, entry))
+        else:
+            path.unlink(missing_ok=True)
+            log(directory, f"reaped {entry.get('state')} lease of {entry.get('count')} for "
+                           f"{entry.get('label')} (pid {entry.get('pid')} exited)")
+    return live
+
+
+def legacy_holders(table: dict) -> list[tuple[Path, dict, int]]:
+    """Held leases with a live holder in the earlier queues: (path, entry, slots here). Read only: their own
+    clients reap them."""
+    found = []
+    for directory in legacy_dirs():
+        for path, entry in entries(directory):
+            if entry.get("state") == "held" and alive(entry, table):
+                found.append((path, entry, min(total(), math.ceil(entry["count"] * total() / LEGACY_TOTAL))))
+    return found
+
+
+def legacy_used(table: dict) -> int:
+    return sum(count for _, _, count in legacy_holders(table))
+
+
+def grant(directory: Path, table: dict) -> str | None:
+    """Grant waiters at the head of the queue while they fit; returns why the head still waits."""
+    live = reap(directory, table)
+    slots = total()
+    used = sum(e["count"] for _, e in live if e["state"] == "held") + legacy_used(table)
+    short = None
+    for path, entry in live:
+        if entry["state"] == "held":
+            continue
+        if entry["count"] > slots - used:
+            return f"{max(0, slots - used)} of {slots} slots free"
+        if used:
+            short = short or memory_short()
+            if short:
+                return short
+        entry.update(state="held", granted=now())
+        write(path, entry)
+        used += entry["count"]
+        log(directory, f"granted {entry['count']} to {entry['label']} (pid {entry['pid']})")
+    return None
+
+
+def log(directory: Path, message: str) -> None:
+    with contextlib.suppress(OSError):
+        with open(directory / "queue.log", "a", encoding="utf-8") as handle:
+            handle.write(f"{now()} {message}\n")
+
+
+def snapshot(directory: Path | None = None) -> tuple[list[dict], list[tuple[Path, dict, int]], dict]:
+    """The live queue entries, the earlier queues' holders and the process table."""
+    directory = directory or state_dir()
+    table = processes()
+    with locked(directory):
+        live = [entry for _, entry in reap(directory, table)]
+    return live, legacy_holders(table), table
+
+
+def status_lines(directory: Path | None = None) -> list[str]:
+    live, legacy, _ = snapshot(directory)
+    lines = [f"{e['state']}: {e['count']} slot(s) {e['label']} pid={e['pid']} since={e['since']} cmd={e['cmd']}"
+             for e in live]
+    lines += [f"legacy: {count} slot(s) {e.get('label')} pid={e.get('pid')} (earlier queue {path.parent.parent})"
+              for path, e, count in legacy]
+    used = sum(e["count"] for e in live if e["state"] == "held") + sum(count for _, _, count in legacy)
+    return lines + [f"{used} of {total()} slots held"]
+
+
+def available(directory: Path | None = None) -> int:
+    """How many slots a new request would get at once: the free ones, or none while another request waits,
+    since the queue serves requests in arrival order."""
+    live, legacy, _ = snapshot(directory)
+    if any(e["state"] != "held" for e in live):
+        return 0
+    used = sum(e["count"] for e in live) + sum(count for _, _, count in legacy)
+    return max(0, total() - used)
+
+
+# Sizing
+
+def size(maximum: int, cores: int, total: int, averages: tuple[float, float, float], held: int,
+         waiting: bool = False, exclusive: bool = False) -> dict:
+    """A job count for work that runs beside `held` leased slots (or after them, when `exclusive`) under load
+    `averages` (1, 5 and 15 minutes) that include processes taking no lease. The module docstring has the formula."""
+    per_slot = cores / total
+    load1, load5, load15 = averages
+    load = min(load1, load5)
+    unleased = max(0.0, load - held * per_slot)
+    busy = unleased + (0.0 if exclusive else held * per_slot)
+    capacity = max(0, math.floor((cores - busy) / per_slot + 0.5))
+    free = total if exclusive else 0 if waiting else max(0, total - held)
+    jobs = max(1, min(maximum, capacity, free))
+    return {"jobs": jobs, "maximum": maximum, "exclusive": exclusive, "cores": cores, "total": total,
+            "cores_per_slot": round(per_slot, 2), "held": held, "waiting": waiting, "free": free,
+            "load": round(load, 2), "load1": round(load1, 2), "load5": round(load5, 2), "load15": round(load15, 2),
+            "unleased_load": round(unleased, 2), "capacity": capacity}
+
+
+def advise(maximum: int | None = None, exclusive: bool = False, cores_now: int | None = None,
+           averages: tuple[float, float, float] | None = None) -> dict:
+    """size() for the queue as it is now: slots held by others (the caller's own lease is not one) and
+    whether a request waits."""
+    live, legacy, table = snapshot()
+    mine = inherited_lease(table)
+    held = sum(e["count"] for e in live if e["state"] == "held" and not (mine and e["pid"] == mine[1]["pid"]))
+    held += sum(count for path, e, count in legacy if not (mine and path == mine[0]))
+    slots = total()
+    return size(maximum or slots, cores_now or cores(), slots, averages or loads(),
+                min(held, slots), any(e["state"] != "held" for e in live), exclusive)
+
+
+# Leases
+
+class Lease:
+    """A held lease, an inherited one, or none (bypass). Release it once the work has finished."""
+
+    def __init__(self, count: int, path: Path | None = None, inherited: bool = False):
+        self.count, self.path, self.inherited = count, path, inherited
+
+    def environment(self) -> dict[str, str]:
+        if self.path is None:
+            return {}
+        env = {}
+        for prefix in LEASE_ENV_PREFIXES:
+            env.update({prefix + "LEASE": str(self.path), prefix + "COUNT": str(self.count)})
+        return env
+
+    def release(self) -> None:
+        if self.path is not None and not self.inherited:
+            with locked(self.path.parent.parent):
+                self.path.unlink(missing_ok=True)
+                log(self.path.parent.parent, f"released {self.count} ({self.path.name})")
+            self.path = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.release()
+
+
+def inherited_lease(table: dict) -> tuple[Path, dict, int] | None:
+    """The held lease this process runs under, here or in an earlier queue: (path, entry, slots here)."""
+    mine = ancestors(table, os.getpid())
+    own = setting("LEASE")
+    for path, entry in entries(state_dir()):
+        if entry.get("state") == "held" and alive(entry, table) and (own == str(path) or entry["pid"] in mine):
+            return path, entry, entry["count"]
+    for path, entry, count in legacy_holders(table):
+        if own == str(path) or entry["pid"] in mine:
+            return path, entry, count
+    return None
+
+
+def inherited(table: dict) -> Lease | None:
+    found = inherited_lease(table)
+    if found is None:
+        return None
+    path, _, count = found
+    # A lease in an earlier queue is honoured but not handed on: nested runs find its holder among their ancestors.
+    return Lease(count, path if path.parent.parent == state_dir() else None, inherited=True)
+
+
+def policy() -> str:
+    value = setting("POLICY") or "normal"
+    if value not in POLICIES:
+        raise SlotError(f"invalid MACHINE_SLOT_POLICY {value!r}: use {', '.join(POLICIES)}")
+    return value
+
+
+def acquire(count: int, label: str, command: str = "", out=sys.stderr, wait: float | None = None) -> Lease:
+    """Wait in the queue for `count` slots (at most the total); the lease is held by this process until released.
+    Raises SlotTimeout, having left the queue, when `wait` seconds pass first."""
+    if count < 1:
+        raise SlotError("count must be at least 1")
+    count = min(count, total())
+    if policy() == "bypass":
+        return Lease(total())
+    directory = state_dir()
+    table = processes()
+    found = inherited(table)
+    if found:
+        return found
+    poll = float(setting("POLL") or 2)
+    me = os.getpid()
+    with locked(directory):
+        sequence_file = directory / "sequence"
+        try:
+            sequence = int(sequence_file.read_text() or 0) + 1
+        except (OSError, ValueError):
+            sequence = 1
+        sequence_file.write_text(str(sequence))
+        path = directory / "queue" / f"{sequence:010d}-{me}.json"
+        write(path, {"pid": me, "start": table.get(me, (0, ""))[1], "count": count, "label": label,
+                     "cmd": command, "since": now(), "state": "waiting"})
+    lease = Lease(count, path)
+    deadline = None if wait is None else time.monotonic() + wait
+    # A terminated waiter leaves the queue at once rather than at the next reap.
+    main_thread = threading.current_thread() is threading.main_thread()
+    previous_term = signal.signal(signal.SIGTERM, terminate) if main_thread else None
+    try:
+        said = None
+        while True:
+            with locked(directory):
+                waiting = grant(directory, processes())
+                try:
+                    state = json.loads(path.read_text())["state"]
+                except (OSError, ValueError):
+                    raise SlotError("the lease vanished from the queue") from None
+            if state == "held":
+                if said:
+                    print(f"slot: granted {count} slot(s) to {label}", file=out, flush=True)
+                return lease
+            if deadline is not None and time.monotonic() >= deadline:
+                raise SlotTimeout(f"no {count} slot(s) within {wait:g} s: {waiting or 'earlier requests first'}")
+            if waiting != said:
+                print(f"slot: {label} waits for {count} slot(s): {waiting or 'earlier requests first'}",
+                      file=out, flush=True)
+                for line in status_lines(directory):
+                    print(f"  {line}", file=out, flush=True)
+                said = waiting
+            pause = poll if deadline is None else max(0.0, min(poll, deadline - time.monotonic()))
+            time.sleep(pause)
+    except BaseException:
+        lease.release()
+        raise
+    finally:
+        if previous_term is not None:
+            signal.signal(signal.SIGTERM, previous_term)
+
+
+def terminate(signum, _frame):
+    raise SystemExit(128 + signum)
+
+
+def run(count: int, label: str, argv: list[str], wait: float | None = None) -> int:
+    """Run argv under a lease of `count` slots; the command's exit status."""
+    try:
+        background = policy() == "background"
+        lease = acquire(count, label, " ".join(argv), wait=wait)
+    except SlotTimeout as error:
+        print(f"slot: {label}: {error}", file=sys.stderr)
+        return TIMED_OUT
+    except KeyboardInterrupt:
+        return 130
+    except SystemExit as stop:
+        return int(stop.code or 1)
+    with lease:
+        if background:
+            prefix = ["/usr/sbin/taskpolicy", "-b", "/usr/bin/nice", "-n", "10"] if os.access(
+                "/usr/sbin/taskpolicy", os.X_OK) else ["/usr/bin/nice", "-n", "10"]
+            argv = prefix + argv
+        try:
+            child = subprocess.Popen(argv, env={**os.environ, **lease.environment()})
+        except OSError as error:
+            print(f"slot: {error}", file=sys.stderr)
+            return 127
+
+        def forward(signum, _frame):
+            with contextlib.suppress(ProcessLookupError):
+                child.send_signal(signum)
+        # The terminal sends SIGINT to the child's process group itself; the lease outlives the child.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        for signum in (signal.SIGTERM, signal.SIGHUP):
+            signal.signal(signum, forward)
+        status = child.wait()
+    return 128 - status if status < 0 else status
+
+
+# Command line
+
+USAGE = ("usage: machine-slot run [-n N|all] [--label L] [--wait SECONDS] [--] COMMAND...\n"
+         "       machine-slot status | available | advise [--max N] [--exclusive]")
+
+
+def parse_count(value: str) -> int:
+    if value == "all":
+        return total()
+    if not value.isdigit() or int(value) < 1:
+        raise SlotError(f"-n takes a positive count or all, not {value!r}")
+    return int(value)
+
+
+def run_command(argv: list[str]) -> int:
+    count, label, wait = 1, os.path.basename(os.getcwd()), None
+    while argv:
+        if argv[0] in ("-n", "--slots") and len(argv) > 1:
+            count, argv = parse_count(argv[1]), argv[2:]
+        elif argv[0] in ("-l", "--label") and len(argv) > 1:
+            label, argv = argv[1], argv[2:]
+        elif argv[0] == "--wait" and len(argv) > 1:
+            try:
+                wait = float(argv[1])
+            except ValueError:
+                raise SlotError(f"--wait takes seconds, not {argv[1]!r}") from None
+            argv = argv[2:]
+        elif argv[0] == "--":
+            argv = argv[1:]
+            break
+        elif argv[0].startswith("-"):
+            raise SlotError(f"unknown option {argv[0]}")
+        else:
+            break
+    if not argv:
+        raise SlotError("no command to run")
+    return run(count, label, argv, wait)
+
+
+def advise_command(argv: list[str]) -> int:
+    maximum, exclusive = None, False
+    while argv:
+        if argv[0] == "--max" and len(argv) > 1:
+            maximum, argv = parse_count(argv[1]), argv[2:]
+        elif argv[0] == "--exclusive":
+            exclusive, argv = True, argv[1:]
+        else:
+            raise SlotError(f"unknown advise option {argv[0]}")
+    print(json.dumps(advise(maximum, exclusive), sort_keys=True))
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    command, rest = (argv[0], argv[1:]) if argv else ("", [])
+    try:
+        if command == "run":
+            return run_command(rest)
+        if command == "status" and not rest:
+            print("\n".join(status_lines()))
+            return 0
+        if command == "available" and not rest:
+            print(available())
+            return 0
+        if command == "advise":
+            return advise_command(rest)
+        if command in ("-h", "--help", "help"):
+            print(__doc__)
+            return 0
+    except SlotError as error:
+        print(f"machine-slot: {error}\n{USAGE}", file=sys.stderr)
+        return 2
+    print(USAGE, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
