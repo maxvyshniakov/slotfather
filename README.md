@@ -9,9 +9,14 @@ The executable is a standalone Python 3 script using only the standard library. 
 ```sh
 gh repo clone maxvyshniakov/slotfather
 cd slotfather
-mkdir -p ~/.local/bin
-install -m 755 slotfather ~/.local/bin/slotfather
+python3 install.py
 ```
+
+The installer also performs the one-time rename migration. It refuses live holders or waiters in either retired queue, preserves the entire earlier machine queue (including saved capacity) when the new queue is absent, and otherwise leaves the existing new queue untouched. Retired contents remain in named `~/.local/state/slotfather-migrations/` backups. Different old and new configurations are both preserved; the existing new configuration stays effective.
+
+Both retired paths, `~/.local/state/machine-slots` and `~/.local/state/straylight-verification/slots`, become regular file guards. Atomic directory/file exchanges ensure old clients cannot recreate an uncoordinated queue between the move and guard creation. Existing intentional guards make a repeated install safe, including while the new queue has active leases. Unrelated files at those paths are refused and preserved. The installer uses the default state locations; coordinate custom queue paths separately.
+
+The executable is replaced atomically and the old command name is removed last. If a migration stops after a directory exchange, retain its guards and printed backup paths: the queue contents remain preserved for recovery. This is an explicit installation step, not compatibility logic in normal command execution.
 
 Put `~/.local/bin` on your `PATH`. All participating projects must use the same state directory; saved capacity is shared through that directory. Updating the executable preserves the queue and running leases.
 
@@ -76,4 +81,4 @@ A command receives `SLOTFATHER_LEASE` and `SLOTFATHER_COUNT` for its existing le
 slotfather run -n 1 -- python3 -m unittest discover -s tests -v
 ```
 
-The tests observe commands and queue admission using independent temporary state, controlled release files, and real child processes. They cover FIFO fairness, exclusive requests, nesting, stale leases, memory guard, CLI outcomes, legacy migration, load advice, and persistent shared capacity changes.
+Installer tests use isolated home directories and real live-process entries to check refusal, preservation, file guards, and repeated installation. Queue tests observe commands and queue admission using independent temporary state, controlled release files, and real child processes. They cover FIFO fairness, exclusive requests, nesting, stale leases, memory guard, CLI outcomes, legacy migration, load advice, and persistent shared capacity changes.
