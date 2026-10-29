@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Concurrency fixtures for machine-slot, the machine-wide slot queue every project shares (#599).
+"""Concurrency fixtures for slotfather, the machine-wide slot queue every project shares (#599).
 
 Fake work records its start in a log and holds its lease until the test creates its release file, so the order
 in which requests start is observable without timing guesses. Each test has its own state directory.
@@ -18,22 +18,22 @@ import time
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-TOOL = str(ROOT / "machine-slot")
+TOOL = str(ROOT / "slotfather")
 WORK = 'echo "start $1" >> "$LOG"; while [ ! -e "$RELEASE/$1" ]; do sleep 0.05; done; echo "end $1" >> "$LOG"'
 
 
 class SlotCase(unittest.TestCase):
     def setUp(self):
-        self.tmp = pathlib.Path(tempfile.mkdtemp(prefix="machine-slot-"))
+        self.tmp = pathlib.Path(tempfile.mkdtemp(prefix="slotfather-"))
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.state, self.release_dir, self.log = self.tmp / "state", self.tmp / "release", self.tmp / "log"
         self.release_dir.mkdir()
         self.log.touch()
         self.memory = self.tmp / "memory"
         self.memory.write_text("8000 1\n")
-        self.env = {k: v for k, v in os.environ.items() if not k.startswith(("MACHINE_SLOT", "STRAYLIGHT_SLOT"))}
-        self.env.update(MACHINE_SLOT_DIR=str(self.state), MACHINE_SLOT_LEGACY_DIRS="", MACHINE_SLOT_POLL="0.05",
-                        MACHINE_SLOT_TOTAL="4", MACHINE_SLOT_MEMORY_FILE=str(self.memory), LOG=str(self.log),
+        self.env = {k: v for k, v in os.environ.items() if not k.startswith(("SLOTFATHER", "STRAYLIGHT_SLOT"))}
+        self.env.update(SLOTFATHER_DIR=str(self.state), SLOTFATHER_LEGACY_DIRS="", SLOTFATHER_POLL="0.05",
+                        SLOTFATHER_CORES="12", SLOTFATHER_MEMORY_FILE=str(self.memory), LOG=str(self.log),
                         RELEASE=str(self.release_dir))
         self.processes = []
         self.addCleanup(self.stop_all)
@@ -50,7 +50,7 @@ class SlotCase(unittest.TestCase):
                 process.stdout.close()
 
     def request(self, label, count, *command, options=()):
-        """Start `machine-slot run -n count --label label -- <fake work label>` in the background."""
+        """Start `slotfather run -n count --label label -- <fake work label>` in the background."""
         argv = [TOOL, "run", "-n", str(count), "--label", label, *options, "--",
                 *(command or ("sh", "-c", WORK, "work", label))]
         process = subprocess.Popen(argv, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
@@ -156,10 +156,10 @@ class FifoTests(SlotCase):
 
 class TotalTests(SlotCase):
     def test_the_total_is_one_slot_per_three_cores_and_at_least_one(self):
-        del self.env["MACHINE_SLOT_TOTAL"]
+        del self.env["SLOTFATHER_CORES"]
         for cores, total in (("12", 4), ("16", 5), ("4", 1), ("2", 1)):
             with self.subTest(cores=cores):
-                self.assertEqual(f"0 of {total} slots held", self.tool("status", MACHINE_SLOT_CORES=cores).stdout
+                self.assertEqual(f"0 of {total} slots held", self.tool("status", SLOTFATHER_CORES=cores).stdout
                                  .splitlines()[-1])
 
     def test_a_request_above_the_total_takes_every_slot(self):
@@ -168,6 +168,68 @@ class TotalTests(SlotCase):
         result = self.tool("run", "-n", "9", "--", "sh", "-c", f'"{TOOL}" status > "{status}"')
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual("4 of 4 slots held", status.read_text().splitlines()[-1])
+
+
+class CapacityTests(SlotCase):
+    def test_saved_capacity_is_shared_by_new_processes_and_reset_restores_auto(self):
+        self.assertEqual("4 slots (automatic)", self.tool("slots").stdout.strip())
+        changed = self.tool("slots", "6")
+        self.assertEqual(0, changed.returncode, changed.stderr)
+        self.assertEqual("6 slots (saved)", changed.stdout.strip())
+        self.assertEqual("6 slots (saved)", self.tool("slots", SLOTFATHER_TOTAL="99").stdout.strip())
+        self.assertEqual("6", self.tool("available").stdout.strip())
+        self.assertEqual(6, json.loads(self.tool("advise", "--exclusive", SLOTFATHER_LOADAVG="0").stdout)["jobs"])
+        result = self.tool("run", "-n", "all", "--", TOOL, "status")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("6 of 6 slots held", result.stdout)
+        reset = self.tool("slots", "reset")
+        self.assertEqual(0, reset.returncode, reset.stderr)
+        self.assertEqual("4 slots (automatic)", self.tool("slots").stdout.strip())
+
+    def test_invalid_capacity_never_changes_saved_value(self):
+        self.assertEqual(0, self.tool("slots", "6").returncode)
+        for args in (("0",), ("-1",), ("1.5",), ("all",), ("many",), ("6", "7")):
+            with self.subTest(args=args):
+                result = self.tool("slots", *args)
+                self.assertEqual(2, result.returncode, result.stdout + result.stderr)
+                self.assertEqual("6 slots (saved)", self.tool("slots").stdout.strip())
+
+    def test_capacity_changes_are_refused_until_holders_and_waiters_leave(self):
+        holder = self.request("holder", "all")
+        self.started("holder")
+        waiter = self.request("waiter", "all")
+        self.wait_for(lambda: "waiting: 4 slot(s) waiter" in self.status(), "waiter to queue")
+        for value in ("6", "2", "reset"):
+            result = self.tool("slots", value)
+            self.assertEqual(2, result.returncode, result.stdout + result.stderr)
+            self.assertIn("queue is busy", result.stderr)
+            self.assertIn("4 of 4 slots held", self.status())
+        self.release("holder")
+        self.finish(holder)
+        self.started("waiter")
+        self.assertIn("4 of 4 slots held", self.status())
+        self.release("waiter")
+        self.finish(waiter)
+        self.assertEqual(0, self.tool("slots", "6").returncode)
+
+    def test_a_live_waiter_alone_also_blocks_capacity_changes(self):
+        pid, start = self.holder()
+        self.queue_entry(self.state, pid, start, 4, "waiting-only", state="waiting")
+        self.assertIn("queue is busy", self.tool("slots", "6").stderr)
+        self.assertEqual("4 slots (automatic)", self.tool("slots").stdout.strip())
+
+    def test_a_crashed_entry_does_not_block_capacity_changes(self):
+        self.queue_entry(self.state, 99999999, "gone", 4, "crashed")
+        self.assertEqual(0, self.tool("slots", "6").returncode)
+        self.assertEqual("6 slots (saved)", self.tool("slots").stdout.strip())
+
+    def test_legacy_holders_and_waiters_block_capacity_changes(self):
+        legacy = self.tmp / "legacy"
+        self.env["SLOTFATHER_LEGACY_DIRS"] = str(legacy)
+        pid, start = self.holder()
+        for state in ("held", "waiting"):
+            self.queue_entry(legacy, pid, start, 4, "legacy", state=state)
+            self.assertIn("queue is busy", self.tool("slots", "6").stderr)
 
 
 class NestingTests(SlotCase):
@@ -182,14 +244,14 @@ class NestingTests(SlotCase):
 
     def test_a_nested_run_without_the_lease_variable_finds_its_ancestor(self):
         status = self.tmp / "inner-status"
-        inner = ["env", "-u", "MACHINE_SLOT_LEASE", TOOL, "run", "-n", "4", "--", "sh", "-c",
+        inner = ["env", "-u", "SLOTFATHER_LEASE", TOOL, "run", "-n", "4", "--", "sh", "-c",
                  f'"{TOOL}" status > "{status}"']
         self.finish(self.request("outer", 1, *inner))
         self.assertIn("1 of 4 slots held", status.read_text())
 
     def test_the_command_sees_its_lease(self):
         seen = self.tmp / "seen"
-        self.finish(self.request("lease", 2, "sh", "-c", f'echo "$MACHINE_SLOT_COUNT $MACHINE_SLOT_LEASE" > "{seen}"'))
+        self.finish(self.request("lease", 2, "sh", "-c", f'echo "$SLOTFATHER_COUNT $SLOTFATHER_LEASE" > "{seen}"'))
         count, path = seen.read_text().split()
         self.assertEqual("2", count)
         self.assertTrue(path.startswith(str(self.state / "queue")), path)
@@ -278,7 +340,7 @@ class CommandLineTests(SlotCase):
     def test_bypass_runs_without_a_lease(self):
         holder = self.request("holder", 4)
         self.started("holder")
-        result = self.tool("run", "-n", "4", "--", "true", MACHINE_SLOT_POLICY="bypass")
+        result = self.tool("run", "-n", "4", "--", "true", SLOTFATHER_POLICY="bypass")
         self.assertEqual(0, result.returncode, result.stderr)
         self.release("holder")
         self.finish(holder)
@@ -302,7 +364,7 @@ class LegacyQueueTests(SlotCase):
     def setUp(self):
         super().setUp()
         self.legacy = self.tmp / "legacy"
-        self.env["MACHINE_SLOT_LEGACY_DIRS"] = str(self.legacy)
+        self.env["SLOTFATHER_LEGACY_DIRS"] = str(self.legacy)
 
     def test_a_lease_held_in_the_old_queue_is_counted(self):
         pid, start = self.holder()
@@ -329,11 +391,11 @@ class LegacyQueueTests(SlotCase):
 
 
 class AdviceTests(SlotCase):
-    """`machine-slot advise`: a job count from the free slots and the load of processes that take no lease. The
+    """`slotfather advise`: a job count from the free slots and the load of processes that take no lease. The
     load is the current one, the lower of load1 and load5: load15 still holds work whose leases ended minutes ago."""
 
     def advise(self, *args, load="0.0"):
-        result = self.tool("advise", *args, MACHINE_SLOT_CORES="12", MACHINE_SLOT_LOADAVG=load)
+        result = self.tool("advise", *args, SLOTFATHER_CORES="12", SLOTFATHER_LOADAVG=load)
         self.assertEqual(0, result.returncode, result.stderr)
         return json.loads(result.stdout)
 

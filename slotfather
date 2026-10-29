@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
-"""machine-slot: one queue of leases on the machine's capacity, shared by every project and agent (#599).
+"""slotfather: one queue of leases on the machine's capacity, shared by every project and agent (#599).
 
-  machine-slot run [-n N|all] [--label L] [--wait S] [--] COMMAND...   run COMMAND holding N slots (default 1)
-  machine-slot status                                                  holders and waiters, in queue order
-  machine-slot available                                               slots a new request gets at once
-  machine-slot advise [--max N] [--exclusive]                          a job count for the load, as JSON
+  slotfather run [-n N|all] [--label L] [--wait S] [--] COMMAND...   run COMMAND holding N slots (default 1)
+  slotfather status                                                  holders and waiters, in queue order
+  slotfather slots [N|reset]                                           show, save or reset shared capacity
+  slotfather available                                               slots a new request gets at once
+  slotfather advise [--max N] [--exclusive]                          a job count for the load, as JSON
 
-Run heavy builds and tests through `machine-slot run -n <k> -- ...`: a test suite or build that keeps the
+Run heavy builds and tests through `slotfather run -n <k> -- ...`: a test suite or build that keeps the
 machine busy takes 1 to 2 slots, a full gate that must not share the machine takes `-n all`.
 
 Slots: one per three cores, at least one, so `total = max(1, cores // 3)`: 4 on a 12-core M2 Max.
-MACHINE_SLOT_TOTAL replaces the total, MACHINE_SLOT_CORES the core count. A request above the total takes
-every slot.
+`slotfather slots N` saves shared capacity; `slotfather slots reset` restores the automatic default.
+SLOTFATHER_CORES replaces the core count. A request above the total takes every slot.
 
 Requests are served strictly in arrival order: an all-slot request at the head of the queue is not overtaken
-by later 1-slot requests. A process that already runs under a lease (MACHINE_SLOT_LEASE, or a holder among its
+by later 1-slot requests. A process that already runs under a lease (SLOTFATHER_LEASE, or a holder among its
 ancestors) runs without a second lease, so nested wrappers neither deadlock nor count twice. A lease whose
 holder died (its pid gone, or reused by a process with another start time) is reaped by the next queue
-operation. While memory is short (free swap under MACHINE_SLOT_MIN_FREE_SWAP_MB, default 512, or the kernel's
+operation. While memory is short (free swap under SLOTFATHER_MIN_FREE_SWAP_MB, default 512, or the kernel's
 memory-pressure level at warning or above), new leases wait for running ones; with nothing running they start.
 `--wait S` gives up after S seconds with exit 75 and leaves the queue. `run` exits with the command's status
 (128 + the signal when a signal ended it).
@@ -27,15 +28,15 @@ min(load1, load5), less what the held slots account for, max(0, load - held x co
 lease. Not load15: it still holds work whose leases ended minutes ago, and min() ignores a one-minute spike.
 The job count is the slots left after that load (and after the held slots, unless --exclusive: an all-slot
 request waits for them), a slot counting while at least half its cores are idle, never above --max (default
-the total) nor, without --exclusive, the free slots, and at least 1. MACHINE_SLOT_LOADAVG replaces the load
+the total) nor, without --exclusive, the free slots, and at least 1. SLOTFATHER_LOADAVG replaces the load
 averages: "load1 load5 load15", or one number for all three.
 
-State: ~/.local/state/machine-slots (MACHINE_SLOT_DIR replaces it; queue.log records grants, releases and
-reaps). Held leases in the queues listed in MACHINE_SLOT_LEGACY_DIRS (colon-separated; default Straylight's
+State: ~/.local/state/machine-slots (SLOTFATHER_DIR replaces it; queue.log records grants, releases and
+reaps). Held leases in the queues listed in SLOTFATHER_LEGACY_DIRS (colon-separated; default Straylight's
 earlier ~/.local/state/straylight-verification/slots; empty to ignore) count as used, scaled from their 4
-slots, until their holders exit. MACHINE_SLOT_POLICY: normal (default), background (low QoS), or bypass (no
+slots, until their holders exit. SLOTFATHER_POLICY: normal (default), background (low QoS), or bypass (no
 lease; for a person who knows the machine is idle). Standard library only: install by copying or linking to
-~/.local/bin/machine-slot.
+~/.local/bin/slotfather.
 """
 from __future__ import annotations
 
@@ -62,7 +63,7 @@ MAX_PRESSURE_LEVEL = 1  # kern.memorystatus_vm_pressure_level: 1 normal, 2 warni
 POLICIES = ("normal", "background", "bypass")
 TIMED_OUT = 75  # EX_TEMPFAIL
 # The variables a lease hands its command; a client may add its own prefix (Straylight's STRAYLIGHT_SLOT_).
-LEASE_ENV_PREFIXES = ["MACHINE_SLOT_"]
+LEASE_ENV_PREFIXES = ["SLOTFATHER_"]
 
 
 class SlotError(Exception):
@@ -76,9 +77,9 @@ class SlotTimeout(SlotError):
 # Configuration
 
 def setting(name: str, default: str | None = None) -> str | None:
-    """MACHINE_SLOT_<name>, read when needed; a client that loads this file may replace this function to add its own
+    """SLOTFATHER_<name>, read when needed; a client that loads this file may replace this function to add its own
     spellings (tools/slot_lease.py)."""
-    value = os.environ.get("MACHINE_SLOT_" + name)
+    value = os.environ.get("SLOTFATHER_" + name)
     return default if value is None else value
 
 
@@ -91,9 +92,22 @@ def cores() -> int:
     return int(value) if value.isdigit() and int(value) > 0 else os.cpu_count() or 1
 
 
+def capacity() -> tuple[int, bool]:
+    """The shared saved capacity, or the automatic default; atomic publication keeps readers consistent."""
+    path = state_dir() / "capacity.json"
+    try:
+        value = json.loads(path.read_text())["slots"]
+    except FileNotFoundError:
+        return max(1, cores() // CORES_PER_SLOT), False
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise SlotError(f"cannot read capacity from {path}: {error}") from None
+    if type(value) is not int or value < 1:
+        raise SlotError(f"invalid saved capacity in {path}; use slotfather slots reset while the queue is idle")
+    return value, True
+
+
 def total() -> int:
-    value = setting("TOTAL") or ""
-    return int(value) if value.isdigit() and int(value) > 0 else max(1, cores() // CORES_PER_SLOT)
+    return capacity()[0]
 
 
 def loads() -> tuple[float, float, float]:
@@ -383,16 +397,15 @@ def inherited(table: dict) -> Lease | None:
 def policy() -> str:
     value = setting("POLICY") or "normal"
     if value not in POLICIES:
-        raise SlotError(f"invalid MACHINE_SLOT_POLICY {value!r}: use {', '.join(POLICIES)}")
+        raise SlotError(f"invalid SLOTFATHER_POLICY {value!r}: use {', '.join(POLICIES)}")
     return value
 
 
-def acquire(count: int, label: str, command: str = "", out=sys.stderr, wait: float | None = None) -> Lease:
+def acquire(count: int | str, label: str, command: str = "", out=sys.stderr, wait: float | None = None) -> Lease:
     """Wait in the queue for `count` slots (at most the total); the lease is held by this process until released.
     Raises SlotTimeout, having left the queue, when `wait` seconds pass first."""
-    if count < 1:
-        raise SlotError("count must be at least 1")
-    count = min(count, total())
+    if count != "all" and (type(count) is not int or count < 1):
+        raise SlotError("count must be a positive integer or all")
     if policy() == "bypass":
         return Lease(total())
     directory = state_dir()
@@ -403,6 +416,8 @@ def acquire(count: int, label: str, command: str = "", out=sys.stderr, wait: flo
     poll = float(setting("POLL") or 2)
     me = os.getpid()
     with locked(directory):
+        # Admission and capacity changes share this lock; resolve all only now.
+        count = total() if count == "all" else min(count, total())
         sequence_file = directory / "sequence"
         try:
             sequence = int(sequence_file.read_text() or 0) + 1
@@ -452,7 +467,7 @@ def terminate(signum, _frame):
     raise SystemExit(128 + signum)
 
 
-def run(count: int, label: str, argv: list[str], wait: float | None = None) -> int:
+def run(count: int | str, label: str, argv: list[str], wait: float | None = None) -> int:
     """Run argv under a lease of `count` slots; the command's exit status."""
     try:
         background = policy() == "background"
@@ -488,8 +503,9 @@ def run(count: int, label: str, argv: list[str], wait: float | None = None) -> i
 
 # Command line
 
-USAGE = ("usage: machine-slot run [-n N|all] [--label L] [--wait SECONDS] [--] COMMAND...\n"
-         "       machine-slot status | available | advise [--max N] [--exclusive]")
+USAGE = ("usage: slotfather run [-n N|all] [--label L] [--wait SECONDS] [--] COMMAND...\n"
+         "       slotfather status | available | advise [--max N] [--exclusive]\n"
+         "       slotfather slots [N|reset]")
 
 
 def parse_count(value: str) -> int:
@@ -504,7 +520,7 @@ def run_command(argv: list[str]) -> int:
     count, label, wait = 1, os.path.basename(os.getcwd()), None
     while argv:
         if argv[0] in ("-n", "--slots") and len(argv) > 1:
-            count, argv = parse_count(argv[1]), argv[2:]
+            count, argv = ("all" if argv[1] == "all" else parse_count(argv[1])), argv[2:]
         elif argv[0] in ("-l", "--label") and len(argv) > 1:
             label, argv = argv[1], argv[2:]
         elif argv[0] == "--wait" and len(argv) > 1:
@@ -538,12 +554,39 @@ def advise_command(argv: list[str]) -> int:
     return 0
 
 
+def slots_command(argv: list[str]) -> int:
+    if len(argv) > 1 or (argv and argv[0] != "reset" and
+                         (not argv[0].isascii() or not argv[0].isdigit() or int(argv[0]) < 1)):
+        raise SlotError("slots takes a positive integer or reset")
+    directory = state_dir()
+    with locked(directory):
+        if argv:
+            table = processes()
+            live = reap(directory, table)
+            legacy_live = any(alive(entry, table) for old in legacy_dirs() for _, entry in entries(old))
+            if live or legacy_live:
+                raise SlotError("queue is busy; capacity can change only after every holder and waiter leaves")
+            path = directory / "capacity.json"
+            try:
+                if argv[0] == "reset":
+                    path.unlink(missing_ok=True)
+                else:
+                    write(path, {"slots": int(argv[0])})
+            except OSError as error:
+                raise SlotError(f"cannot save capacity: {error}") from None
+        value, saved = capacity()
+    print(f"{value} slots ({'saved' if saved else 'automatic'})")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     command, rest = (argv[0], argv[1:]) if argv else ("", [])
     try:
         if command == "run":
             return run_command(rest)
+        if command == "slots":
+            return slots_command(rest)
         if command == "status" and not rest:
             print("\n".join(status_lines()))
             return 0
@@ -556,7 +599,7 @@ def main(argv: list[str] | None = None) -> int:
             print(__doc__)
             return 0
     except SlotError as error:
-        print(f"machine-slot: {error}\n{USAGE}", file=sys.stderr)
+        print(f"slotfather: {error}\n{USAGE}", file=sys.stderr)
         return 2
     print(USAGE, file=sys.stderr)
     return 2
