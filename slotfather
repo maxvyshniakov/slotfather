@@ -31,7 +31,7 @@ request waits for them), a slot counting while at least half its cores are idle,
 the total) nor, without --exclusive, the free slots, and at least 1. SLOTFATHER_LOADAVG replaces the load
 averages: "load1 load5 load15", or one number for all three.
 
-State: ~/.local/state/machine-slots (SLOTFATHER_DIR replaces it; queue.log records grants, releases and
+State: ~/.local/state/slotfather (SLOTFATHER_DIR replaces it; queue.log records grants, releases and
 reaps). Held leases in the queues listed in SLOTFATHER_LEGACY_DIRS (colon-separated; default Straylight's
 earlier ~/.local/state/straylight-verification/slots; empty to ignore) count as used, scaled from their 4
 slots, until their holders exit. SLOTFATHER_POLICY: normal (default), background (low QoS), or bypass (no
@@ -54,7 +54,7 @@ import sys
 import threading
 import time
 
-DEFAULT_DIR = "~/.local/state/machine-slots"
+DEFAULT_DIR = "~/.local/state/slotfather"
 DEFAULT_LEGACY_DIRS = "~/.local/state/straylight-verification/slots"
 LEGACY_TOTAL = 4  # the earlier queue's fixed slot count
 CORES_PER_SLOT = 3

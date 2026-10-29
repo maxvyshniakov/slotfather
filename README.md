@@ -35,7 +35,7 @@ Nested invocations inherit a live ancestor's lease rather than waiting for anoth
 
 `advise` prints a JSON worker-budget decision. It uses the lower of the one- and five-minute load averages, subtracts the CPU share explained by held slots, and reserves the rest for unleased work. The 15-minute tail is recorded but does not shrink a new run after earlier work ended. `--exclusive` assumes the caller will wait for every slot; it is advice, not a lease.
 
-State keeps its existing path `~/.local/state/machine-slots/` so active leases survive the command rename; `queue.log` records grants, releases, and reaping. `status` lists holders and waiters. The extracted version also reads leases in Straylight's earlier queue during migration; old clients do not see new leases, so retire old wrappers before relying on mutual isolation.
+State lives in `~/.local/state/slotfather/`; `queue.log` records grants, releases, and reaping. `status` lists holders and waiters. The extracted version also reads leases in Straylight's earlier queue during migration; old clients do not see new leases, so retire old wrappers before relying on mutual isolation.
 
 ## Configuration
 
