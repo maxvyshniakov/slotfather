@@ -39,6 +39,24 @@ State lives in `~/.local/state/machine-slots/`; `queue.log` records grants, rele
 
 ## Configuration
 
+`-n` selects how many slots one command requests; it does not change the total capacity:
+
+```sh
+machine-slot run -n 3 -- make build
+```
+
+Set the total with an environment variable, or remove the override to restore the automatic default:
+
+```sh
+export MACHINE_SLOT_TOTAL=6
+machine-slot status
+
+unset MACHINE_SLOT_TOTAL
+machine-slot status
+```
+
+The default is `max(1, cores // 3)`, so four slots on a 12-core Mac. `export` applies to the current shell and its children; remove a corresponding shell-startup entry as well if you saved one. There is no persistent machine-wide configuration command. Every client sharing the queue must use the same capacity setting.
+
 | Variable | Purpose |
 | --- | --- |
 | `MACHINE_SLOT_DIR` | Shared queue directory. |
@@ -60,9 +78,3 @@ machine-slot run -n 1 -- python3 -m unittest discover -s tests -v
 ```
 
 The tests observe commands and queue admission using independent temporary state, controlled release files, and real child processes. They cover FIFO fairness, exclusive requests, nesting, stale leases, memory guard, CLI outcomes, legacy migration, and load advice.
-
-## Source ownership
-
-This private repository is the upstream for `machine-slot`. The initial executable is byte-identical to Straylight's snapshot at commit `6852fe43b0b056911f76dc02ddceb4e920ddf371`; [PROVENANCE.json](PROVENANCE.json) records its path and SHA-256. The initial tests relocate only the executable path.
-
-Straylight may retain a pinned vendored copy so old checkouts remain self-contained and reproducible. Changes belong here first; consumers should update to a reviewed commit and verify the copied file's hash. Installed copies are deployment artifacts, not additional source owners.
