@@ -13,16 +13,19 @@ import contextlib
 import datetime
 import importlib.machinery
 import importlib.util
-import locale
 import math
 import os
 from pathlib import Path
 import re
+import select
 import shutil
+import signal
 import subprocess
 import sys
+import termios
 import textwrap
 import time
+import tty
 import unicodedata
 
 
@@ -36,22 +39,22 @@ def load_core():
 
 sf = load_core()
 
-# dashboard_model() gathers plain data, dashboard_draw() lays it out on a Canvas of styled cells, and curses shows that
-# canvas live while --once prints it, so the live view and the snapshot are the same picture.
+# dashboard_model() gathers plain data and dashboard_draw() lays it out on a Canvas of styled cells; the live view
+# and --once write that canvas as the same escape sequences, so they are the same picture.
 
 SPARK = "▁▂▃▄▅▆▇█"
 HISTORY_WINDOW = 3600  # seconds of queue.log the utilisation strip rebuilds
 LOG_TAIL = 262144  # bytes of queue.log read per refresh
 WIDE = 110  # columns from which the panels sit side by side
-# style -> (256-colour foreground, 8-colour foreground, attributes: b bold, d dim, r reverse). None keeps the
-# terminal's own foreground, so text reads on light and dark themes alike.
+# style -> (256-colour foreground, attributes: b bold, d dim, r reverse). None keeps the terminal's own foreground,
+# so text reads on light and dark themes alike.
 STYLES = {
-    "text": (None, None, ""), "bold": (None, None, "b"), "dim": (245, None, "d"), "frame": (239, None, "d"),
-    "title": (75, "cyan", "b"), "key": (75, "cyan", "b"), "accent": (75, "cyan", ""),
-    "ok": (114, "green", ""), "warn": (179, "yellow", ""), "bad": (167, "red", ""), "legacy": (176, "magenta", ""),
-    "badge-ok": (114, "green", "br"), "badge-warn": (179, "yellow", "br"), "badge-bad": (167, "red", "br"),
-    "h0": (75, "blue", ""), "h1": (79, "cyan", ""), "h2": (216, "green", ""), "h3": (141, "magenta", ""),
-    "h4": (110, "blue", ""), "h5": (186, "cyan", ""),
+    "text": (None, ""), "bold": (None, "b"), "dim": (245, "d"), "frame": (239, "d"),
+    "title": (75, "b"), "key": (75, "b"), "accent": (75, ""),
+    "ok": (114, ""), "warn": (179, ""), "bad": (167, ""), "legacy": (176, ""),
+    "badge-ok": (114, "br"), "badge-warn": (179, "br"), "badge-bad": (167, "br"),
+    "h0": (75, ""), "h1": (79, ""), "h2": (216, ""), "h3": (141, ""),
+    "h4": (110, ""), "h5": (186, ""),
 }
 HOLDER_STYLES = 6
 ASCII = str.maketrans({"█": "#", "▓": "%", "▒": "=", "░": ".", "·": ".", "●": "*", "…": "~", "─": "-", "│": "|",
@@ -204,19 +207,23 @@ class Canvas:
                 found.append([char, style, selected])
         return found
 
-    def render(self, colour: bool, ascii_only: bool = False) -> str:
-        lines = []
+    def lines(self, colour: bool, ascii_only: bool = False) -> list[str]:
+        """Every row at full width, with SGR colour codes when `colour`."""
+        found = []
         for y in range(self.height):
             if colour:
                 line = "".join(sgr(style, selected) + text + "\x1b[0m" for text, style, selected in self.runs(y))
             else:
-                line = "".join(char for char, _, _ in self.cells[y]).rstrip()
-            lines.append(line.translate(ASCII) if ascii_only else line)
-        return "\n".join(lines)
+                line = "".join(char for char, _, _ in self.cells[y])
+            found.append(line.translate(ASCII) if ascii_only else line)
+        return found
+
+    def render(self, colour: bool, ascii_only: bool = False) -> str:
+        return "\n".join(line if colour else line.rstrip() for line in self.lines(colour, ascii_only))
 
 
 def sgr(style: str, selected: bool) -> str:
-    fore, _, flags = STYLES[style]
+    fore, flags = STYLES[style]
     codes = ["0"] + (["1"] if "b" in flags else []) + (["2"] if "d" in flags and fore is None else [])
     codes += [f"38;5;{fore}"] if fore is not None else []
     codes += ["7"] if "r" in flags or selected else []
@@ -820,44 +827,61 @@ def draw_panel(canvas: Canvas, name: str, y: int, x: int, height: int, width: in
         draw_events(canvas, y, x, height, width, model)
 
 
-# Dashboard terminal
+# Dashboard terminal: plain escape sequences, not curses. The ncurses that Python links (6.0 here) repeats a
+# multibyte character with REP by sending only its last byte, and terminals with REP in their terminfo, such as
+# Ghostty and cmux, then draw each run of █ or ─ as garbage. Writing the canvas ourselves avoids every such quirk.
 
-def curses_styles(curses) -> dict[str, int]:
-    attributes, colours = {}, curses.has_colors()
-    background = -1
-    if colours:
-        curses.start_color()
-        try:
-            curses.use_default_colors()
-        except curses.error:
-            background = curses.COLOR_BLACK
-    rich = colours and curses.COLORS >= 256
-    for number, (name, (fore256, fore8, flags)) in enumerate(STYLES.items(), 1):
-        attribute = 0
-        colour = fore256 if rich else getattr(curses, f"COLOR_{fore8.upper()}") if fore8 else None
-        if colours and colour is not None and number < curses.COLOR_PAIRS:
-            curses.init_pair(number, colour, background)
-            attribute |= curses.color_pair(number)
-        attribute |= (curses.A_BOLD if "b" in flags else 0) | (curses.A_REVERSE if "r" in flags else 0)
-        attribute |= curses.A_DIM if "d" in flags and colour is None else 0
-        attributes[name] = attribute
-    return attributes
+KEYS = {"\x1b[A": "up", "\x1bOA": "up", "\x1b[B": "down", "\x1bOB": "down", "\x1b[H": "home", "\x1bOH": "home",
+        "\x1b[1~": "home", "\x1b[F": "end", "\x1bOF": "end", "\x1b[4~": "end", "\x1b[5~": "home", "\x1b[6~": "end"}
+SEQUENCE = re.compile(r"\x1b(\[[0-9;?]*[ -/]*[@-~]|O.)")
+PARTIAL = re.compile(r"\x1b(\[[0-9;?]*[ -/]*|O)?$")
+
+
+def read_keys(fd: int) -> list[str]:
+    """Keys waiting on fd: printable characters, the names in KEYS, or esc. A sequence split across reads is
+    completed first; one this view does not know is dropped rather than read as Esc and its letters."""
+    data = os.read(fd, 1024).decode("utf-8", "ignore")
+    while PARTIAL.search(data) and select.select([fd], [], [], 0.03)[0]:
+        data += os.read(fd, 1024).decode("utf-8", "ignore")
+    found, index = [], 0
+    while index < len(data):
+        name = next((KEYS[seq] for seq in KEYS if data.startswith(seq, index)), None)
+        sequence = SEQUENCE.match(data, index)
+        if name or sequence:
+            if name:
+                found.append(name)
+            index = sequence.end() if sequence else index + 1
+        else:
+            found.append("esc" if data[index] == "\x1b" else data[index])
+            index += 1
+    return found
+
+
+@contextlib.contextmanager
+def full_screen(fd_in: int, fd_out: int):
+    """The alternate screen with the cursor hidden, line wrap off and keys read one at a time without echo; Ctrl-C
+    still interrupts. Everything is put back on the way out."""
+    saved = termios.tcgetattr(fd_in)
+    try:
+        tty.setcbreak(fd_in)
+        os.write(fd_out, b"\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[2J")
+        yield
+    finally:
+        os.write(fd_out, b"\x1b[0m\x1b[?7h\x1b[?25h\x1b[?1049l")
+        termios.tcsetattr(fd_in, termios.TCSADRAIN, saved)
 
 
 def dashboard_live(interval: float) -> None:
-    import curses
-    ascii_only = "utf" not in (locale.getpreferredencoding(False) or "").lower()
-
-    def display(screen):
-        with contextlib.suppress(curses.error):
-            curses.curs_set(0)
-        styles = curses_styles(curses)
-        screen.keypad(True)
-        screen.timeout(250)
-        model = error = selected_key = None
-        index, colours, cwds = 0, {}, {}
-        paused = help_open = False
-        fetched, drawn, force, dirty = 0.0, 0.0, True, True
+    fd_in, fd_out = sys.stdin.fileno(), sys.stdout.fileno()
+    colour = not os.environ.get("NO_COLOR")
+    ascii_only = "utf" not in (sys.stdout.encoding or "").lower()
+    resized = []
+    signal.signal(signal.SIGWINCH, lambda *_: resized.append(True))
+    model = error = selected_key = None
+    index, colours, cwds, shown = 0, {}, {}, []
+    paused = help_open = False
+    fetched, drawn, force, dirty = 0.0, 0.0, True, True
+    with full_screen(fd_in, fd_out):
         while True:
             if force or (not paused and time.monotonic() - fetched >= interval):
                 try:
@@ -873,50 +897,47 @@ def dashboard_live(interval: float) -> None:
             selected_key = keys[index] if items else None
             if items and items[index]["kind"] != "waiting" and items[index]["pid"] not in cwds:
                 cwds[items[index]["pid"]] = process_cwd(items[index]["pid"])
+            if resized:
+                resized.clear()
+                shown, dirty = [], True  # redraw every row at the new size
+                os.write(fd_out, b"\x1b[2J")
             if dirty or time.monotonic() - drawn >= 1:
-                height, width = screen.getmaxyx()
-                canvas = Canvas(width, height)
+                size = os.get_terminal_size(fd_out)
+                canvas = Canvas(size.columns, size.lines)
                 dashboard_draw(canvas, model, index, paused, help_open, error,
                                cwds.get(items[index]["pid"]) if items else None)
-                screen.erase()
-                for y in range(height):
-                    x = 0
-                    for text, style, chosen in canvas.runs(y):
-                        with contextlib.suppress(curses.error):  # the bottom-right cell cannot be written
-                            screen.addstr(y, x, text.translate(ASCII) if ascii_only else text,
-                                          styles[style] | (curses.A_REVERSE if chosen else 0))
-                        x += text_width(text)
-                screen.refresh()
-                drawn, dirty = time.monotonic(), False
-            key = screen.getch()
-            if key == -1:
+                lines = canvas.lines(colour, ascii_only)
+                # Only rows that changed are written: a second's tick usually touches the clock and a few ages.
+                frame = "".join(f"\x1b[{row + 1};1H{line}" for row, line in enumerate(lines)
+                                if row >= len(shown) or shown[row] != line)
+                if frame:
+                    os.write(fd_out, frame.encode("utf-8", "replace"))
+                shown, drawn, dirty = lines, time.monotonic(), False
+            if not select.select([fd_in], [], [], 0.25)[0]:
                 continue
-            dirty = True
-            if key in (ord("q"), ord("Q")):
-                return
-            if key == 27:  # Esc only closes help: an escape sequence curses did not decode must not quit
-                help_open = False
-            elif key == ord("?"):
-                help_open = not help_open
-            elif key in (ord("p"), ord(" ")):
-                paused = not paused
-            elif key in (ord("r"), ord("R")):
-                screen.clear()
-                force = True
-            elif key in (ord("j"), curses.KEY_DOWN):
-                index += 1
-            elif key in (ord("k"), curses.KEY_UP):
-                index -= 1
-            elif key in (ord("g"), curses.KEY_HOME, curses.KEY_PPAGE):
-                index = 0
-            elif key in (ord("G"), curses.KEY_END, curses.KEY_NPAGE):
-                index = len(items) - 1
-            index = max(0, min(index, len(items) - 1))
-            selected_key = keys[index] if items else None
-
-    locale.setlocale(locale.LC_ALL, "")
-    os.environ.setdefault("ESCDELAY", "25")
-    curses.wrapper(display)
+            for key in read_keys(fd_in):
+                dirty = True
+                if key in ("q", "Q"):
+                    return
+                if key == "esc":
+                    help_open = False
+                elif key == "?":
+                    help_open = not help_open
+                elif key in ("p", " "):
+                    paused = not paused
+                elif key in ("r", "R"):
+                    shown, force = [], True
+                    os.write(fd_out, b"\x1b[2J")
+                elif key in ("j", "down"):
+                    index += 1
+                elif key in ("k", "up"):
+                    index -= 1
+                elif key in ("g", "home"):
+                    index = 0
+                elif key in ("G", "end"):
+                    index = len(items) - 1
+                index = max(0, min(index, len(items) - 1))
+                selected_key = keys[index] if items else None
 
 
 def dashboard_command(argv: list[str]) -> int:
@@ -962,8 +983,6 @@ def dashboard_command(argv: list[str]) -> int:
         dashboard_live(interval)
     except KeyboardInterrupt:
         pass
-    except ImportError:
-        raise sf.SlotError("dashboard needs Python's curses module; dashboard --once prints one snapshot") from None
     return 0
 
 

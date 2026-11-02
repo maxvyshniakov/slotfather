@@ -111,7 +111,8 @@ class SeparationTests(SlotCase):
         self.assertIn("usage: slotfather", result.stderr)
         pid, terminal = pty.fork()
         if pid == 0:
-            os.execve(TOOL, [TOOL], {**self.env, "TERM": "xterm-256color"})
+            # Ghostty's terminfo has REP, which the ncurses Python links sent as a lone last byte of █ or ─.
+            os.execve(TOOL, [TOOL], {**self.env, "TERM": "xterm-ghostty"})
         fcntl.ioctl(terminal, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
         screen, deadline = b"", time.monotonic() + 15
         while b"RUNNING" not in screen and time.monotonic() < deadline:
@@ -124,7 +125,7 @@ class SeparationTests(SlotCase):
             # Keep reading: a dashboard blocked on a full terminal never reads the q.
             if select.select([terminal], [], [], 0.1)[0]:
                 with contextlib.suppress(OSError):
-                    os.read(terminal, 65536)
+                    screen += os.read(terminal, 65536)
             done, code = os.waitpid(pid, os.WNOHANG)
             status = code if done else None
         os.close(terminal)
@@ -134,6 +135,10 @@ class SeparationTests(SlotCase):
             self.fail("the dashboard did not quit on q")
         self.assertIn(b"RUNNING", screen)
         self.assertEqual(0, os.waitstatus_to_exitcode(status))
+        text = screen.decode("utf-8")  # strict: a stray byte of a multibyte character fails here
+        self.assertIn("█", text)
+        self.assertNotRegex(text, r"\x1b\[\d+b", "no REP: a terminal repeats bytes, not characters")
+        self.assertTrue(text.rstrip().endswith("\x1b[?1049l"), "quitting leaves the alternate screen")
 
     def test_the_queue_code_holds_no_terminal_code(self):
         source = pathlib.Path(TOOL).read_text()
