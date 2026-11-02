@@ -358,6 +358,10 @@ def verdict(model: dict) -> tuple[str, str, str]:
     slots, used, free, waiters, guard = (model[k] for k in ("slots", "used", "free", "waiters", "guard"))
     if waiters:
         head = waiters[0]
+        if head["count"] > free and free and head["passable"]:
+            until = clock(head["since"] + datetime.timedelta(seconds=sf.overtake_window()))
+            return ("PASSING", "badge-ok", f"{head['label']} needs {head['count']} slots with {free} free · requests "
+                    f"that fit start before it until {until}")
         if head["count"] > free:
             behind = sum(1 for w in waiters[1:] if w["count"] <= free)
             fifo = f" · {behind} smaller request{'s' * (behind != 1)} that would fit wait behind it" if behind else ""
@@ -386,19 +390,21 @@ def dashboard_model() -> dict:
                 "rss": sum(p[2] for p in tree), "procs": len(tree),"key": (entry.get("pid"), entry.get("since")), "kind": kind, "count": count, "queue": queue,
                 "label": dashboard_text(entry.get("label", "")), "pid": entry.get("pid"),
                 "cmd": dashboard_text(entry.get("cmd", "")), "since": parse_utc(entry.get("since")),
-                "granted": parse_utc(entry.get("granted")),
+                "granted": parse_utc(entry.get("granted")), "passable": kind == "waiting" and sf.overtakable(entry),
                 "style": "warn" if kind == "waiting" else "legacy"}
 
     holders = [item(e, "held", e["count"]) for e in live if e["state"] == "held"]
     holders += [item(e, "legacy", count, str(path.parent.parent)) for path, e, count in legacy]
-    waiters = [item(e, "waiting", e["count"]) for e in live if e["state"] != "held"]
+    live_waiters = [e for e in live if e["state"] != "held"]
+    waiters = [item(e, "waiting", e["count"]) for e in live_waiters]
     used = sum(h["count"] for h in holders)
     guard, machine, averages = sf.memory_short(), sf.cores(), sf.loads()
     events = queue_events(directory)
     moment = datetime.datetime.now(datetime.timezone.utc)
     own_held = sum(h["count"] for h in holders if h["kind"] == "held")
     return {"directory": str(directory), "slots": slots, "saved": saved, "cores": machine, "averages": averages,
-            "advice": sf.size(slots, machine, slots, averages, min(used, slots), bool(waiters)),
+            "advice": sf.size(slots, machine, slots, averages, min(used, slots),
+                              bool(waiters) and sf.room(live_waiters, max(0, slots - used)) == 0),
             "holders": holders, "waiters": waiters, "used": used, "free": max(0, slots - used), "guard": guard,
             "memory": memory_facts(), "history": held_history(events, own_held, moment), "events": events[-60:],
             "updated": moment}

@@ -29,6 +29,7 @@ slotfather run -n 1 --label tests -- python3 -m unittest discover
 slotfather run -n 2 -- make build
 slotfather run -n all -- ./benchmark.sh
 slotfather status
+slotfather history 50
 slotfather available
 slotfather advise --max 4
 slotfather advise --exclusive
@@ -36,13 +37,13 @@ slotfather advise --exclusive
 
 `run` waits for capacity, holds a lease while its command runs, and returns the command's exit status. The default request is one slot. `--wait SECONDS` bounds the wait and returns 75 if capacity does not arrive; a missing executable returns 127 and a signal returns 128 plus its number.
 
-The automatic capacity is `max(1, cores // 3)`: four slots on a 12-core machine. A request larger than the machine's capacity takes every slot. Arrival order is strict: a queued all-slot request is never overtaken by later smaller requests. Use one slot for a suite or build, two for half this 12-core machine, and `all` for a benchmark requiring isolation.
+The automatic capacity is `max(1, cores // 3)`: four slots on a 12-core machine. A request larger than the machine's capacity takes every slot. Requests are served in arrival order with one exception: a waiter that does not fit lets later requests that fit start before it for `SLOTFATHER_OVERTAKE_WINDOW` seconds after it queued (default 600). After that it holds back everyone behind it, so an all-slot request starts no later than the window plus the longest run admitted during it. Use one slot for a suite or build, two for half this 12-core machine, and `all` for a benchmark requiring isolation; a waiting `-n all` request says so on stderr.
 
 Nested invocations inherit a live ancestor's lease rather than waiting for another one. Dead holders and reused PIDs are detected using process IDs and process start times. New leases wait while macOS reports low free swap or memory-pressure warning, except that an otherwise idle machine can start one request. With swap turned off there is no swap to run short of, so only memory pressure holds leases back.
 
 `advise` prints a JSON worker-budget decision. It uses the lower of the one- and five-minute load averages, subtracts the CPU share explained by held slots, and reserves the rest for unleased work. The 15-minute tail is recorded but does not shrink a new run after earlier work ended. `--exclusive` assumes the caller will wait for every slot; it is advice, not a lease.
 
-State lives in `~/.local/state/slotfather/`; `queue.log` records grants, releases, and reaping. `status` lists holders and waiters. The extracted version also reads leases in Straylight's earlier queue during migration; old clients do not see new leases, so retire old wrappers before relying on mutual isolation.
+State lives in `~/.local/state/slotfather/`; `queue.log` records grants, releases, and reaping. `history.jsonl` has one JSON line per request that left the queue: label, command, directory, slots, queue, grant and end times, seconds waited and run, the outcome (`released`, `left` after giving up, or `reaped`) and, for `run`, the exit status; past 4 MB its older half is dropped. `history [N]` lists the last N (default 20). `status` lists holders and waiters. The extracted version also reads leases in Straylight's earlier queue during migration; old clients do not see new leases, so retire old wrappers before relying on mutual isolation.
 
 ## Dashboard
 
@@ -87,6 +88,7 @@ Capacity changes and reset are refused while any live holder or waiter exists, i
 | `SLOTFATHER_LEGACY_DIRS` | Colon-separated old queues; defaults to `~/.local/state/straylight-verification/slots`. Empty disables migration reads. |
 | `SLOTFATHER_POLL` | How often a waiter checks its own entry, and its first interval between full looks at the queue, in seconds; default 2. |
 | `SLOTFATHER_POLL_MAX` | Longest interval between a waiter's full looks (each runs `ps` under the queue lock); default 10. The interval grows by half while the reason to wait stays the same. A release grants waiters at once, so the backoff only delays reaping a crashed holder and recovery from memory pressure. |
+| `SLOTFATHER_OVERTAKE_WINDOW` | Seconds after it queued during which a waiter that does not fit lets later requests that fit start first; default 600. `0` serves strictly in arrival order. |
 | `SLOTFATHER_LOADAVG` | Advice test/diagnostic override: one number or `load1 load5 load15`. |
 | `SLOTFATHER_MEMORY_FILE` | Memory test seam: file containing `free_swap_MB pressure_level`. |
 
@@ -98,4 +100,4 @@ A command receives `SLOTFATHER_LEASE` and `SLOTFATHER_COUNT` for its existing le
 slotfather run -n 1 -- python3 -m unittest discover -s tests -v
 ```
 
-Installer tests use isolated home directories and real live-process entries to check refusal, preservation, file guards, and repeated installation. Queue tests observe commands and queue admission using independent temporary state, controlled release files, and real child processes. They cover FIFO fairness, exclusive requests, nesting, stale leases, memory guard, CLI outcomes, legacy migration, load advice, and persistent shared capacity changes.
+Installer tests use isolated home directories and real live-process entries to check refusal, preservation, file guards, and repeated installation. Queue tests observe commands and queue admission using independent temporary state, controlled release files, and real child processes. They cover FIFO fairness, the overtaking window, the run history, exclusive requests, nesting, stale leases, memory guard, CLI outcomes, legacy migration, load advice, and persistent shared capacity changes.

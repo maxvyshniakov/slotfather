@@ -3,6 +3,7 @@
 
   slotfather run [-n N|all] [--label L] [--wait S] [--] COMMAND...   run COMMAND holding N slots (default 1)
   slotfather status                                                  holders and waiters, in queue order
+  slotfather history [N]                                             the last N requests that left the queue
   slotfather slots [N|reset]                                           show, save or reset shared capacity
   slotfather available                                               slots a new request gets at once
   slotfather advise [--max N] [--exclusive]                          a job count for the load, as JSON
@@ -15,8 +16,10 @@ Slots: one per three cores, at least one, so `total = max(1, cores // 3)`: 4 on 
 `slotfather slots N` saves shared capacity; `slotfather slots reset` restores the automatic default.
 SLOTFATHER_CORES replaces the core count. A request above the total takes every slot.
 
-Requests are served strictly in arrival order: an all-slot request at the head of the queue is not overtaken
-by later 1-slot requests. A process that already runs under a lease (SLOTFATHER_LEASE, or a holder among its
+Requests are served in arrival order, with one exception: a waiter that does not fit lets later requests that fit
+start before it until it has waited SLOTFATHER_OVERTAKE_WINDOW seconds (default 600; 0 serves strictly in order).
+Past that it holds back everyone behind it, so an all-slot request starts at most the window plus the longest run
+admitted meanwhile after it queued. A process that already runs under a lease (SLOTFATHER_LEASE, or a holder among its
 ancestors) runs without a second lease, so nested wrappers neither deadlock nor count twice. A lease whose
 holder died (its pid gone, or reused by a process with another start time) is reaped by the next queue
 operation. While memory is short (free swap under SLOTFATHER_MIN_FREE_SWAP_MB, default 512, where swap is on; or the
@@ -35,9 +38,10 @@ the total) nor, without --exclusive, the free slots, and at least 1. SLOTFATHER_
 averages: "load1 load5 load15", or one number for all three.
 
 State: ~/.local/state/slotfather (SLOTFATHER_DIR replaces it; queue.log records grants, releases and
-reaps). Held leases in the queues listed in SLOTFATHER_LEGACY_DIRS (colon-separated; default Straylight's
-earlier ~/.local/state/straylight-verification/slots; empty to ignore) count as used, scaled from their 4
-slots, until their holders exit. SLOTFATHER_POLICY: normal (default), background (low QoS), or bypass (no
+reaps; history.jsonl, which `history` lists, has a line per request that left the queue: its command, directory,
+wait, run and outcome). Held leases in the queues listed in SLOTFATHER_LEGACY_DIRS (colon-separated; default
+Straylight's earlier ~/.local/state/straylight-verification/slots; empty to ignore) count as used, scaled from
+their 4 slots, until their holders exit. SLOTFATHER_POLICY: normal (default), background (low QoS), or bypass (no
 lease; for a person who knows the machine is idle). Standard library only, Python 3.9 or later: install.py puts it
 and slotfather-dashboard, which `slotfather dashboard` runs from beside it, in ~/.local/bin.
 """
@@ -71,6 +75,11 @@ MAX_PRESSURE_LEVEL = 1  # kern.memorystatus_vm_pressure_level: 1 normal, 2 warni
 POLICIES = ("normal", "background", "bypass")
 TIMED_OUT = 75  # EX_TEMPFAIL
 POLL_MAX = 10  # seconds between a long waiter's full looks at the queue
+OVERTAKE_WINDOW = 600  # seconds a waiter that does not fit lets later requests that fit start first
+HISTORY_MAX = 4 << 20  # bytes of history.jsonl; past it the older half is dropped
+ALL_NOTE = ("-n all holds every later request behind it until the whole machine is free; use it only for work that "
+            "needs the machine to itself, such as a performance measurement, and otherwise ask for the slots the "
+            "command uses")
 # The variables a lease hands its command; a client may add its own prefix (Straylight's STRAYLIGHT_SLOT_).
 LEASE_ENV_PREFIXES = ["SLOTFATHER_"]
 
@@ -130,6 +139,14 @@ def loads() -> tuple[float, float, float]:
     return os.getloadavg()
 
 
+def overtake_window() -> float:
+    """SLOTFATHER_OVERTAKE_WINDOW in seconds; a value that is not a number serves strictly in order."""
+    try:
+        return max(0.0, float(setting("OVERTAKE_WINDOW") or OVERTAKE_WINDOW))
+    except ValueError:
+        return 0.0
+
+
 def legacy_dirs() -> list[Path]:
     value = setting("LEGACY_DIRS", DEFAULT_LEGACY_DIRS)
     own = state_dir().resolve()
@@ -139,6 +156,22 @@ def legacy_dirs() -> list[Path]:
 
 def now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def seconds(stamp) -> float | None:
+    """A now() stamp as epoch seconds, or None."""
+    try:
+        return datetime.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=datetime.timezone.utc).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def duration(value: float) -> str:
+    value = int(value)
+    if value >= 3600:
+        return f"{value // 3600}h{value % 3600 // 60:02d}m"
+    return f"{value // 60}m{value % 60:02d}s" if value >= 60 else f"{value}s"
 
 
 # Processes
@@ -254,7 +287,48 @@ def reap(directory: Path, table: dict) -> list[tuple[Path, dict]]:
             path.unlink(missing_ok=True)
             log(directory, f"reaped {entry.get('state')} lease of {entry.get('count')} for "
                            f"{entry.get('label')} (pid {entry.get('pid')} exited)")
+            record(directory, entry, "reaped")
     return live
+
+
+def record(directory: Path, entry: dict, outcome: str, status: int | None = None) -> None:
+    """Add a request that left the queue to history.jsonl: released (it ran), left (it gave up waiting) or reaped
+    (its holder died). Callers hold the queue lock."""
+    ended = time.time()
+    queued, granted = seconds(entry.get("since")), seconds(entry.get("granted"))
+    item = {"label": entry.get("label"), "cmd": entry.get("cmd"), "cwd": entry.get("cwd"), "count": entry.get("count"),
+            "pid": entry.get("pid"), "queued": entry.get("since"), "granted": entry.get("granted"), "ended": now(),
+            "outcome": outcome, "waited": None if queued is None else round((granted or ended) - queued),
+            "ran": None if granted is None else round(ended - granted), "status": status}
+    path = directory / "history.jsonl"
+    with contextlib.suppress(OSError):
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(item) + "\n")
+        if path.stat().st_size > HISTORY_MAX:
+            lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+            pending = path.with_name(path.name + ".pending")
+            pending.write_text("".join(lines[len(lines) // 2:]), encoding="utf-8")
+            pending.replace(path)
+
+
+def history_lines(limit: int, directory: Path | None = None) -> list[str]:
+    """The last `limit` requests that left the queue, oldest first."""
+    try:
+        lines = ((directory or state_dir()) / "history.jsonl").read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return []
+    found = []
+    for line in lines[-limit:]:
+        with contextlib.suppress(ValueError):
+            item = json.loads(line)
+            ended = seconds(item.get("ended"))
+            when = time.strftime("%m-%d %H:%M", time.localtime(ended)) if ended is not None else "?"
+            waited = "?" if item.get("waited") is None else duration(item["waited"])
+            ran = "" if item.get("ran") is None else f" ran {duration(item['ran'])}"
+            status = "" if item.get("status") is None else f" exit {item['status']}"
+            found.append(f"{when} {item.get('outcome')}: {item.get('count')} slot(s) {item.get('label')} waited "
+                         f"{waited}{ran}{status} cmd={item.get('cmd')}")
+    return found
 
 
 def legacy_holders(table: dict) -> list[tuple[Path, dict, int]]:
@@ -272,17 +346,41 @@ def legacy_used(table: dict) -> int:
     return sum(count for _, _, count in legacy_holders(table))
 
 
+def overtakable(entry: dict, moment: float | None = None) -> bool:
+    """Whether later requests that fit may still start before this waiter: it has waited less than the window."""
+    queued = seconds(entry.get("since"))
+    return queued is not None and (time.time() if moment is None else moment) - queued < overtake_window()
+
+
+def room(waiters: list[dict], free: int) -> int:
+    """The slots a new request gets at once behind `waiters` with `free` slots unheld, as grant() admits it."""
+    for entry in waiters:
+        if entry["count"] <= free:
+            free -= entry["count"]
+        elif not overtakable(entry):
+            return 0
+    return free
+
+
 def grant(directory: Path, table: dict) -> str | None:
-    """Grant waiters at the head of the queue while they fit; returns why the head still waits."""
+    """Grant waiters in queue order while they fit. One that does not fit lets later ones that fit start first until
+    it has waited the overtaking window, then holds back everyone behind it. Returns why the first that does not fit
+    still waits."""
     live = reap(directory, table)
     slots = total()
     used = sum(e["count"] for _, e in live if e["state"] == "held") + legacy_used(table)
-    short = None
+    short = blocked = None
     for path, entry in live:
         if entry["state"] == "held":
             continue
-        if entry["count"] > slots - used:
-            return f"{max(0, slots - used)} of {slots} slots free"
+        free = max(0, slots - used)
+        if entry["count"] > free:
+            if not overtakable(entry):
+                return blocked or f"{free} of {slots} slots free"
+            until = time.strftime("%H:%M:%S", time.localtime(seconds(entry["since"]) + overtake_window()))
+            blocked = blocked or (f"{free} of {slots} slots free; requests that fit may pass {entry['label']} "
+                                  f"until {until}")
+            continue
         if used:
             short = short or memory_short()
             if short:
@@ -291,7 +389,7 @@ def grant(directory: Path, table: dict) -> str | None:
         write(path, entry)
         used += entry["count"]
         log(directory, f"granted {entry['count']} to {entry['label']} (pid {entry['pid']})")
-    return None
+    return blocked
 
 
 def log(directory: Path, message: str) -> None:
@@ -320,13 +418,11 @@ def status_lines(directory: Path | None = None) -> list[str]:
 
 
 def available(directory: Path | None = None) -> int:
-    """How many slots a new request would get at once: the free ones, or none while another request waits,
-    since the queue serves requests in arrival order."""
+    """How many slots a new request would get at once: the free ones less what waiters take first, or none while a
+    waiter that has waited past the overtaking window holds back everyone behind it."""
     live, legacy, _ = snapshot(directory)
-    if any(e["state"] != "held" for e in live):
-        return 0
-    used = sum(e["count"] for e in live) + sum(count for _, _, count in legacy)
-    return max(0, total() - used)
+    used = sum(e["count"] for e in live if e["state"] == "held") + sum(count for _, _, count in legacy)
+    return room([e for e in live if e["state"] != "held"], max(0, total() - used))
 
 
 # Sizing
@@ -358,8 +454,9 @@ def advise(maximum: int | None = None, exclusive: bool = False, cores_now: int |
     held = sum(e["count"] for e in live if e["state"] == "held" and not (mine and e["pid"] == mine[1]["pid"]))
     held += sum(count for path, e, count in legacy if not (mine and path == mine[0]))
     slots = total()
+    waiters = [e for e in live if e["state"] != "held"]
     return size(maximum or slots, cores_now or cores(), slots, averages or loads(),
-                min(held, slots), any(e["state"] != "held" for e in live), exclusive)
+                min(held, slots), bool(waiters) and room(waiters, max(0, slots - held)) == 0, exclusive)
 
 
 # Leases
@@ -369,6 +466,7 @@ class Lease:
 
     def __init__(self, count: int, path: Path | None = None, inherited: bool = False):
         self.count, self.path, self.inherited = count, path, inherited
+        self.status = None  # the command's exit status, for the history, where the holder knows it
 
     def environment(self) -> dict[str, str]:
         if self.path is None:
@@ -382,8 +480,14 @@ class Lease:
         if self.path is not None and not self.inherited:
             directory = self.path.parent.parent
             with locked(directory):
+                try:
+                    entry = json.loads(self.path.read_text())
+                except (OSError, ValueError):
+                    entry = None
                 self.path.unlink(missing_ok=True)
                 log(directory, f"released {self.count} ({self.path.name})")
+                if isinstance(entry, dict):
+                    record(directory, entry, "released" if entry.get("state") == "held" else "left", self.status)
                 # Hand the slots on now: waiters look at the queue less often the longer they wait.
                 with contextlib.suppress(SlotError, OSError):
                     grant(directory, processes())
@@ -425,9 +529,11 @@ def policy() -> str:
     return value
 
 
-def acquire(count: int | str, label: str, command: str = "", out=sys.stderr, wait: float | None = None) -> Lease:
+def acquire(count: int | str, label: str, command: str = "", out=sys.stderr, wait: float | None = None,
+            note: str = "") -> Lease:
     """Wait in the queue for `count` slots (at most the total); the lease is held by this process until released.
-    Raises SlotTimeout, having left the queue, when `wait` seconds pass first."""
+    Raises SlotTimeout, having left the queue, when `wait` seconds pass first. `note` follows the first word that
+    the request waits."""
     if count != "all" and (type(count) is not int or count < 1):
         raise SlotError("count must be a positive integer or all")
     if policy() == "bypass":
@@ -440,6 +546,10 @@ def acquire(count: int | str, label: str, command: str = "", out=sys.stderr, wai
     poll = float(setting("POLL") or 2)
     poll_max = max(poll, float(setting("POLL_MAX") or POLL_MAX))
     me = os.getpid()
+    try:
+        cwd = os.getcwd()
+    except OSError:
+        cwd = ""
     with locked(directory):
         # Admission and capacity changes share this lock; resolve all only now.
         count = total() if count == "all" else min(count, total())
@@ -451,7 +561,7 @@ def acquire(count: int | str, label: str, command: str = "", out=sys.stderr, wai
         sequence_file.write_text(str(sequence))
         path = directory / "queue" / f"{sequence:010d}-{me}.json"
         write(path, {"pid": me, "start": table.get(me, (0, ""))[1], "count": count, "label": label,
-                     "cmd": command, "since": now(), "state": "waiting"})
+                     "cmd": command, "cwd": cwd, "since": now(), "state": "waiting"})
     lease = Lease(count, path)
     deadline = None if wait is None else time.monotonic() + wait
     # A terminated waiter leaves the queue at once rather than at the next reap.
@@ -483,6 +593,8 @@ def acquire(count: int | str, label: str, command: str = "", out=sys.stderr, wai
                       file=out, flush=True)
                 for line in status_lines(directory):
                     print(f"  {line}", file=out, flush=True)
+                if note and said is None:
+                    print(f"slot: {note}", file=out, flush=True)
                 said = waiting
             pause = min(poll, max(0.0, look - time.monotonic()))
             time.sleep(pause if deadline is None else max(0.0, min(pause, deadline - time.monotonic())))
@@ -502,7 +614,7 @@ def run(count: int | str, label: str, argv: list[str], wait: float | None = None
     """Run argv under a lease of `count` slots; the command's exit status."""
     try:
         background = policy() == "background"
-        lease = acquire(count, label, " ".join(argv), wait=wait)
+        lease = acquire(count, label, " ".join(argv), wait=wait, note=ALL_NOTE if count == "all" else "")
     except SlotTimeout as error:
         print(f"slot: {label}: {error}", file=sys.stderr)
         return TIMED_OUT
@@ -529,7 +641,8 @@ def run(count: int | str, label: str, argv: list[str], wait: float | None = None
         for signum in (signal.SIGTERM, signal.SIGHUP):
             signal.signal(signum, forward)
         status = child.wait()
-    return 128 - status if status < 0 else status
+        lease.status = 128 - status if status < 0 else status
+    return lease.status
 
 
 # Command line
@@ -547,7 +660,7 @@ def dashboard(argv: list[str]) -> int:
 
 USAGE = ("usage: slotfather                     (in a terminal: the live dashboard)\n"
          "       slotfather run [-n N|all] [--label L] [--wait SECONDS] [--] COMMAND...\n"
-         "       slotfather status | available | advise [--max N] [--exclusive]\n"
+         "       slotfather status | available | history [N] | advise [--max N] [--exclusive]\n"
          "       slotfather slots [N|reset]\n"
          "       slotfather dashboard [--interval SECONDS] | dashboard --once [--width N] [--height N] [--color]")
 
@@ -636,6 +749,9 @@ def main(argv: list[str] | None = None) -> int:
             return slots_command(rest)
         if command == "status" and not rest:
             print("\n".join(status_lines()))
+            return 0
+        if command == "history" and (not rest or (len(rest) == 1 and rest[0].isdigit())):
+            print("\n".join(history_lines(int(rest[0]) if rest else 20)))
             return 0
         if command == "available" and not rest:
             print(available())

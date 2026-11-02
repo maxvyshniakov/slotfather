@@ -65,6 +65,20 @@ class DashboardTests(SlotCase):
         for process in (holder, gate, small):
             self.finish(process)
 
+    def test_within_the_overtaking_window_smaller_requests_pass_a_blocked_head(self):
+        self.env["SLOTFATHER_OVERTAKE_WINDOW"] = "600"
+        holder = self.request("holder", 2)
+        self.started("holder")
+        gate = self.request("gate", "all")
+        self.wait_for(lambda: "waiting: 4 slot(s) gate" in self.status(), "the gate to queue")
+        text = self.snapshot()
+        self.assertIn("PASSING", text)
+        self.assertIn("gate needs 4 slots with 2 free · requests that fit start before it until", text)
+        for label in ("holder", "gate"):
+            self.release(label)
+        for process in (holder, gate):
+            self.finish(process)
+
     def test_every_terminal_size_draws_without_error(self):
         holder = self.request("a-rather-long-label-for-a-holder", 1)
         self.started("a-rather-long-label-for-a-holder")

@@ -36,6 +36,7 @@ class SlotCase(unittest.TestCase):
         self.memory.write_text("8000 1\n")
         self.env = {k: v for k, v in os.environ.items() if not k.startswith(("SLOTFATHER", "STRAYLIGHT_SLOT"))}
         self.env.update(SLOTFATHER_DIR=str(self.state), SLOTFATHER_LEGACY_DIRS="", SLOTFATHER_POLL="0.05", SLOTFATHER_POLL_MAX="0.5",
+                        SLOTFATHER_OVERTAKE_WINDOW="0",
                         SLOTFATHER_CORES="12", SLOTFATHER_MEMORY_FILE=str(self.memory), LOG=str(self.log),
                         RELEASE=str(self.release_dir))
         self.processes = []
@@ -258,6 +259,94 @@ class NestingTests(SlotCase):
         count, path = seen.read_text().split()
         self.assertEqual("2", count)
         self.assertTrue(path.startswith(str(self.state / "queue")), path)
+
+
+class OvertakeTests(SlotCase):
+    """A waiter that does not fit lets later requests that fit start first until it has waited the window."""
+
+    def queue_gate_behind_one(self, window):
+        self.env["SLOTFATHER_OVERTAKE_WINDOW"] = window
+        one = self.request("one", 1)
+        self.started("one")
+        gate = self.request("gate", "all")
+        self.wait_for(lambda: "waiting: 4 slot(s) gate" in self.status(), "the gate to queue")
+        return one, gate
+
+    def test_within_the_window_a_smaller_request_passes_a_blocked_gate(self):
+        one, gate = self.queue_gate_behind_one("600")
+        self.assertIn("requests that fit may pass gate until", self.output_line(gate))
+        self.assertEqual("3", self.tool("available").stdout.strip(), "the waiting gate holds no slots back yet")
+        later = self.request("later", 1)
+        self.started("later")
+        self.release("one")
+        self.wait_for(lambda: "end one" in self.events(), "one to end")
+        self.assertNotIn("start gate", self.events(), "the gate needs every slot, and later still holds one")
+        self.release("later")
+        self.started("gate")
+        self.release("gate")
+        for process in (one, gate, later):
+            self.finish(process)
+        self.assertEqual(["start one", "start later", "end one", "end later", "start gate", "end gate"],
+                         self.events())
+
+    def test_past_the_window_a_blocked_gate_holds_back_later_requests(self):
+        one, gate = self.queue_gate_behind_one("1")
+        time.sleep(2.1)  # queue stamps have whole seconds
+        self.assertEqual("0", self.tool("available").stdout.strip())
+        later = self.request("later", 1)
+        self.wait_for(lambda: "waiting: 1 slot(s) later" in self.status(), "the later request to queue")
+        self.release("one")
+        self.started("gate")
+        self.assertNotIn("start later", self.events())
+        self.release("gate")
+        self.started("later")
+        self.release("later")
+        for process in (one, gate, later):
+            self.finish(process)
+
+    def test_an_all_slot_request_that_waits_says_what_all_is_for(self):
+        one, gate = self.queue_gate_behind_one("0")
+        self.release("one")
+        self.release("gate")
+        self.finish(one)
+        self.assertEqual(1, self.finish(gate).count("slot: -n all holds every later request behind it"))
+
+
+class HistoryTests(SlotCase):
+    def history(self):
+        lines = (self.state / "history.jsonl").read_text().splitlines()
+        return {item["label"]: item for item in map(json.loads, lines)}
+
+    def test_each_request_that_leaves_the_queue_is_recorded(self):
+        whole = self.request("whole", "all")
+        self.started("whole")
+        late = self.request("late", 1, options=("--wait", "0.3"))
+        self.assertEqual(75, late.wait(timeout=20))
+        self.release("whole")
+        self.finish(whole)
+        self.assertEqual(3, self.tool("run", "--label", "fails", "--", "sh", "-c", "exit 3").returncode)
+        found = self.history()
+        self.assertEqual(("released", 4, 0, os.getcwd()), (found["whole"]["outcome"], found["whole"]["count"],
+                                                         found["whole"]["status"], found["whole"]["cwd"]))
+        self.assertGreaterEqual(found["whole"]["ran"], 0)
+        self.assertEqual(("left", None, None), (found["late"]["outcome"], found["late"]["granted"],
+                                                found["late"]["ran"]))
+        self.assertEqual(("released", 3, "sh -c exit 3"), (found["fails"]["outcome"], found["fails"]["status"],
+                                                           found["fails"]["cmd"]))
+        listing = self.tool("history").stdout
+        self.assertRegex(listing, r"left: 1 slot\(s\) late waited \d+s cmd=sh")
+        self.assertRegex(listing, r"released: 1 slot\(s\) fails waited \d+s ran \d+s exit 3 cmd=sh -c exit 3")
+        self.assertEqual(1, len(self.tool("history", "1").stdout.splitlines()))
+
+    def test_a_reaped_lease_is_recorded(self):
+        (self.state / "queue").mkdir(parents=True)
+        (self.state / "queue" / "0000000001-1.json").write_text(json.dumps(
+            {"pid": os.getpid(), "start": "Thu Jan  1 00:00:00 1970", "count": 2, "label": "crashed", "cmd": "fake",
+             "since": "2026-01-01T00:00:00Z", "granted": "2026-01-01T00:01:00Z", "state": "held"}))
+        self.status()
+        item = self.history()["crashed"]
+        self.assertEqual(("reaped", 60), (item["outcome"], item["waited"]))
+        self.assertGreater(item["ran"], 0)
 
 
 class StaleLeaseTests(SlotCase):
