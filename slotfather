@@ -4,6 +4,7 @@
   slotfather run [-n N|all] [--label L] [--wait S] [--] COMMAND...   run COMMAND holding N slots (default 1)
   slotfather status                                                  holders and waiters, in queue order
   slotfather history [N]                                             the last N requests that left the queue
+  slotfather stats [--since W] [--label L] [--by B] [--json]         what leases used and how full the machine was
   slotfather slots [N|reset]                                           show, save or reset shared capacity
   slotfather available                                               slots a new request gets at once
   slotfather advise [--max N] [--exclusive]                          a job count for the load, as JSON
@@ -39,11 +40,16 @@ averages: "load1 load5 load15", or one number for all three.
 
 State: ~/.local/state/slotfather (SLOTFATHER_DIR replaces it; queue.log records grants, releases and
 reaps; history.jsonl, which `history` lists, has a line per request that left the queue: its command, directory,
-wait, run and outcome). Held leases in the queues listed in SLOTFATHER_LEGACY_DIRS (colon-separated; default
-Straylight's earlier ~/.local/state/straylight-verification/slots; empty to ignore) count as used, scaled from
-their 4 slots, until their holders exit. SLOTFATHER_POLICY: normal (default), background (low QoS), or bypass (no
-lease; for a person who knows the machine is idle). Standard library only, Python 3.9 or later: install.py puts it
-and slotfather-dashboard, which `slotfather dashboard` runs from beside it, in ~/.local/bin.
+wait, run and outcome, and for `run` what its process tree used; machine.jsonl samples the machine while leases
+run; `stats` reads both). While its command runs, the holder looks at the command's process tree every
+SLOTFATHER_SAMPLE_MAX seconds at most (default 10; the first look comes sooner): CPU time is the command's own
+rusage, which holds every descendant reaped inside the tree, plus the sampled CPU of processes that left the tree
+(orphans, and launchd children carrying the lease's SLOTFATHER_LEASE). Held leases in the queues listed in
+SLOTFATHER_LEGACY_DIRS (colon-separated; default Straylight's earlier ~/.local/state/straylight-verification/slots;
+empty to ignore) count as used, scaled from their 4 slots, until their holders exit. SLOTFATHER_POLICY: normal
+(default), background (low QoS), or bypass (no lease; for a person who knows the machine is idle). Standard library
+only, Python 3.9 or later: install.py puts it, slotfather-dashboard and slotfather-stats, which `slotfather
+dashboard` and `slotfather stats` run from beside it, in ~/.local/bin.
 """
 from __future__ import annotations
 
@@ -76,7 +82,15 @@ POLICIES = ("normal", "background", "bypass")
 TIMED_OUT = 75  # EX_TEMPFAIL
 POLL_MAX = 10  # seconds between a long waiter's full looks at the queue
 OVERTAKE_WINDOW = 600  # seconds a waiter that does not fit lets later requests that fit start first
-HISTORY_MAX = 4 << 20  # bytes of history.jsonl; past it the older half is dropped
+HISTORY_MAX = 4 << 20  # bytes of history.jsonl; past it the file becomes history.jsonl.1, replacing the older one
+# history.jsonl lines: version 1 had no "v" field and no usage; version 2 adds "v", what a `run` used (cpu,
+# cpu_detached, wall, rss_peak_mb, rss_mean_mb, processes, samples) and the machine's cores and capacity.
+HISTORY_VERSION = 2
+MACHINE_VERSION = 1  # machine.jsonl lines
+MACHINE_MAX = 4 << 20  # bytes of machine.jsonl before it becomes machine.jsonl.1
+MACHINE_EVERY = 15  # seconds between machine samples while any lease runs
+SAMPLE_FIRST = 0.5  # seconds before a holder's first look at its command's process tree
+SAMPLE_MAX = 10  # longest interval between those looks; each is half as long again as the one before
 ALL_NOTE = ("-n all holds every later request behind it until the whole machine is free; use it only for work that "
             "needs the machine to itself, such as a performance measurement, and otherwise ask for the slots the "
             "command uses")
@@ -249,6 +263,264 @@ def pressure_level() -> float | None:
     return float(value) if value and value.isdigit() else None
 
 
+# Usage: what a lease's process tree used, and what the machine did meanwhile
+
+def cpu_seconds(text: str) -> float | None:
+    """ps `time` ([days-][hours:]minutes:seconds.fraction) as seconds, or None."""
+    days, _, rest = text.strip().rpartition("-")
+    try:
+        value = 0.0
+        for part in rest.split(":"):
+            value = value * 60 + float(part)
+        return value + (int(days) * 86400 if days else 0)
+    except ValueError:
+        return None
+
+
+def started_at(lstart: str) -> float | None:
+    """A `ps -o lstart` time (C locale) as epoch seconds, or None."""
+    try:
+        return time.mktime(time.strptime(" ".join(lstart.split()), "%a %b %d %H:%M:%S %Y"))
+    except ValueError:
+        return None
+
+
+def usage_table() -> dict[int, tuple[int, str, int, int, float]]:
+    """Live pid -> (ppid, start, uid, resident KB, CPU seconds of its own), from one ps over the machine."""
+    result = subprocess.run(["ps", "-axo", "pid=,ppid=,uid=,rss=,time=,lstart="], capture_output=True, text=True,
+                            env={**os.environ, "LC_ALL": "C"})
+    table = {}
+    for line in result.stdout.splitlines():
+        parts = line.split(None, 5)
+        if len(parts) == 6 and all(p.isdigit() for p in parts[:4]):
+            cpu = cpu_seconds(parts[4])
+            if cpu is not None:
+                table[int(parts[0])] = (int(parts[1]), parts[5].strip(), int(parts[2]), int(parts[3]), cpu)
+    return table
+
+
+def carrying(pids: list[int], lease: str) -> set[int]:
+    """Those of `pids` whose environment holds SLOTFATHER_LEASE=<lease>. macOS shows another process's environment
+    only for the user's own processes that are not platform binaries; the rest read as not carrying it."""
+    if not pids:
+        return set()
+    result = subprocess.run(["ps", "-wwE", "-o", "pid=,command=", "-p", ",".join(map(str, pids))],
+                            capture_output=True, text=True, env={**os.environ, "LC_ALL": "C"})
+    mark = " SLOTFATHER_LEASE=" + lease
+    found = set()
+    for line in result.stdout.splitlines():
+        pid, _, rest = line.strip().partition(" ")
+        at = (" " + rest).find(mark)
+        tail = (" " + rest)[at + len(mark):] if at >= 0 else None
+        if pid.isdigit() and tail is not None and (not tail or tail[0] == " "):
+            found.add(int(pid))
+    return found
+
+
+class TreeUsage:
+    """CPU and memory of one command's process tree, from snapshots of the process table.
+
+    A process is the lease's while it descends from the command (attached), and stays the lease's after its parent
+    exits and launchd adopts it (detached); a child of launchd started during the lease joins it when its
+    environment carries the lease (`marked`). CPU time of every process an attached parent reaps reaches the
+    command's own rusage at its exit, so it is not summed here; a detached process is reaped by launchd, so its CPU
+    is the last sample of its own time. Processes born and gone between two samples outside the attached tree are
+    not seen. Resident memory is the sum over the tree's processes (shared pages count once per process)."""
+
+    def __init__(self, root: int, since: float, marked=None, uid: int | None = None):
+        self.root, self.since = root, since
+        self.marked = marked or (lambda pids: set())
+        self.uid = os.getuid() if uid is None else uid
+        self.root_start = None
+        self.members = {}  # (pid, start) -> [own CPU seconds at the last sample, attached]
+        self.checked = set()  # (pid, start) of launchd children already considered
+        self.detached_gone = 0.0
+        self.processes = self.samples = 0
+        self.rss_peak = 0  # KB
+        self.rss_area = self.span = 0.0  # KB x seconds, seconds
+        self.last = None  # (moment, resident KB) of the previous sample
+
+    def observe(self, moment: float, table: dict) -> None:
+        for key in list(self.members):
+            row = table.get(key[0])
+            if row is None or row[1] != key[1]:
+                cpu, attached = self.members.pop(key)
+                if not attached:
+                    self.detached_gone += cpu
+        children = {}
+        for pid, row in table.items():
+            children.setdefault(row[0], []).append(pid)
+
+        def tree(roots) -> set[int]:
+            found, stack = set(), [p for p in roots if p in table]
+            while stack:
+                pid = stack.pop()
+                if pid not in found:
+                    found.add(pid)
+                    stack.extend(children.get(pid, ()))
+            return found
+
+        if self.root_start is None and self.root in table:
+            self.root_start = table[self.root][1]
+        attached = tree([self.root]) if self.root in table and table[self.root][1] == self.root_start else set()
+        fresh = []
+        for pid, row in table.items():
+            key = (pid, row[1])
+            if row[0] == 1 and row[2] == self.uid and key not in self.members and key not in self.checked:
+                self.checked.add(key)
+                begun = started_at(row[1])
+                if begun is not None and begun >= self.since - 1:
+                    fresh.append(pid)
+        adopted = self.marked(fresh) if fresh else set()
+        detached = tree([pid for pid, _ in self.members if pid not in attached] + list(adopted)) - attached
+        resident = 0
+        for pid in attached | detached:
+            row = table[pid]
+            key = (pid, row[1])
+            if key not in self.members:
+                self.processes += 1
+            self.members[key] = [row[4], pid in attached]
+            resident += row[3]
+        if self.last is not None:
+            self.rss_area += self.last[1] * (moment - self.last[0])
+            self.span += moment - self.last[0]
+        self.last = (moment, resident)
+        self.rss_peak = max(self.rss_peak, resident)
+        self.samples += 1
+
+    def detached(self) -> float:
+        """CPU seconds of processes that left the attached tree: gone, and still running at the last sample."""
+        return self.detached_gone + sum(cpu for cpu, attached in self.members.values() if not attached)
+
+    def result(self, reaped_cpu: float, reaped_peak_kb: int = 0, wall: float | None = None) -> dict:
+        """Usage for the history, once the command has exited and the last sample was taken after its exit:
+        `reaped_cpu` and `reaped_peak_kb` come from the command's rusage."""
+        detached = self.detached()
+        mean = self.rss_area / self.span if self.span > 0 else (self.last[1] if self.last else 0)
+        found = {"cpu": round(reaped_cpu + detached, 2), "cpu_detached": round(detached, 2),
+                 "rss_peak_mb": round(max(self.rss_peak, reaped_peak_kb) / 1024, 1),
+                 "rss_mean_mb": round(mean / 1024, 1), "processes": self.processes, "samples": self.samples}
+        if wall is not None:
+            found["wall"] = round(wall, 2)
+        return found
+
+
+class Watch(threading.Thread):
+    """The holder's sampler: looks at the command's tree, first after SAMPLE_FIRST seconds and then half as long
+    again each time up to SLOTFATHER_SAMPLE_MAX, and samples the machine when no holder has lately. A fault here
+    never reaches the lease: the history then lacks what could not be measured."""
+
+    def __init__(self, usage: TreeUsage, directory: Path):
+        super().__init__(daemon=True, name="slotfather-watch")
+        self.usage, self.directory = usage, directory
+        try:
+            self.most = max(0.05, float(setting("SAMPLE_MAX") or SAMPLE_MAX))
+        except ValueError:
+            self.most = SAMPLE_MAX
+        self.stopped = threading.Event()
+        self.lock = threading.Lock()
+
+    def look(self) -> None:
+        with contextlib.suppress(Exception):
+            table = usage_table()
+            with self.lock:
+                self.usage.observe(time.time(), table)
+        with contextlib.suppress(Exception):
+            sample_machine(self.directory)
+
+    def run(self) -> None:
+        interval = min(SAMPLE_FIRST, self.most)
+        while not self.stopped.wait(interval):
+            self.look()
+            interval = min(interval * 1.5, self.most)
+
+    def finish(self, rusage, wall: float) -> dict | None:
+        """Stops sampling, takes the last look (after the command exited) and returns the usage."""
+        self.stopped.set()
+        self.join(timeout=30)
+        try:
+            table = usage_table()
+            with self.lock:
+                self.usage.observe(time.time(), table)
+                if rusage is None:
+                    return None
+                peak = rusage.ru_maxrss // 1024 if sys.platform == "darwin" else rusage.ru_maxrss  # bytes on macOS
+                return self.usage.result(rusage.ru_utime + rusage.ru_stime, peak, wall)
+        except Exception:  # noqa: BLE001 - measuring must never cost the lease its release
+            return None
+
+
+_host_port = None
+
+
+def cpu_ticks() -> list[int] | None:
+    """Cumulative CPU ticks of the whole machine: [user, system, idle, nice], or None where unavailable."""
+    global _host_port
+    if sys.platform == "darwin":
+        try:
+            import ctypes
+            libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+            if _host_port is None:
+                libc.mach_host_self.restype = ctypes.c_uint
+                _host_port = libc.mach_host_self()
+            counts, size = (ctypes.c_uint * 4)(), ctypes.c_uint(4)
+            if libc.host_statistics(_host_port, 3, counts, ctypes.byref(size)) == 0:  # HOST_CPU_LOAD_INFO
+                return list(counts)
+        except (OSError, AttributeError):
+            return None
+        return None
+    with contextlib.suppress(OSError, ValueError):
+        fields = Path("/proc/stat").read_text().split("\n", 1)[0].split()[1:]
+        user, nice, system, idle = (int(v) for v in fields[:4])
+        return [user, system, idle + sum(int(v) for v in fields[4:5]), nice]  # iowait counts as idle
+    return None
+
+
+def machine_facts(directory: Path) -> dict:
+    """One machine sample: load, cumulative CPU ticks (busy is the change between two samples), memory pressure,
+    swap and the slots held."""
+    held = [e for _, e in entries(directory) if e.get("state") == "held"]
+    swap = swap_usage()
+    level = pressure_level()
+    free = sysctl("kern.memorystatus_level")
+    item = {"v": MACHINE_VERSION, "t": now(), "at": round(time.time(), 2),
+            "load": [round(v, 2) for v in os.getloadavg()], "ticks": cpu_ticks(), "cores": cores(),
+            "pressure": level, "memory_free_pct": int(free) if free and free.isdigit() else None,
+            "swap_total_mb": None if swap is None else round(swap[0]),
+            "swap_free_mb": None if swap is None else round(swap[1]),
+            "held": sum(e["count"] for e in held), "leases": len(held)}
+    with contextlib.suppress(SlotError):
+        item["capacity"] = total()
+    return item
+
+
+def sample_machine(directory: Path) -> bool:
+    """Appends a machine sample unless one was taken in the last SLOTFATHER_MACHINE_EVERY seconds; holders share
+    the duty through machine.jsonl's age and a lock of its own, never the queue's."""
+    path = directory / "machine.jsonl"
+    try:
+        every = float(setting("MACHINE_EVERY") or MACHINE_EVERY)
+    except ValueError:
+        every = MACHINE_EVERY
+
+    def due() -> bool:
+        try:
+            return time.time() - path.stat().st_mtime >= every
+        except FileNotFoundError:
+            return True
+    if not due():
+        return False
+    with open(directory / ".machine.lock", "a") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        if not due():
+            return False
+        append_bounded(path, json.dumps(machine_facts(directory)) + "\n", MACHINE_MAX)
+        return True
+
+
 # Queue
 
 @contextlib.contextmanager
@@ -291,43 +563,69 @@ def reap(directory: Path, table: dict) -> list[tuple[Path, dict]]:
     return live
 
 
-def record(directory: Path, entry: dict, outcome: str, status: int | None = None) -> None:
+def record(directory: Path, entry: dict, outcome: str, status: int | None = None, usage: dict | None = None) -> None:
     """Add a request that left the queue to history.jsonl: released (it ran), left (it gave up waiting) or reaped
-    (its holder died). Callers hold the queue lock."""
+    (its holder died), with what its process tree used where the holder measured it. Callers hold the queue lock."""
     ended = time.time()
     queued, granted = seconds(entry.get("since")), seconds(entry.get("granted"))
-    item = {"label": entry.get("label"), "cmd": entry.get("cmd"), "cwd": entry.get("cwd"), "count": entry.get("count"),
-            "pid": entry.get("pid"), "queued": entry.get("since"), "granted": entry.get("granted"), "ended": now(),
-            "outcome": outcome, "waited": None if queued is None else round((granted or ended) - queued),
+    item = {"v": HISTORY_VERSION, "label": entry.get("label"), "cmd": entry.get("cmd"), "cwd": entry.get("cwd"),
+            "count": entry.get("count"), "pid": entry.get("pid"), "queued": entry.get("since"),
+            "granted": entry.get("granted"), "ended": now(), "outcome": outcome,
+            "waited": None if queued is None else round((granted or ended) - queued),
             "ran": None if granted is None else round(ended - granted), "status": status}
-    path = directory / "history.jsonl"
+    with contextlib.suppress(SlotError, OSError):
+        item.update(cores=cores(), capacity=total())
+    item.update(usage or {})
     with contextlib.suppress(OSError):
-        with open(path, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(item) + "\n")
-        if path.stat().st_size > HISTORY_MAX:
-            lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
-            pending = path.with_name(path.name + ".pending")
-            pending.write_text("".join(lines[len(lines) // 2:]), encoding="utf-8")
-            pending.replace(path)
+        append_bounded(directory / "history.jsonl", json.dumps(item) + "\n", HISTORY_MAX)
+
+
+def append_bounded(path: Path, line: str, limit: int) -> None:
+    """Append a line; past `limit` bytes the file becomes <name>.1, replacing the previous one, so at most two
+    files' worth stays. Readers read <name>.1 first, then <name>."""
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(line)
+    if path.stat().st_size > limit:
+        path.replace(path.with_name(path.name + ".1"))
+
+
+def journal(path: Path):
+    """The JSON objects of a bounded file and its rotated predecessor, oldest first; lines that do not parse (a
+    torn write, a foreign line) are skipped."""
+    for part in (path.with_name(path.name + ".1"), path):
+        try:
+            text = part.read_text(encoding="utf-8")
+        except (FileNotFoundError, UnicodeDecodeError):
+            continue
+        for line in text.splitlines():
+            with contextlib.suppress(ValueError):
+                item = json.loads(line)
+                if isinstance(item, dict):
+                    yield item
+
+
+def history_items(directory: Path | None = None) -> list[dict]:
+    """Every request in history.jsonl (and its rotated part), oldest first. Version-1 lines read as they are: they
+    lack "v" and the usage fields."""
+    return list(journal((directory or state_dir()) / "history.jsonl"))
 
 
 def history_lines(limit: int, directory: Path | None = None) -> list[str]:
     """The last `limit` requests that left the queue, oldest first."""
-    try:
-        lines = ((directory or state_dir()) / "history.jsonl").read_text(encoding="utf-8").splitlines()
-    except FileNotFoundError:
-        return []
     found = []
-    for line in lines[-limit:]:
-        with contextlib.suppress(ValueError):
-            item = json.loads(line)
-            ended = seconds(item.get("ended"))
-            when = time.strftime("%m-%d %H:%M", time.localtime(ended)) if ended is not None else "?"
-            waited = "?" if item.get("waited") is None else duration(item["waited"])
-            ran = "" if item.get("ran") is None else f" ran {duration(item['ran'])}"
-            status = "" if item.get("status") is None else f" exit {item['status']}"
-            found.append(f"{when} {item.get('outcome')}: {item.get('count')} slot(s) {item.get('label')} waited "
-                         f"{waited}{ran}{status} cmd={item.get('cmd')}")
+    for item in history_items(directory)[-limit:]:
+        ended = seconds(item.get("ended"))
+        when = time.strftime("%m-%d %H:%M", time.localtime(ended)) if ended is not None else "?"
+        waited = "?" if item.get("waited") is None else duration(item["waited"])
+        ran = "" if item.get("ran") is None else f" ran {duration(item['ran'])}"
+        status = "" if item.get("status") is None else f" exit {item['status']}"
+        used = ""
+        if isinstance(item.get("cpu"), (int, float)):
+            wall = item.get("wall") or item.get("ran")
+            cores_used = f"{item['cpu'] / wall:.1f} cores" if wall else f"{item['cpu']:.0f} s CPU"
+            used = f" used {cores_used}, {item.get('rss_peak_mb', 0):.0f} MB"
+        found.append(f"{when} {item.get('outcome')}: {item.get('count')} slot(s) {item.get('label')} waited "
+                     f"{waited}{ran}{status}{used} cmd={item.get('cmd')}")
     return found
 
 
@@ -467,6 +765,7 @@ class Lease:
     def __init__(self, count: int, path: Path | None = None, inherited: bool = False):
         self.count, self.path, self.inherited = count, path, inherited
         self.status = None  # the command's exit status, for the history, where the holder knows it
+        self.usage = None  # what the command's process tree used (TreeUsage.result), where the holder measured it
 
     def environment(self) -> dict[str, str]:
         if self.path is None:
@@ -487,7 +786,8 @@ class Lease:
                 self.path.unlink(missing_ok=True)
                 log(directory, f"released {self.count} ({self.path.name})")
                 if isinstance(entry, dict):
-                    record(directory, entry, "released" if entry.get("state") == "held" else "left", self.status)
+                    record(directory, entry, "released" if entry.get("state") == "held" else "left", self.status,
+                           self.usage)
                 # Hand the slots on now: waiters look at the queue less often the longer they wait.
                 with contextlib.suppress(SlotError, OSError):
                     grant(directory, processes())
@@ -632,35 +932,60 @@ def run(count: int | str, label: str, argv: list[str], wait: float | None = None
         except OSError as error:
             print(f"slot: {error}", file=sys.stderr)
             return 127
+        began = time.monotonic()
+        watch = None
+        if lease.path is not None and not lease.inherited:
+            marker = str(lease.path)
+            watch = Watch(TreeUsage(child.pid, time.time() - 1, lambda pids: carrying(pids, marker)),
+                          lease.path.parent.parent)
+            with contextlib.suppress(RuntimeError):
+                watch.start()
+        reaped = []
 
         def forward(signum, _frame):
-            with contextlib.suppress(ProcessLookupError):
-                child.send_signal(signum)
+            # os.kill rather than child.send_signal, which polls and could reap the child before wait4 sees it;
+            # until wait4 returns the child (a zombie at worst) keeps its pid.
+            if not reaped:
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(child.pid, signum)
         # The terminal sends SIGINT to the child's process group itself; the lease outlives the child.
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         for signum in (signal.SIGTERM, signal.SIGHUP):
             signal.signal(signum, forward)
-        status = child.wait()
+        try:
+            _, raw, rusage = os.wait4(child.pid, 0)  # the rusage holds every descendant reaped inside the tree
+            status = os.waitstatus_to_exitcode(raw)
+        except ChildProcessError:
+            status, rusage = child.wait(), None
+        reaped.append(True)
+        child.returncode = status
+        if watch is not None and watch.is_alive():
+            lease.usage = watch.finish(rusage, time.monotonic() - began)
         lease.status = 128 - status if status < 0 else status
     return lease.status
 
 
 # Command line
 
-def dashboard(argv: list[str]) -> int:
-    """Runs slotfather-dashboard from beside this file with this interpreter: the view's code never loads with the
-    queue's, and a fault in it cannot reach admission."""
-    path = Path(__file__).resolve().with_name("slotfather-dashboard")
+def companion(name: str, argv: list[str], title: str) -> int:
+    """Runs slotfather-<name> from beside this file with this interpreter: the dashboard's and the statistics' code
+    never loads with the queue's, and a fault in it cannot reach admission."""
+    path = Path(__file__).resolve().with_name(f"slotfather-{name}")
     if not path.is_file():
-        raise SlotError(f"the dashboard is not installed beside slotfather: {path}")
+        raise SlotError(f"{title} is not installed beside slotfather: {path}")
     os.execv(sys.executable, [sys.executable, str(path), *argv])
     return 0  # not reached
+
+
+def dashboard(argv: list[str]) -> int:
+    return companion("dashboard", argv, "the dashboard")
 
 
 
 USAGE = ("usage: slotfather                     (in a terminal: the live dashboard)\n"
          "       slotfather run [-n N|all] [--label L] [--wait SECONDS] [--] COMMAND...\n"
          "       slotfather status | available | history [N] | advise [--max N] [--exclusive]\n"
+         "       slotfather stats [--since WHEN] [--label GLOB] [--by both|label|kind] [--top N] [--json]\n"
          "       slotfather slots [N|reset]\n"
          "       slotfather dashboard [--interval SECONDS] | dashboard --once [--width N] [--height N] [--color]")
 
@@ -760,6 +1085,8 @@ def main(argv: list[str] | None = None) -> int:
             return advise_command(rest)
         if command == "dashboard":
             return dashboard(rest)
+        if command == "stats":
+            return companion("stats", rest, "slotfather-stats")
         if command in ("-h", "--help", "help"):
             print(__doc__)
             return 0

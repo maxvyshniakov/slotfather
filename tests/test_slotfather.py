@@ -335,7 +335,8 @@ class HistoryTests(SlotCase):
                                                            found["fails"]["cmd"]))
         listing = self.tool("history").stdout
         self.assertRegex(listing, r"left: 1 slot\(s\) late waited \d+s cmd=sh")
-        self.assertRegex(listing, r"released: 1 slot\(s\) fails waited \d+s ran \d+s exit 3 cmd=sh -c exit 3")
+        self.assertRegex(listing, r"released: 1 slot\(s\) fails waited \d+s ran \d+s exit 3 used [\d.]+ cores, \d+ MB "
+                                  r"cmd=sh -c exit 3")
         self.assertEqual(1, len(self.tool("history", "1").stdout.splitlines()))
 
     def test_a_reaped_lease_is_recorded(self):
