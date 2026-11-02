@@ -325,7 +325,7 @@ class TreeUsage:
     environment carries the lease (`marked`). CPU time of every process an attached parent reaps reaches the
     command's own rusage at its exit, so it is not summed here; a detached process is reaped by launchd, so its CPU
     is the last sample of its own time. Processes born and gone between two samples outside the attached tree are
-    not seen. Resident memory is the sum over the tree's processes (shared pages count once per process)."""
+    not seen, nor is a child that exits unwaited-for before its parent exits (launchd reaps that zombie). Resident memory is the sum over the tree's processes (shared pages count once per process)."""
 
     def __init__(self, root: int, since: float, marked=None, uid: int | None = None):
         self.root, self.since = root, since

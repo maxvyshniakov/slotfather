@@ -135,7 +135,7 @@ class RunUsageTests(SlotCase):
 
     def test_a_run_records_the_cpu_of_its_whole_tree_and_of_a_child_that_outlives_its_parent(self):
         script = ('"$PY" -c "$BURN" 0.4 & "$PY" -c "$BURN" 0.4; wait; '
-                  '( "$PY" -c "$BURN" 0.6 & sleep 0.6 ); sleep 1.5')
+                  '( "$PY" -c "$BURN" 1.0 & sleep 0.3 ); sleep 2')
         result = self.tool("run", "--label", "tree", "--", "sh", "-c", script)
         self.assertEqual(0, result.returncode, result.stderr)
         item = self.history()[-1]
