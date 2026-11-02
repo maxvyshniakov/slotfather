@@ -12,6 +12,7 @@ import unittest
 ROOT = Path(__file__).resolve().parent.parent
 PAYLOAD = b"#!/bin/sh\nprintf slotfather-fixture\n"
 DASHBOARD = b"#!/usr/bin/env python3\nprint('dashboard fixture')\n"
+STATS = b"#!/usr/bin/env python3\nprint('stats fixture')\n"
 
 
 class InstallTests(unittest.TestCase):
@@ -33,6 +34,7 @@ class InstallTests(unittest.TestCase):
             shutil.copyfile(ROOT / "install.py", self.source / "install.py")
         (self.source / "slotfather").write_bytes(PAYLOAD)
         (self.source / "slotfather-dashboard").write_bytes(DASHBOARD)
+        (self.source / "slotfather-stats").write_bytes(STATS)
         self.env = {**os.environ, "HOME": str(self.home)}
 
     def run_install(self, *options):
@@ -77,6 +79,7 @@ class InstallTests(unittest.TestCase):
         self.assertFalse((self.bin / "machine-slot").exists())
         self.assertTrue(os.access(self.bin / "slotfather", os.X_OK))
         self.assertTrue(os.access(self.bin / "slotfather-dashboard", os.X_OK))
+        self.assertTrue(os.access(self.bin / "slotfather-stats", os.X_OK))
 
     def test_installed_commands_name_the_installing_interpreter_instead_of_env(self):
         result = self.run_install("--python", sys.executable)
@@ -86,6 +89,8 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(PAYLOAD, (self.bin / "slotfather").read_bytes(), "only an env python3 shebang is pinned")
         run = subprocess.run([str(self.bin / "slotfather-dashboard")], capture_output=True, text=True)
         self.assertEqual("dashboard fixture\n", run.stdout)
+        self.assertEqual(f"#!{sys.executable}\nprint('stats fixture')\n".encode(),
+                         (self.bin / "slotfather-stats").read_bytes())
 
     def test_an_interpreter_older_than_the_minimum_is_refused_before_any_change(self):
         old_python = self.tmp / "python3.8"

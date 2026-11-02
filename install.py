@@ -21,7 +21,7 @@ import uuid
 
 MIN_PYTHON = (3, 9)
 ENV_SHEBANG = b"#!/usr/bin/env python3\n"
-COMMANDS = ("slotfather", "slotfather-dashboard")
+COMMANDS = ("slotfather", "slotfather-dashboard", "slotfather-stats")
 USAGE = "usage: python3 install.py [--python /path/to/python3]"
 GUARD = b"Retired queue: use slotfather with ~/.local/state/slotfather. Update this checkout before running heavy work.\n"
 
@@ -207,12 +207,13 @@ def install(home, source, python):
                 changing = True
                 empty.unlink()  # This is now the temporary guard, never queue data.
             changing = True
-            # The dashboard first: an executable that names a missing view is the shorter-lived mismatch.
+            # The companions (dashboard, stats) first: an executable that names a missing one is the shorter-lived
+            # mismatch.
             for name in reversed(COMMANDS):
                 install_binary(source.with_name(name), home / ".local/bin" / name, python)
             old_command.unlink(missing_ok=True)
-            print(f"Installed {home / '.local/bin/slotfather'} and slotfather-dashboard for {python}; "
-                  "old queue paths are file guards")
+            print(f"Installed {home / '.local/bin/slotfather'}, slotfather-dashboard and slotfather-stats for "
+                  f"{python}; old queue paths are file guards")
         finally:
             # An idleness refusal leaves original state and commands untouched.
             # Once exchanges begin, preserve every guard and backup even on error.
