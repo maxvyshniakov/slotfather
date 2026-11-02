@@ -19,7 +19,6 @@ from pathlib import Path
 import re
 import select
 import shutil
-import signal
 import subprocess
 import sys
 import termios
@@ -875,12 +874,10 @@ def dashboard_live(interval: float) -> None:
     fd_in, fd_out = sys.stdin.fileno(), sys.stdout.fileno()
     colour = not os.environ.get("NO_COLOR")
     ascii_only = "utf" not in (sys.stdout.encoding or "").lower()
-    resized = []
-    signal.signal(signal.SIGWINCH, lambda *_: resized.append(True))
     model = error = selected_key = None
-    index, colours, cwds, shown = 0, {}, {}, []
+    index, colours, cwds, shown, drawn_size = 0, {}, {}, [], None
     paused = help_open = False
-    fetched, drawn, force, dirty = 0.0, 0.0, True, True
+    fetched, drawn, whole, force, dirty = 0.0, 0.0, 0.0, True, True
     with full_screen(fd_in, fd_out):
         while True:
             if force or (not paused and time.monotonic() - fetched >= interval):
@@ -897,12 +894,14 @@ def dashboard_live(interval: float) -> None:
             selected_key = keys[index] if items else None
             if items and items[index]["kind"] != "waiting" and items[index]["pid"] not in cwds:
                 cwds[items[index]["pid"]] = process_cwd(items[index]["pid"])
-            if resized:
-                resized.clear()
-                shown, dirty = [], True  # redraw every row at the new size
+            size = os.get_terminal_size(fd_out)  # read each pass: at most 0.25 s behind a resize
+            if size != drawn_size:
+                # A terminal reflows its own screen on resize: clear it and draw every row.
                 os.write(fd_out, b"\x1b[2J")
-            if dirty or time.monotonic() - drawn >= 1:
-                size = os.get_terminal_size(fd_out)
+                shown, drawn_size, dirty = [], size, True
+            elif time.monotonic() - whole >= 5:
+                shown = []  # rewrite every row now and then, in place, so a stray line cannot stay wrong
+            if dirty or time.monotonic() - drawn >= 1 or not shown:
                 canvas = Canvas(size.columns, size.lines)
                 dashboard_draw(canvas, model, index, paused, help_open, error,
                                cwds.get(items[index]["pid"]) if items else None)
@@ -912,6 +911,7 @@ def dashboard_live(interval: float) -> None:
                                 if row >= len(shown) or shown[row] != line)
                 if frame:
                     os.write(fd_out, frame.encode("utf-8", "replace"))
+                whole = time.monotonic() if not shown else whole
                 shown, drawn, dirty = lines, time.monotonic(), False
             if not select.select([fd_in], [], [], 0.25)[0]:
                 continue
