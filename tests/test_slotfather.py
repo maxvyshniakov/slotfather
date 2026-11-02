@@ -6,6 +6,8 @@ in which requests start is observable without timing guesses. Each test has its 
 """
 from __future__ import annotations
 
+import importlib.machinery
+import importlib.util
 import json
 import os
 import pathlib
@@ -13,6 +15,7 @@ import select
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -32,7 +35,7 @@ class SlotCase(unittest.TestCase):
         self.memory = self.tmp / "memory"
         self.memory.write_text("8000 1\n")
         self.env = {k: v for k, v in os.environ.items() if not k.startswith(("SLOTFATHER", "STRAYLIGHT_SLOT"))}
-        self.env.update(SLOTFATHER_DIR=str(self.state), SLOTFATHER_LEGACY_DIRS="", SLOTFATHER_POLL="0.05",
+        self.env.update(SLOTFATHER_DIR=str(self.state), SLOTFATHER_LEGACY_DIRS="", SLOTFATHER_POLL="0.05", SLOTFATHER_POLL_MAX="0.5",
                         SLOTFATHER_CORES="12", SLOTFATHER_MEMORY_FILE=str(self.memory), LOG=str(self.log),
                         RELEASE=str(self.release_dir))
         self.processes = []
@@ -301,6 +304,53 @@ class StaleLeaseTests(SlotCase):
         self.finish(holder)
 
 
+class PollingTests(SlotCase):
+    def count_ps(self):
+        """Puts a ps that counts its runs first on PATH for requests started from now; returns the count file."""
+        tools, count = self.tmp / "tools", self.tmp / "ps-runs"
+        tools.mkdir()
+        (tools / "ps").write_text(f'#!/bin/sh\necho run >> "{count}"\nexec /bin/ps "$@"\n')
+        (tools / "ps").chmod(0o755)
+        count.touch()
+        self.env = {**self.env, "PATH": f"{tools}:{self.env['PATH']}"}
+        return count
+
+    def test_a_long_waiter_looks_at_the_queue_less_and_less_often(self):
+        holder = self.request("holder", "all")
+        self.started("holder")
+        count = self.count_ps()
+        self.env["SLOTFATHER_POLL_MAX"] = "1"
+        waiter = self.request("waiter", 1)
+        self.wait_for(lambda: count.read_text(), "the waiter's first look")
+        time.sleep(3)
+        looks = len(count.read_text().split())
+        # Every 0.05 s would be about 60 looks; growing by half each time to 1 s it is about 10.
+        self.assertLess(looks, 20, "a waiter whose reason to wait does not change should back off")
+        self.release("holder")
+        self.started("waiter")
+        self.release("waiter")
+        for process in (holder, waiter):
+            self.finish(process)
+
+    def test_a_release_hands_its_slots_on_without_waiting_for_the_next_look(self):
+        holder = self.request("holder", "all")
+        self.started("holder")
+        waiter = self.request("waiter", 1)
+        self.wait_for(lambda: "waiting: 1 slot(s) waiter" in self.status(), "the waiter to queue")
+        # A stopped waiter takes no look of its own, so only the release can grant it.
+        os.kill(waiter.pid, signal.SIGSTOP)
+        try:
+            self.release("holder")
+            self.wait_for(lambda: "held: 1 slot(s) waiter" in self.status(), "the release to grant the waiter",
+                          timeout=5)
+        finally:
+            os.kill(waiter.pid, signal.SIGCONT)
+        self.started("waiter")
+        self.release("waiter")
+        for process in (holder, waiter):
+            self.finish(process)
+
+
 class MemoryGuardTests(SlotCase):
     def test_new_leases_wait_while_swap_is_short_and_start_when_it_recovers(self):
         holder = self.request("holder", 1)
@@ -328,6 +378,15 @@ class MemoryGuardTests(SlotCase):
         self.release("guarded")
         self.finish(guarded)
 
+    def test_a_host_with_swap_turned_off_has_no_swap_floor(self):
+        loader = importlib.machinery.SourceFileLoader("slotfather_tool", TOOL)
+        tool = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(tool)
+        self.assertIsNone(tool.swap_free_mb("total = 0.00M  used = 0.00M  free = 0.00M  (encrypted)"))
+        self.assertEqual(148.0, tool.swap_free_mb("total = 2048.00M  used = 1900.00M  free = 148.00M  (encrypted)"))
+        self.assertEqual(1536.0, tool.swap_free_mb("total = 2.00G  used = 512.00M  free = 1.50G  (encrypted)"))
+        self.assertIsNone(tool.swap_free_mb(""))
+
     def test_with_nothing_running_a_short_swap_does_not_block(self):
         self.memory.write_text("0 4\n")
         lone = self.request("lone", 4)
@@ -337,6 +396,14 @@ class MemoryGuardTests(SlotCase):
 
 
 class CommandLineTests(SlotCase):
+    def test_an_interpreter_older_than_the_minimum_says_how_to_reinstall(self):
+        result = subprocess.run([sys.executable, "-c", "import runpy, sys; sys.version_info = (3, 8, 0); "
+                                 f"runpy.run_path({TOOL!r}, run_name='__main__')", "status"],
+                                env=self.env, capture_output=True, text=True, timeout=20)
+        self.assertEqual(1, result.returncode)
+        self.assertIn("slotfather needs Python 3.9 or later", result.stderr)
+        self.assertIn("install.py", result.stderr)
+
     def test_bypass_runs_without_a_lease(self):
         holder = self.request("holder", 4)
         self.started("holder")

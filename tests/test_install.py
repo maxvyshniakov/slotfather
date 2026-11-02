@@ -11,6 +11,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
 PAYLOAD = b"#!/bin/sh\nprintf slotfather-fixture\n"
+DASHBOARD = b"#!/usr/bin/env python3\nprint('dashboard fixture')\n"
 
 
 class InstallTests(unittest.TestCase):
@@ -31,10 +32,14 @@ class InstallTests(unittest.TestCase):
         if (ROOT / "install.py").exists():
             shutil.copyfile(ROOT / "install.py", self.source / "install.py")
         (self.source / "slotfather").write_bytes(PAYLOAD)
+        (self.source / "slotfather-dashboard").write_bytes(DASHBOARD)
         self.env = {**os.environ, "HOME": str(self.home)}
 
-    def run_install(self):
-        return subprocess.run([sys.executable, str(self.source / "install.py")], env=self.env,
+    def run_install(self, *options):
+        # A test runner inside a virtual environment names its own interpreter, which the installer then accepts.
+        if sys.prefix != sys.base_prefix and not options:
+            options = ("--python", sys.executable)
+        return subprocess.run([sys.executable, str(self.source / "install.py"), *options], env=self.env,
                               capture_output=True, text=True, timeout=20)
 
     def queue(self, path, *, state="held", pid=99999999, start="gone"):
@@ -71,6 +76,29 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(PAYLOAD, (self.bin / "slotfather").read_bytes())
         self.assertFalse((self.bin / "machine-slot").exists())
         self.assertTrue(os.access(self.bin / "slotfather", os.X_OK))
+        self.assertTrue(os.access(self.bin / "slotfather-dashboard", os.X_OK))
+
+    def test_installed_commands_name_the_installing_interpreter_instead_of_env(self):
+        result = self.run_install("--python", sys.executable)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        installed = (self.bin / "slotfather-dashboard").read_bytes()
+        self.assertEqual(f"#!{sys.executable}\nprint('dashboard fixture')\n".encode(), installed)
+        self.assertEqual(PAYLOAD, (self.bin / "slotfather").read_bytes(), "only an env python3 shebang is pinned")
+        run = subprocess.run([str(self.bin / "slotfather-dashboard")], capture_output=True, text=True)
+        self.assertEqual("dashboard fixture\n", run.stdout)
+
+    def test_an_interpreter_older_than_the_minimum_is_refused_before_any_change(self):
+        old_python = self.tmp / "python3.8"
+        old_python.write_text("#!/bin/sh\necho 3.8\n")
+        old_python.chmod(0o755)
+        self.queue(self.old)
+        before = self.contents(self.old)
+        result = self.run_install("--python", str(old_python))
+        self.assertEqual(2, result.returncode)
+        self.assertIn("is Python 3.8; slotfather needs 3.9 or later", result.stderr)
+        self.assertEqual(before, self.contents(self.old))
+        self.assertFalse((self.bin / "slotfather").exists())
+        self.assertEqual("old command", (self.bin / "machine-slot").read_text())
 
     def test_live_old_holders_and_waiters_refuse_without_changing_state(self):
         pid, start = self.live_process()

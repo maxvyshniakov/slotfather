@@ -3,6 +3,10 @@
 
 This explicit migration is outside normal queue admission. It preserves every old
 queue as the new queue or a named backup, and blocks old clients with file guards.
+
+The installed commands run on one named interpreter: `#!/usr/bin/env python3` becomes
+the interpreter running this installer (or --python), so an agent inside a project's
+virtual environment still runs slotfather on the Python it was installed with.
 """
 from contextlib import ExitStack, contextmanager
 import ctypes
@@ -15,6 +19,10 @@ import sys
 import tempfile
 import uuid
 
+MIN_PYTHON = (3, 9)
+ENV_SHEBANG = b"#!/usr/bin/env python3\n"
+COMMANDS = ("slotfather", "slotfather-dashboard")
+USAGE = "usage: python3 install.py [--python /path/to/python3]"
 GUARD = b"Retired queue: use slotfather with ~/.local/state/slotfather. Update this checkout before running heavy work.\n"
 
 
@@ -85,8 +93,33 @@ def make_guard(path):
     return path.stat().st_ino
 
 
-def install_binary(source, target):
+def interpreter(argv):
+    """The interpreter the commands will name: --python PATH, else this one unless it belongs to a virtual
+    environment, whose interpreter disappears with the project. It must exist and be Python 3.9 or later."""
+    if argv:
+        if len(argv) != 2 or argv[0] != "--python":
+            raise InstallError(USAGE)
+        python = os.path.abspath(os.path.expanduser(argv[1]))
+    elif sys.prefix != sys.base_prefix:
+        raise InstallError("this Python belongs to a virtual environment; run install.py with a Python outside it, "
+                           "or name one with --python")
+    else:
+        python = sys.executable  # as invoked, not resolved: a version-manager link keeps following upgrades
+    try:
+        found = subprocess.run([python, "-c", "import sys; print('%d.%d' % sys.version_info[:2])"],
+                               capture_output=True, text=True, timeout=20).stdout.strip()
+        version = tuple(int(part) for part in found.split("."))
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        raise InstallError(f"cannot run {python} as Python") from None
+    if version < MIN_PYTHON:
+        raise InstallError(f"{python} is Python {found}; slotfather needs {MIN_PYTHON[0]}.{MIN_PYTHON[1]} or later")
+    return python
+
+
+def install_binary(source, target, python):
     payload = source.read_bytes()
+    if payload.startswith(ENV_SHEBANG):
+        payload = b"#!" + os.fsencode(python) + b"\n" + payload[len(ENV_SHEBANG):]
     target.parent.mkdir(parents=True, exist_ok=True)
     pending = None
     try:
@@ -102,13 +135,14 @@ def install_binary(source, target):
             pending.unlink(missing_ok=True)
 
 
-def install(home, source):
+def install(home, source, python):
     state = home / ".local/state"
     destination = state / "slotfather"
     old_paths = (state / "machine-slots", state / "straylight-verification/slots")
     old_command = home / ".local/bin/machine-slot"
-    if not source.is_file():
-        raise InstallError(f"source executable missing: {source}")
+    for name in COMMANDS:
+        if not source.with_name(name).is_file():
+            raise InstallError(f"source executable missing: {source.with_name(name)}")
     if old_command.is_dir() and not old_command.is_symlink():
         raise InstallError(f"old command is a directory; leaving it unchanged: {old_command}")
     created_guards = []
@@ -173,9 +207,12 @@ def install(home, source):
                 changing = True
                 empty.unlink()  # This is now the temporary guard, never queue data.
             changing = True
-            install_binary(source, home / ".local/bin/slotfather")
+            # The dashboard first: an executable that names a missing view is the shorter-lived mismatch.
+            for name in reversed(COMMANDS):
+                install_binary(source.with_name(name), home / ".local/bin" / name, python)
             old_command.unlink(missing_ok=True)
-            print(f"Installed {home / '.local/bin/slotfather'}; old queue paths are file guards")
+            print(f"Installed {home / '.local/bin/slotfather'} and slotfather-dashboard for {python}; "
+                  "old queue paths are file guards")
         finally:
             # An idleness refusal leaves original state and commands untouched.
             # Once exchanges begin, preserve every guard and backup even on error.
@@ -186,11 +223,12 @@ def install(home, source):
 
 
 def main():
-    if len(sys.argv) > 1:
-        print("usage: python3 install.py", file=sys.stderr)
-        return 0 if sys.argv[1:] == ["--help"] else 2
+    if sys.argv[1:] == ["--help"]:
+        print(USAGE)
+        return 0
     try:
-        install(Path.home(), Path(__file__).resolve().with_name("slotfather"))
+        python = interpreter(sys.argv[1:])
+        install(Path.home(), Path(__file__).resolve().with_name("slotfather"), python)
     except (InstallError, OSError) as error:
         print(f"slotfather install: {error}", file=sys.stderr)
         return 2

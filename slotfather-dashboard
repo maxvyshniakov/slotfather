@@ -1,0 +1,979 @@
+#!/usr/bin/env python3
+"""slotfather-dashboard: a read-only live view of the slotfather queue; `slotfather dashboard` runs it.
+
+  slotfather dashboard [--interval S]                        live view: ? lists the keys, q quits
+  slotfather dashboard --once [--width N] [--height N] [--color]   one snapshot as text
+
+It lives apart from the queue so the lease code stays small: it reads what `slotfather status` reads, and a fault
+here ends the view, never admission. It loads the slotfather executable beside it (symlinks resolved) as a module.
+"""
+from __future__ import annotations
+
+import contextlib
+import datetime
+import importlib.machinery
+import importlib.util
+import locale
+import math
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import textwrap
+import time
+import unicodedata
+
+
+def load_core():
+    path = Path(__file__).resolve().with_name("slotfather")
+    loader = importlib.machinery.SourceFileLoader("slotfather_core", str(path))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    loader.exec_module(module)
+    return module
+
+
+sf = load_core()
+
+# dashboard_model() gathers plain data, dashboard_draw() lays it out on a Canvas of styled cells, and curses shows that
+# canvas live while --once prints it, so the live view and the snapshot are the same picture.
+
+SPARK = "▁▂▃▄▅▆▇█"
+HISTORY_WINDOW = 3600  # seconds of queue.log the utilisation strip rebuilds
+LOG_TAIL = 262144  # bytes of queue.log read per refresh
+WIDE = 110  # columns from which the panels sit side by side
+# style -> (256-colour foreground, 8-colour foreground, attributes: b bold, d dim, r reverse). None keeps the
+# terminal's own foreground, so text reads on light and dark themes alike.
+STYLES = {
+    "text": (None, None, ""), "bold": (None, None, "b"), "dim": (245, None, "d"), "frame": (239, None, "d"),
+    "title": (75, "cyan", "b"), "key": (75, "cyan", "b"), "accent": (75, "cyan", ""),
+    "ok": (114, "green", ""), "warn": (179, "yellow", ""), "bad": (167, "red", ""), "legacy": (176, "magenta", ""),
+    "badge-ok": (114, "green", "br"), "badge-warn": (179, "yellow", "br"), "badge-bad": (167, "red", "br"),
+    "h0": (75, "blue", ""), "h1": (79, "cyan", ""), "h2": (216, "green", ""), "h3": (141, "magenta", ""),
+    "h4": (110, "blue", ""), "h5": (186, "cyan", ""),
+}
+HOLDER_STYLES = 6
+ASCII = str.maketrans({"█": "#", "▓": "%", "▒": "=", "░": ".", "·": ".", "●": "*", "…": "~", "─": "-", "│": "|",
+                       "╭": "+", "╮": "+", "╰": "+", "╯": "+", "↑": "^", "↓": "v", "↗": "/", "↘": "\\", "→": ">",
+                       "←": "<", "≈": "~", "×": "x", "—": "-", "⏸": "=", "▁": "_", "▂": "_", "▃": "-", "▄": "-",
+                       "▅": "=", "▆": "=", "▇": "#"})
+GRANTED = re.compile(r"granted (\d+) to (.*) \(pid (\d+)\)$")
+RELEASED = re.compile(r"released (\d+) \(\d+-(\d+)\.json\)$")
+REAPED = re.compile(r"reaped (\S+) lease of (\d+) for (.*) \(pid (\d+) exited\)$")
+
+
+def dashboard_text(value) -> str:
+    """A label or command as plain text: any process writes queue entries, so control bytes are blanked."""
+    return "".join(char if char.isprintable() else " " for char in str(value))
+
+
+def cell_width(char: str) -> int:
+    if unicodedata.combining(char):
+        return 0
+    return 2 if unicodedata.east_asian_width(char) in "WF" else 1
+
+
+def text_width(value) -> int:
+    return sum(cell_width(char) for char in dashboard_text(value))
+
+
+def clip(value, width: int) -> str:
+    """value cut to `width` cells, ending in … when cut."""
+    text = dashboard_text(value)
+    if text_width(text) <= width:
+        return text
+    kept, used = [], 0
+    for char in text:
+        if used + cell_width(char) > width - 1:
+            break
+        kept.append(char)
+        used += cell_width(char)
+    return "".join(kept) + "…" if width > 0 else ""
+
+
+def span(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m{seconds % 60:02}s"
+    if seconds < 86400:
+        return f"{seconds // 3600}h{seconds // 60 % 60:02}m"
+    return f"{seconds // 86400}d{seconds // 3600 % 24:02}h"
+
+
+def clock(moment: datetime.datetime | None) -> str:
+    if moment is None:
+        return "--:--:--"
+    local = moment.astimezone()
+    return local.strftime("%H:%M:%S" if local.date() == datetime.date.today() else "%a %H:%M")
+
+
+def megabytes(value: float | None) -> str:
+    if value is None:
+        return "?"
+    return f"{value / 1024:.1f} GB" if value >= 1024 else f"{value:.0f} MB"
+
+
+def short(value: float) -> str:
+    return f"{value:.1f}".rstrip("0").rstrip(".")
+
+
+def tilde(path: str) -> str:
+    home = os.path.expanduser("~")
+    return "~" + path[len(home):] if path == home or path.startswith(home + os.sep) else path
+
+
+def parse_utc(value) -> datetime.datetime | None:
+    try:
+        return datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+class Canvas:
+    """A grid of [character, style, selected] cells; a wide character takes its cell and an empty one after it."""
+
+    def __init__(self, width: int, height: int):
+        self.width, self.height = max(0, width), max(0, height)
+        self.cells = [[[" ", "text", False] for _ in range(self.width)] for _ in range(self.height)]
+
+    def put(self, y: int, x: int, value, style: str = "text", width: int | None = None) -> int:
+        """Writes value from column x, cut to `width` cells and to the edge; the column after it."""
+        text = clip(value, width) if width is not None else dashboard_text(value)
+        if not 0 <= y < self.height:
+            return x
+        for char in text:
+            size = cell_width(char)
+            if size == 0:
+                continue
+            if x + size > self.width:
+                break
+            if x >= 0:
+                self.cells[y][x][:2] = [char, style]
+                if size == 2:
+                    self.cells[y][x + 1][:2] = ["", style]
+            x += size
+        return x
+
+    def right(self, y: int, end: int, value, style: str = "text") -> int:
+        """Writes value ending just before column `end`; the column it starts at."""
+        start = end - text_width(value)
+        self.put(y, start, value, style)
+        return start
+
+    def segments(self, y: int, x: int, parts, width: int | None = None) -> int:
+        """Writes (text, style) parts one after another, all within `width` cells from x."""
+        end = self.width if width is None else x + width
+        for text, style in parts:
+            if x >= end:
+                break
+            x = self.put(y, x, text, style, end - x)
+        return x
+
+    def fill(self, y: int, x: int, height: int, width: int) -> None:
+        for row in range(max(0, y), min(self.height, y + height)):
+            for column in range(max(0, x), min(self.width, x + width)):
+                self.cells[row][column] = [" ", "text", False]
+
+    def select(self, y: int, start: int, end: int) -> None:
+        if 0 <= y < self.height:
+            for column in range(max(0, start), min(self.width, end)):
+                self.cells[y][column][2] = True
+
+    def box(self, y: int, x: int, height: int, width: int, title: str = "", note: str = "") -> None:
+        if height < 2 or width < 6:
+            return
+        self.put(y, x, "╭" + "─" * (width - 2) + "╮", "frame")
+        for row in range(y + 1, y + height - 1):
+            self.put(row, x, "│", "frame")
+            self.put(row, x + width - 1, "│", "frame")
+        self.put(y + height - 1, x, "╰" + "─" * (width - 2) + "╯", "frame")
+        after = self.put(y, x + 2, f" {title} ", "title", width - 4) if title else x + 2
+        if note and x + width - 2 - text_width(note) - 2 > after:
+            self.right(y, x + width - 2, f" {note} ", "dim")
+
+    def runs(self, y: int) -> list[list]:
+        """Row y as [text, style, selected] runs."""
+        found = []
+        for char, style, selected in self.cells[y]:
+            if found and found[-1][1] == style and found[-1][2] == selected:
+                found[-1][0] += char
+            else:
+                found.append([char, style, selected])
+        return found
+
+    def render(self, colour: bool, ascii_only: bool = False) -> str:
+        lines = []
+        for y in range(self.height):
+            if colour:
+                line = "".join(sgr(style, selected) + text + "\x1b[0m" for text, style, selected in self.runs(y))
+            else:
+                line = "".join(char for char, _, _ in self.cells[y]).rstrip()
+            lines.append(line.translate(ASCII) if ascii_only else line)
+        return "\n".join(lines)
+
+
+def sgr(style: str, selected: bool) -> str:
+    fore, _, flags = STYLES[style]
+    codes = ["0"] + (["1"] if "b" in flags else []) + (["2"] if "d" in flags and fore is None else [])
+    codes += [f"38;5;{fore}"] if fore is not None else []
+    codes += ["7"] if "r" in flags or selected else []
+    return "\x1b[" + ";".join(codes) + "m"
+
+
+# Dashboard data
+
+def process_usage() -> tuple[dict, dict]:
+    """pid -> (CPU percent, resident KB, command name) for every process, and ppid -> its child pids."""
+    result = subprocess.run(["ps", "-axo", "pid=,ppid=,%cpu=,rss=,comm="], capture_output=True, text=True)
+    own, children = {}, {}
+    for line in result.stdout.splitlines():
+        parts = line.split(None, 4)
+        if len(parts) == 5 and parts[0].isdigit() and parts[1].isdigit():
+            with contextlib.suppress(ValueError):
+                own[int(parts[0])] = (float(parts[2].replace(",", ".")), int(parts[3]), os.path.basename(parts[4]))
+                children.setdefault(int(parts[1]), []).append(int(parts[0]))
+    return own, children
+
+
+def process_tree(pid, own: dict, children: dict) -> list[tuple[int, float, int, str]]:
+    """(pid, CPU percent, resident KB, name) for pid and all its descendants: a lease's whole command."""
+    found, stack, seen = [], [pid], set()
+    while stack:
+        current = stack.pop()
+        if current in seen or current not in own:
+            continue
+        seen.add(current)
+        found.append((current, *own[current]))
+        stack.extend(children.get(current, ()))
+    return found
+
+
+def process_cwd(pid) -> str | None:
+    """The directory a holder was started in, which names its project better than most labels."""
+    with contextlib.suppress(OSError):
+        return os.readlink(f"/proc/{pid}/cwd")
+    try:
+        result = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"], capture_output=True, text=True,
+                                timeout=2)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return next((line[1:] for line in result.stdout.splitlines() if line.startswith("n")), None)
+
+
+def memory_facts() -> dict:
+    """Free and total swap in MB and the kernel's memory-pressure level, as far as this host reports them."""
+    seam = sf.setting("MEMORY_FILE")
+    if seam:
+        with contextlib.suppress(OSError, ValueError):
+            free, level = (float(v) for v in Path(seam).read_text().split()[:2])
+            return {"swap_free": free, "swap_total": None, "level": level}
+        return {"swap_free": None, "swap_total": None, "level": None}
+    total, free = sf.swap_usage() or (None, None)
+    return {"swap_total": total, "swap_free": free, "level": sf.pressure_level()}
+
+
+def queue_events(directory: Path) -> list[dict]:
+    """The grants, releases and reaps at the end of queue.log, oldest first. Each event carries `delta`, the change
+    it made to held slots. A release whose grant precedes the part read is taken to end a held lease; one whose
+    pid was never granted in a fully read log is a waiter that gave up."""
+    try:
+        with open(directory / "queue.log", "rb") as handle:
+            start = max(0, handle.seek(0, os.SEEK_END) - LOG_TAIL)
+            handle.seek(start)
+            lines = handle.read().decode("utf-8", "replace").splitlines()[1 if start else 0:]
+    except OSError:
+        return []
+    events, granted = [], {}
+    for line in lines:
+        moment, _, message = line.partition(" ")
+        when = parse_utc(moment)
+        if when is None:
+            continue
+        if found := GRANTED.match(message):
+            count, label, pid = int(found[1]), found[2], int(found[3])
+            granted[pid] = label
+            events.append({"when": when, "verb": "granted", "count": count, "label": label, "pid": pid,
+                           "delta": count})
+        elif found := RELEASED.match(message):
+            count, pid = int(found[1]), int(found[2])
+            held = pid in granted or start > 0
+            events.append({"when": when, "verb": "released" if held else "left", "count": count,
+                           "label": granted.pop(pid, ""), "pid": pid, "delta": -count if held else 0})
+        elif found := REAPED.match(message):
+            state, count, label, pid = found[1], int(found[2]), found[3], int(found[4])
+            granted.pop(pid, None)
+            events.append({"when": when, "verb": "reaped", "count": count, "label": label, "pid": pid,
+                           "delta": -count if state == "held" else 0, "state": state})
+    return events
+
+
+def held_history(events: list[dict], held_now: int, now_moment: datetime.datetime,
+                 window: float = HISTORY_WINDOW) -> list[tuple[datetime.datetime, datetime.datetime, int]]:
+    """Held slots over the last `window` seconds as (start, end, slots) steps, walked back from held_now."""
+    begin = now_moment - datetime.timedelta(seconds=window)
+    steps, level, end = [], held_now, now_moment
+    for event in reversed(events):
+        if event["when"] <= begin:
+            break
+        if event["delta"] and event["when"] < end:
+            steps.append((event["when"], end, max(0, level)))
+            end = event["when"]
+        level -= event["delta"]
+    steps.append((begin, end, max(0, level)))
+    return steps[::-1]
+
+
+def history_buckets(steps: list, columns: int) -> list[int]:
+    """The most slots held during each of `columns` equal parts of the history."""
+    if not steps or columns <= 0:
+        return []
+    begin, end = steps[0][0], steps[-1][1]
+    width = (end - begin) / columns
+    buckets = []
+    for column in range(columns):
+        low, high = begin + width * column, begin + width * (column + 1)
+        buckets.append(max((level for start, stop, level in steps if start < high and stop > low), default=0))
+    return buckets
+
+
+def history_summary(steps: list, slots: int) -> dict:
+    total_seconds = sum((stop - start).total_seconds() for start, stop, _ in steps) or 1
+    held = sum((stop - start).total_seconds() * min(level, slots) for start, stop, level in steps)
+    full = sum((stop - start).total_seconds() for start, stop, level in steps if level >= slots)
+    return {"average": held / total_seconds / slots, "full": full / total_seconds,
+            "peak": max((level for _, _, level in steps), default=0)}
+
+
+def verdict(model: dict) -> tuple[str, str, str]:
+    """(word, badge style, sentence): what happens to a request made now, mirroring grant()."""
+    slots, used, free, waiters, guard = (model[k] for k in ("slots", "used", "free", "waiters", "guard"))
+    if waiters:
+        head = waiters[0]
+        if head["count"] > free:
+            behind = sum(1 for w in waiters[1:] if w["count"] <= free)
+            fifo = f" · {behind} smaller request{'s' * (behind != 1)} that would fit wait behind it" if behind else ""
+            return ("QUEUED", "badge-warn", f"next is {head['label']}, which needs {head['count']} slot"
+                    f"{'s' * (head['count'] != 1)} with {free} free{fifo}")
+        if used and guard:
+            return "GUARD", "badge-bad", f"memory: {guard} · {len(waiters)} waiting until running work ends"
+        return "ADMITTING", "badge-ok", f"{head['label']} is being granted its slots"
+    if free == 0:
+        return "FULL", "badge-warn", f"all {slots} slots are held · a new request queues"
+    if used and guard:
+        return "GUARD", "badge-bad", f"memory: {guard} · new work waits until running work ends"
+    note = " · memory is short, but an idle machine still starts one" if guard else ""
+    return "OPEN", "badge-ok", f"{free} of {slots} slots free · a new request starts now{note}"
+
+
+def dashboard_model() -> dict:
+    directory = sf.state_dir()
+    live, legacy, _ = sf.snapshot(directory)
+    slots, saved = sf.capacity()
+    own, children = process_usage()
+
+    def item(entry: dict, kind: str, count: int, queue: str = "") -> dict:
+        tree = process_tree(entry.get("pid"), own, children) if kind != "waiting" else []
+        return {"tree": sorted(tree, key=lambda process: -process[1]), "cpu": sum(p[1] for p in tree),
+                "rss": sum(p[2] for p in tree), "procs": len(tree),"key": (entry.get("pid"), entry.get("since")), "kind": kind, "count": count, "queue": queue,
+                "label": dashboard_text(entry.get("label", "")), "pid": entry.get("pid"),
+                "cmd": dashboard_text(entry.get("cmd", "")), "since": parse_utc(entry.get("since")),
+                "granted": parse_utc(entry.get("granted")),
+                "style": "warn" if kind == "waiting" else "legacy"}
+
+    holders = [item(e, "held", e["count"]) for e in live if e["state"] == "held"]
+    holders += [item(e, "legacy", count, str(path.parent.parent)) for path, e, count in legacy]
+    waiters = [item(e, "waiting", e["count"]) for e in live if e["state"] != "held"]
+    used = sum(h["count"] for h in holders)
+    guard, machine, averages = sf.memory_short(), sf.cores(), sf.loads()
+    events = queue_events(directory)
+    moment = datetime.datetime.now(datetime.timezone.utc)
+    own_held = sum(h["count"] for h in holders if h["kind"] == "held")
+    return {"directory": str(directory), "slots": slots, "saved": saved, "cores": machine, "averages": averages,
+            "advice": sf.size(slots, machine, slots, averages, min(used, slots), bool(waiters)),
+            "holders": holders, "waiters": waiters, "used": used, "free": max(0, slots - used), "guard": guard,
+            "memory": memory_facts(), "history": held_history(events, own_held, moment), "events": events[-60:],
+            "updated": moment}
+
+
+def dashboard_colours(model: dict, assigned: dict) -> None:
+    """Gives each running lease a colour it keeps until it ends, preferring colours no other lease shows, so the
+    slot bar, the table swatch and the detail heading stay linked as the queue moves."""
+    keys = {h["key"] for h in model["holders"]}
+    for key in [key for key in assigned if key not in keys]:
+        del assigned[key]
+    for holder in model["holders"]:
+        if holder["kind"] != "held":
+            continue
+        if holder["key"] not in assigned:
+            taken = list(assigned.values())
+            assigned[holder["key"]] = min(range(HOLDER_STYLES), key=lambda n: (taken.count(n), n))
+        holder["style"] = f"h{assigned[holder['key']]}"
+
+
+# Dashboard layout
+
+def bar(fraction: float, width: int, style: str) -> list[tuple[str, str]]:
+    filled = max(0, min(width, round(fraction * width)))
+    return [("█" * filled, style), ("░" * (width - filled), "frame")]
+
+
+def share(item: dict, model: dict) -> tuple[float, float]:
+    """(cores the lease's commands use, cores its slots stand for)."""
+    return item["cpu"] / 100, item["count"] * model["cores"] / model["slots"]
+
+
+def share_style(item: dict, model: dict, moment: datetime.datetime) -> str:
+    used, allotted = share(item, model)
+    running = (moment - item["granted"]).total_seconds() if item["granted"] else 0
+    if running > 120 and used < 0.1 * allotted:
+        return "warn"  # holds slots while nearly idle
+    return "bad" if used > 1.5 * allotted else "accent"
+
+
+def columns(width: int, spec: list[tuple]) -> list[tuple]:
+    """spec: (key, title, width, right-aligned, priority) with width 0 for the one flexible column. Drops the
+    columns of the highest priority number until the rest leave the flexible one 10 cells; (key, title, x, width,
+    right-aligned)."""
+    keep = list(spec)
+    while sum(c[2] + 1 for c in keep if c[2]) + 10 > width and any(c[2] and c[4] for c in keep):
+        keep.remove(max((c for c in keep if c[2] and c[4]), key=lambda c: c[4]))
+    flexible = max(4, width - sum(c[2] + 1 for c in keep if c[2]))
+    placed, x = [], 0
+    for key, title, size, right, _ in keep:
+        placed.append((key, title, x, size or flexible, right))
+        x += (size or flexible) + 1
+    return placed
+
+
+def draw_row(canvas: Canvas, y: int, x: int, placed: list, values: dict) -> None:
+    for key, _, column, size, right in placed:
+        value = values.get(key, "")
+        parts = value if isinstance(value, list) else [(value, "text")] if isinstance(value, str) else [value]
+        start = x + column
+        if right:
+            start += max(0, size - sum(text_width(text) for text, _ in parts))
+        canvas.segments(y, start, parts, x + column + size - start)
+
+
+def draw_header(canvas: Canvas, model: dict | None, paused: bool, error: str | None) -> None:
+    moment = datetime.datetime.now(datetime.timezone.utc)
+    end = canvas.right(0, canvas.width - 1, clock(moment), "dim")
+    if error:
+        end = canvas.right(0, end - 2, "● stale", "bad")
+    else:
+        end = canvas.right(0, end - 2, "⏸ paused" if paused else "● live", "warn" if paused else "ok")
+    x = canvas.put(0, 1, "slotfather", "title")
+    canvas.put(0, x + 2, tilde(model["directory"] if model else str(sf.state_dir())), "dim", max(0, end - x - 4))
+
+
+def draw_slots(canvas: Canvas, y: int, x: int, width: int, model: dict) -> None:
+    """The capacity as one bar: a block per slot, a lease's slots joined in its colour, free slots hollow, then the
+    queue's demand. Labels sit under the blocks they name."""
+    slots, waiters, end = model["slots"], model["waiters"], x + width
+    summary = f"{model['used']}/{slots} held"
+    room = width - (min(30, width // 3) if waiters else 0) - len(summary) - 2
+    cell, gap = (room + 1) // slots - 1, 1
+    if cell < 2:
+        cell, gap = max(1, room // slots), 0
+    cell = min(cell, 8)
+    filled = 0
+    for holder in model["holders"]:
+        count = min(holder["count"], slots - filled)
+        if count <= 0:
+            break
+        length = count * cell + (count - 1) * gap
+        canvas.put(y, x, ("▓" if holder["kind"] == "legacy" else "█") * length, holder["style"])
+        canvas.put(y + 1, x, holder["label"], holder["style"], length)
+        x, filled = x + length + gap, filled + count
+    if filled < slots:
+        canvas.put(y + 1, x, "free", "dim", (slots - filled) * (cell + gap) - gap)
+    for _ in range(slots - filled):
+        x = canvas.put(y, x, "░" * cell, "frame") + gap
+    x = canvas.put(y, x + 1 - gap, summary, "bold")
+    if model["used"] > slots:
+        x = canvas.put(y, x, f" +{model['used'] - slots} over", "bad")
+    if waiters:
+        queue_x = x = canvas.put(y, x + 3, "queue ", "dim")
+        for index, waiter in enumerate(waiters):
+            if x + waiter["count"] + 4 > end:
+                canvas.put(y, x, f"+{len(waiters) - index}", "warn")
+                break
+            x = canvas.put(y, x, "▒" * waiter["count"], "warn") + 1
+        head = waiters[0]
+        canvas.put(y + 1, queue_x, f"next: {head['label']} ×{head['count']}", "warn", end - queue_x)
+
+
+def draw_running(canvas: Canvas, y: int, x: int, height: int, width: int, model: dict, selected: int,
+                 moment: datetime.datetime) -> None:
+    holders = model["holders"]
+    canvas.box(y, x, height, width, "RUNNING", f"{len(holders)} lease{'s' * (len(holders) != 1)}")
+    placed = columns(width - 4, [("swatch", "", 1, False, 0), ("label", "LABEL", 0, False, 0),
+                                 ("slots", "SLOTS", 5, True, 1), ("held", "RUNNING", 8, True, 2),
+                                 ("cpu", "CPU USE / SHARE", 15, False, 3), ("pid", "PID", 6, True, 5),
+                                 ("waited", "WAITED", 7, True, 4)])
+    draw_row(canvas, y + 1, x + 2, placed, {key: (title, "dim") for key, title, *_ in placed})
+    rows = height - 3
+    if not holders:
+        canvas.put(y + 2, x + 2, f"Nothing running · all {model['slots']} slots free", "dim", width - 4)
+    offset = max(0, min(selected - rows + 1, len(holders) - rows)) if selected < len(holders) else 0
+    for index, holder in enumerate(holders[offset:offset + rows], offset):
+        row = y + 2 + index - offset
+        used, allotted = share(holder, model)
+        style = share_style(holder, model, moment)
+        waited = (holder["granted"] - holder["since"]).total_seconds() if holder["granted"] and holder["since"] else None
+        draw_row(canvas, row, x + 2, placed, {
+            "swatch": ("▓" if holder["kind"] == "legacy" else "█", holder["style"]),
+            "label": holder["label"] + (" (earlier queue)" if holder["kind"] == "legacy" else ""),
+            "slots": str(holder["count"]),
+            "held": span((moment - holder["granted"]).total_seconds()) if holder["granted"] else "?",
+            "cpu": bar(used / allotted if allotted else 0, 5, style) + [(f" {used:.1f}/{short(allotted)}", style)],
+            "pid": str(holder["pid"]), "waited": span(waited) if waited is not None else "—"})
+        if index == selected:
+            canvas.select(row, x + 1, x + width - 1)
+    if len(holders) > offset + rows:
+        canvas.put(y + height - 1, x + 2, f" ↓ {len(holders) - offset - rows} more ", "dim")
+
+
+def draw_queue(canvas: Canvas, y: int, x: int, height: int, width: int, model: dict, selected: int,
+               moment: datetime.datetime) -> None:
+    waiters = model["waiters"]
+    wanted = sum(w["count"] for w in waiters)
+    canvas.box(y, x, height, width, "QUEUE", f"{len(waiters)} waiting · {wanted} slot{'s' * (wanted != 1)} wanted"
+               if waiters else "first come, first served")
+    placed = columns(width - 4, [("position", "#", 2, True, 0), ("label", "LABEL", 0, False, 0),
+                                 ("wants", "WANTS", 5, True, 1), ("waiting", "WAITING", 8, True, 2),
+                                 ("ahead", "AHEAD", 6, True, 3), ("pid", "PID", 6, True, 4)])
+    draw_row(canvas, y + 1, x + 2, placed, {key: (title, "dim") for key, title, *_ in placed})
+    rows, local = height - 3, selected - len(model["holders"])
+    if not waiters:
+        canvas.put(y + 2, x + 2, "Empty · a request that fits the free slots starts at once", "dim", width - 4)
+    offset = max(0, min(local - rows + 1, len(waiters) - rows)) if local >= 0 else 0
+    ahead = 0
+    for index, waiter in enumerate(waiters):
+        if offset <= index < offset + rows:
+            row = y + 2 + index - offset
+            draw_row(canvas, row, x + 2, placed, {
+                "position": (str(index + 1), "warn"), "label": waiter["label"], "wants": str(waiter["count"]),
+                "waiting": span((moment - waiter["since"]).total_seconds()) if waiter["since"] else "?",
+                "ahead": ("next", "warn") if index == 0 else str(ahead), "pid": str(waiter["pid"])})
+            if index == local:
+                canvas.select(row, x + 1, x + width - 1)
+        ahead += waiter["count"]
+    if len(waiters) > offset + rows:
+        canvas.put(y + height - 1, x + 2, f" ↓ {len(waiters) - offset - rows} more ", "dim")
+
+
+def draw_detail(canvas: Canvas, y: int, x: int, height: int, width: int, model: dict, selected: int,
+                cwd: str | None, moment: datetime.datetime) -> None:
+    canvas.box(y, x, height, width, "SELECTED")
+    items = model["holders"] + model["waiters"]
+    inner, bottom = width - 4, y + height - 1
+    if not items:
+        canvas.put(y + 1, x + 2, "Nothing to select · the queue is idle", "dim", inner)
+        return
+    item = items[selected]
+    kind = {"held": f"running · {item['count']} slot{'s' * (item['count'] != 1)}",
+            "legacy": f"earlier queue · {item['count']} slot{'s' * (item['count'] != 1)}"}
+    if item["kind"] == "waiting":
+        position = selected - len(model["holders"])
+        ahead = sum(w["count"] for w in model["waiters"][:position])
+        heading = f"waiting · #{position + 1} · wants {item['count']}"
+    else:
+        heading = kind[item["kind"]]
+    after = canvas.put(y + 1, x + 2, item["label"] or "(no label)", "bold", max(8, inner - text_width(heading) - 2))
+    canvas.put(y + 1, after + 2, heading, item["style"], x + width - 2 - after - 2)
+    facts = []
+    command = textwrap.wrap(item["cmd"], max(10, inner - 10), break_on_hyphens=False) or ["—"]
+    if item["kind"] == "waiting":
+        facts.append(("queued", [(f"{clock(item['since'])} · waiting "
+                                  f"{span((moment - item['since']).total_seconds()) if item['since'] else '?'}", "text")]))
+        if position == 0:
+            facts.append(("blocked", [(verdict(model)[2], "warn")]))
+        else:
+            facts.append(("ahead", [(f"{position} request{'s' * (position != 1)} for {ahead} slots go first", "text")]))
+    else:
+        used, allotted = share(item, model)
+        style = share_style(item, model, moment)
+        note = " · idle while holding slots" if style == "warn" else " · above its share" if style == "bad" else ""
+        facts.append(("cpu", bar(used / allotted if allotted else 0, 10, style) +
+                      [(f" {used:.1f} of {short(allotted)} cores{note}", style)]))
+        if item["granted"]:
+            waited = f" · waited {span((item['granted'] - item['since']).total_seconds())}" if item["since"] else ""
+            facts.append(("granted", [(f"{clock(item['granted'])}{waited} · running "
+                                       f"{span((moment - item['granted']).total_seconds())}", "text")]))
+        facts.append(("memory", [(f"{megabytes(item['rss'] / 1024)} in {item['procs']} "
+                                  f"process{'es' * (item['procs'] != 1)}", "text")]))
+    where = tilde(item["queue"] or cwd or "")
+    room_for_path = inner - 10 - len(f"pid {item['pid']} · ")
+    if text_width(where) > room_for_path > 1:
+        where = "…" + where[len(where) - room_for_path + 1:]  # the end of a path names the project
+    facts.append(("process", [(f"pid {item['pid']}", "text")] + ([(f" · {where}", "dim")] if where else [])))
+    row = y + 2
+    room = bottom - row - len(facts)
+    for index, line in enumerate(command[:max(1, room)]):
+        canvas.put(row, x + 2, "command" if index == 0 else "", "dim")
+        cut = index == max(1, room) - 1 and len(command) > max(1, room)
+        canvas.put(row, x + 12, line + (" …" if cut else ""), "text", inner - 10)
+        row += 1
+    for name, parts in facts:
+        if row >= bottom:
+            break
+        canvas.put(row, x + 2, name, "dim")
+        canvas.segments(row, x + 12, parts, inner - 10)
+        row += 1
+    # What the lease actually runs, busiest first, in the rows left over.
+    if item["tree"] and bottom - row >= 3:
+        placed = columns(inner - 10, [("pid", "PID", 6, True, 0), ("cpu", "CPU", 6, True, 0),
+                                      ("rss", "MEMORY", 8, True, 1), ("name", "PROCESS", 0, False, 0)])
+        canvas.put(row + 1, x + 2, "processes", "dim")
+        draw_row(canvas, row + 1, x + 12, placed, {key: (title, "dim") for key, title, *_ in placed})
+        shown = item["tree"][:bottom - row - 2]
+        for process_row, (pid, cpu, rss, name) in enumerate(shown, row + 2):
+            more = process_row == bottom - 1 and len(item["tree"]) > len(shown)
+            draw_row(canvas, process_row, x + 12, placed, {"pid": str(pid), "cpu": f"{cpu:.0f}%",
+                     "rss": megabytes(rss / 1024),
+                     "name": (f"… {len(item['tree']) - len(shown) + 1} more", "dim") if more else name})
+
+
+def draw_machine(canvas: Canvas, y: int, x: int, height: int, width: int, model: dict) -> None:
+    canvas.box(y, x, height, width, "MACHINE")
+    inner, slots = width - 4, model["slots"]
+    load1, load5, load15 = model["averages"]
+    trend = "↗" if load1 > load15 * 1.15 + 0.2 else "↘" if load1 < load15 * 0.85 - 0.2 else "→"
+    advice, memory, guard = model["advice"], model["memory"], model["guard"]
+    level = memory["level"]
+    pressure = {1: ("normal", "ok"), 2: ("warning", "warn"), 4: ("critical", "bad")}.get(
+        int(level) if level is not None else 0, ("unknown", "dim"))
+    if memory["swap_total"] == 0:
+        swap = ("swap off", "text")
+    else:
+        total = f" of {megabytes(memory['swap_total'])}" if memory["swap_total"] else ""
+        swap = (f"swap {megabytes(memory['swap_free'])} free{total}", "text")
+    chart_width = max(8, inner - 10)
+    buckets = history_buckets(model["history"], chart_width)
+    summary = history_summary(model["history"], slots)
+    # (priority, name, parts): the lines a short panel drops first have the highest priority number.
+    lines = [
+        (0, "cpu", bar(load1 / model["cores"], 12, "accent") + [(f" {load1:.1f} of {model['cores']} cores {trend}",
+                                                                "text")]),
+        (5, "", [(f"load 1m {load1:.1f} · 5m {load5:.1f} · 15m {load15:.1f}", "dim")]),
+        (6, "unleased", [(f"≈{advice['unleased_load']:.1f} cores · advise {advice['jobs']} "
+                          f"job{'s' * (advice['jobs'] != 1)}", "dim")]),
+        (1, "memory", [(f"pressure {pressure[0]}", pressure[1]), (" · ", "dim"), swap]),
+        (2, "guard", [(f"on · {guard.replace(' is under ', ' < ')}" if guard else "off · leases start on capacity alone",
+                       "bad" if guard else "dim")]),
+    ]
+    room = height - 2
+    while len(lines) + 2 > room and len(lines) > 1:
+        lines.remove(max(lines, key=lambda line: line[0]))
+    # A row per slot keeps whole-slot steps crisp; more than eight slots share rows.
+    chart_rows = max(1 if room >= len(lines) + 1 else 0, min(min(slots, 8), room - len(lines) - 1))
+    row = y + 1
+    for _, name, parts in lines:
+        canvas.put(row, x + 2, name, "dim")
+        canvas.segments(row, x + 12, parts, inner - 10)
+        row += 1
+    # Held slots over the last hour as a bar chart of eighth blocks, chart_rows tall; full columns are yellow.
+    for line in range(chart_rows):
+        floor = (chart_rows - 1 - line) * 8
+        canvas.put(row, x + 2, "held" if line == 0 else "1 h" if line == 1 else "", "dim")
+        for column, level in enumerate(buckets):
+            eighths = math.ceil(level / slots * chart_rows * 8) - floor if level else 0
+            glyph = SPARK[min(8, eighths) - 1] if eighths > 0 else "▁" if line == chart_rows - 1 else " "
+            canvas.put(row, x + 12 + column, glyph, "frame" if eighths <= 0 else "warn" if level >= slots else "accent")
+        row += 1
+    if chart_rows and row < y + height - 1:
+        canvas.put(row, x + 12, f"avg {summary['average']:.0%} · peak {summary['peak']}/{slots} · "
+                                f"full {summary['full']:.0%}", "dim", inner - 10)
+
+
+def draw_events(canvas: Canvas, y: int, x: int, height: int, width: int, model: dict) -> None:
+    canvas.box(y, x, height, width, "EVENTS", "queue.log, newest first")
+    styles = {"granted": "ok", "released": "accent", "left": "dim", "reaped": "bad"}
+    events = model["events"][::-1][:height - 2]
+    if not events:
+        canvas.put(y + 1, x + 2, "No grants, releases or reaps logged yet", "dim", width - 4)
+    for row, event in enumerate(events, y + 1):
+        slot_word = f"{event['count']} slot{'s' * (event['count'] != 1)}"
+        detail = {"granted": f"{slot_word} · pid {event['pid']}", "released": f"{slot_word} · pid {event['pid']}",
+                  "left": f"gave up waiting for {slot_word} · pid {event['pid']}",
+                  "reaped": f"{event.get('state', '')} {slot_word} · pid {event['pid']} died"}[event["verb"]]
+        canvas.segments(row, x + 2, [(clock(event["when"]), "dim"), ("  ", "text"),
+                                     (f"{event['verb']:<9}", styles[event["verb"]]),
+                                     (f"{event['label'] or '?'}", "text"), (f"  {detail}", "dim")], width - 4)
+
+
+def draw_help(canvas: Canvas) -> None:
+    lines = [("Keys", "title"), ("  ↑ ↓  j k     select a lease or a waiting request", "text"),
+             ("  g G  Home End  first / last", "text"), ("  p  space     pause updates", "text"),
+             ("  r            refresh now", "text"), ("  ?            close this help", "text"),
+             ("  q            quit (Esc closes this help)", "text"), ("", "text"), ("Reading it", "title"),
+             ("  █  a held slot; one colour per lease, in the bar and its table row", "text"),
+             ("  ▓  a lease in an earlier queue     ░  a free slot     ▒  queued demand", "text"),
+             ("  CPU USE / SHARE: cores the lease's commands use / cores its slots stand for", "text"),
+             ("  yellow: holding slots while nearly idle    red: well above its share", "text"),
+             ("  held: slots held over the last hour, rebuilt from queue.log", "text"),
+             ("  advise: the job count `slotfather advise` gives unleased work now", "text"), ("", "text"),
+             ("The dashboard only observes: it never grants, cancels or kills anything.", "dim")]
+    width = min(canvas.width - 4, max(text_width(text) for text, _ in lines) + 4)
+    height = min(canvas.height - 2, len(lines) + 2)
+    y, x = (canvas.height - height) // 2, (canvas.width - width) // 2
+    canvas.fill(y, x, height, width)
+    canvas.box(y, x, height, width, "HELP")
+    for row, (text, style) in enumerate(lines[:height - 2], y + 1):
+        canvas.put(row, x + 2, text, style, width - 4)
+
+
+def allocate(available: int, panels: list[tuple[str, int, int]]) -> dict[str, int]:
+    """panels: (name, minimum, natural height) by priority. Each gets its minimum while room lasts, then grows
+    towards its natural height; the last panel placed takes what remains."""
+    heights = {}
+    for name, minimum, _ in panels:
+        if minimum <= available:
+            heights[name], available = minimum, available - minimum
+    for name, _, natural in panels:
+        if name in heights:
+            extra = min(available, max(0, natural - heights[name]))
+            heights[name], available = heights[name] + extra, available - extra
+    if heights:
+        heights[list(heights)[-1]] += available
+    return heights
+
+
+def dashboard_draw(canvas: Canvas, model: dict | None, selected: int = 0, paused: bool = False,
+                   help_open: bool = False, error: str | None = None, cwd: str | None = None) -> None:
+    width, height = canvas.width, canvas.height
+    draw_header(canvas, model, paused, error)
+    keys = [("↑↓", "select"), ("p", "resume" if paused else "pause"), ("r", "refresh"), ("?", "help"), ("q", "quit")]
+    x = 1
+    for key, action in keys:
+        x = canvas.segments(height - 1, x, [(key, "key"), (f" {action}   ", "dim")])
+    if error:
+        canvas.right(height - 1, width - 1, clip(f"refresh failed: {error}", max(0, width - x - 2)), "bad")
+    elif model:
+        canvas.right(height - 1, width - 1, f"updated {clock(model['updated'])}", "dim")
+    if model is None:
+        canvas.put(2, 2, f"Queue unavailable: {error}" if error else "Reading the queue…", "bad" if error else "dim",
+                   width - 4)
+        return
+    moment = datetime.datetime.now(datetime.timezone.utc)
+    word, badge, sentence = verdict(model)
+    after = canvas.put(2, 2, f" {word} ", badge)
+    note = f"{model['cores']} cores · {model['slots']} slots, {'saved' if model['saved'] else 'automatic'}"
+    if after + 2 + text_width(sentence) + 3 + text_width(note) <= width - 2:
+        canvas.right(2, width - 2, note, "dim")
+    lines = textwrap.wrap(sentence, max(10, width - after - 4)) or [""]
+    canvas.put(2, after + 2, lines[0], "text", width - after - 4)
+    if len(lines) > 1:
+        canvas.put(3, after + 2, " ".join(lines[1:]), "text", width - after - 4)
+    if width < 50 or height < 14:
+        draw_slots(canvas, 4, 2, width - 4, model)
+        canvas.put(7, 2, "Enlarge the terminal for leases and the queue", "dim", width - 4)
+        return
+    draw_slots(canvas, 4, 2, width - 4, model)
+    top, available = 7, height - 8
+    holders, waiters = model["holders"], model["waiters"]
+    running, queued = max(1, len(holders)) + 3, max(1, len(waiters)) + 3
+    if width >= WIDE:
+        left = width - max(52, width * 2 // 5) - 1
+        heights = allocate(available, [("running", min(running, 7), running), ("queue", min(queued, 7), queued),
+                                       ("events", 4, available)])
+        y = top
+        for name in ("running", "queue", "events"):
+            if name in heights:
+                draw_panel(canvas, name, y, 0, heights[name], left, model, selected, cwd, moment)
+                y += heights[name]
+        machine = max(8, min(8 + min(model["slots"], 8), available - 10)) if available >= 14 else 0
+        right = {"detail": available - machine, "machine": machine}
+        y = top
+        for name in ("detail", "machine"):
+            if right[name]:
+                draw_panel(canvas, name, y, left + 1, right[name], width - left - 1, model, selected, cwd, moment)
+                y += right[name]
+    else:
+        heights = allocate(available, [("running", min(running, 7), running), ("queue", min(queued, 7), queued),
+                                       ("detail", 5, 10),
+                                       ("machine", 5, 8 + min(model["slots"], 8)), ("events", 4, available)])
+        y = top
+        for name in ("running", "queue", "detail", "machine", "events"):
+            if name in heights:
+                draw_panel(canvas, name, y, 0, heights[name], width, model, selected, cwd, moment)
+                y += heights[name]
+    if help_open:
+        draw_help(canvas)
+
+
+def draw_panel(canvas: Canvas, name: str, y: int, x: int, height: int, width: int, model: dict, selected: int,
+               cwd: str | None, moment: datetime.datetime) -> None:
+    if name == "running":
+        draw_running(canvas, y, x, height, width, model, selected, moment)
+    elif name == "queue":
+        draw_queue(canvas, y, x, height, width, model, selected, moment)
+    elif name == "detail":
+        draw_detail(canvas, y, x, height, width, model, selected, cwd, moment)
+    elif name == "machine":
+        draw_machine(canvas, y, x, height, width, model)
+    else:
+        draw_events(canvas, y, x, height, width, model)
+
+
+# Dashboard terminal
+
+def curses_styles(curses) -> dict[str, int]:
+    attributes, colours = {}, curses.has_colors()
+    background = -1
+    if colours:
+        curses.start_color()
+        try:
+            curses.use_default_colors()
+        except curses.error:
+            background = curses.COLOR_BLACK
+    rich = colours and curses.COLORS >= 256
+    for number, (name, (fore256, fore8, flags)) in enumerate(STYLES.items(), 1):
+        attribute = 0
+        colour = fore256 if rich else getattr(curses, f"COLOR_{fore8.upper()}") if fore8 else None
+        if colours and colour is not None and number < curses.COLOR_PAIRS:
+            curses.init_pair(number, colour, background)
+            attribute |= curses.color_pair(number)
+        attribute |= (curses.A_BOLD if "b" in flags else 0) | (curses.A_REVERSE if "r" in flags else 0)
+        attribute |= curses.A_DIM if "d" in flags and colour is None else 0
+        attributes[name] = attribute
+    return attributes
+
+
+def dashboard_live(interval: float) -> None:
+    import curses
+    ascii_only = "utf" not in (locale.getpreferredencoding(False) or "").lower()
+
+    def display(screen):
+        with contextlib.suppress(curses.error):
+            curses.curs_set(0)
+        styles = curses_styles(curses)
+        screen.keypad(True)
+        screen.timeout(250)
+        model = error = selected_key = None
+        index, colours, cwds = 0, {}, {}
+        paused = help_open = False
+        fetched, drawn, force, dirty = 0.0, 0.0, True, True
+        while True:
+            if force or (not paused and time.monotonic() - fetched >= interval):
+                try:
+                    fresh = dashboard_model()
+                    dashboard_colours(fresh, colours)
+                    model, error = fresh, None
+                except (sf.SlotError, OSError) as failure:
+                    error = dashboard_text(failure)
+                fetched, force, dirty = time.monotonic(), False, True
+            items = (model["holders"] + model["waiters"]) if model else []
+            keys = [item["key"] for item in items]
+            index = keys.index(selected_key) if selected_key in keys else max(0, min(index, len(items) - 1))
+            selected_key = keys[index] if items else None
+            if items and items[index]["kind"] != "waiting" and items[index]["pid"] not in cwds:
+                cwds[items[index]["pid"]] = process_cwd(items[index]["pid"])
+            if dirty or time.monotonic() - drawn >= 1:
+                height, width = screen.getmaxyx()
+                canvas = Canvas(width, height)
+                dashboard_draw(canvas, model, index, paused, help_open, error,
+                               cwds.get(items[index]["pid"]) if items else None)
+                screen.erase()
+                for y in range(height):
+                    x = 0
+                    for text, style, chosen in canvas.runs(y):
+                        with contextlib.suppress(curses.error):  # the bottom-right cell cannot be written
+                            screen.addstr(y, x, text.translate(ASCII) if ascii_only else text,
+                                          styles[style] | (curses.A_REVERSE if chosen else 0))
+                        x += text_width(text)
+                screen.refresh()
+                drawn, dirty = time.monotonic(), False
+            key = screen.getch()
+            if key == -1:
+                continue
+            dirty = True
+            if key in (ord("q"), ord("Q")):
+                return
+            if key == 27:  # Esc only closes help: an escape sequence curses did not decode must not quit
+                help_open = False
+            elif key == ord("?"):
+                help_open = not help_open
+            elif key in (ord("p"), ord(" ")):
+                paused = not paused
+            elif key in (ord("r"), ord("R")):
+                screen.clear()
+                force = True
+            elif key in (ord("j"), curses.KEY_DOWN):
+                index += 1
+            elif key in (ord("k"), curses.KEY_UP):
+                index -= 1
+            elif key in (ord("g"), curses.KEY_HOME, curses.KEY_PPAGE):
+                index = 0
+            elif key in (ord("G"), curses.KEY_END, curses.KEY_NPAGE):
+                index = len(items) - 1
+            index = max(0, min(index, len(items) - 1))
+            selected_key = keys[index] if items else None
+
+    locale.setlocale(locale.LC_ALL, "")
+    os.environ.setdefault("ESCDELAY", "25")
+    curses.wrapper(display)
+
+
+def dashboard_command(argv: list[str]) -> int:
+    interval, once, colour, width, height = 1.0, False, None, None, None
+    while argv:
+        if argv[0] == "--once":
+            once, argv = True, argv[1:]
+        elif argv[0] == "--color":
+            colour, argv = True, argv[1:]
+        elif argv[0] in ("--interval", "--width", "--height") and len(argv) > 1:
+            try:
+                value = float(argv[1])
+            except ValueError:
+                value = math.nan
+            if argv[0] == "--interval":
+                if not 0.1 <= value <= 60:
+                    raise sf.SlotError("dashboard --interval takes seconds from 0.1 to 60")
+                interval = value
+            elif not (value.is_integer() and 5 <= value <= 1000):
+                raise sf.SlotError(f"dashboard {argv[0]} takes a whole number of cells from 5 to 1000")
+            elif argv[0] == "--width":
+                width = int(value)
+            else:
+                height = int(value)
+            argv = argv[2:]
+        else:
+            raise sf.SlotError("dashboard takes [--interval SECONDS] or --once [--width N] [--height N] [--color]")
+    if once:
+        model = dashboard_model()
+        dashboard_colours(model, {})
+        items = model["holders"] + model["waiters"]
+        size_now = shutil.get_terminal_size((120, 40))
+        canvas = Canvas(width or size_now.columns, height or size_now.lines)
+        dashboard_draw(canvas, model, cwd=process_cwd(items[0]["pid"]) if items and items[0]["kind"] != "waiting"
+                       else None)
+        tty = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+        print(canvas.render(colour if colour is not None else tty,
+                            "utf" not in (sys.stdout.encoding or "").lower()))
+        return 0
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise sf.SlotError("dashboard needs an interactive terminal; dashboard --once prints one snapshot")
+    try:
+        dashboard_live(interval)
+    except KeyboardInterrupt:
+        pass
+    except ImportError:
+        raise sf.SlotError("dashboard needs Python's curses module; dashboard --once prints one snapshot") from None
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        return dashboard_command(list(sys.argv[1:] if argv is None else argv))
+    except sf.SlotError as error:
+        print(f"slotfather dashboard: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
