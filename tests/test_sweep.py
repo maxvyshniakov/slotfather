@@ -108,13 +108,15 @@ class PlanTests(unittest.TestCase):
                   proc(102, 50, f"node {gone}/src/cli.mjs verify", age=700),
                   proc(103, 50, f"node {HOME}/sweep-fixture-new/out.json", age=700),
                   proc(104, 50, "node /opt/gone/x.js", age=700),
-                  proc(105, 50, f"sh -c ls {HOME}/*-wt-shoot/static $HOME/x {gone}/$name/y", age=700)],
+                  proc(105, 50, f"sh -c ls {HOME}/*-wt-shoot/static $HOME/x {gone}/$name/y", age=700),
+                  proc(106, 50, f"zsh -c cd {HOME}/wt\\012d=/tmp\\012tools/lane check", age=700)],
                  cwds={100: sweep.Cwd(f"{gone}", True), 101: sweep.Cwd(f"{gone}", True),
                        103: sweep.Cwd("/w", False)},
-                 gone=(gone, "/opt/gone"))
+                 gone=(gone, "/opt/gone", f"{HOME}/wt\\012d="))  # what the glued words would name
         found = plan(s)
         self.assertEqual({100, 102}, set(found), "young (101), an existing parent (103), a path outside home and "
-                                                 "the temporary directories (104), globs and variables (105) are left")
+                                                 "the temporary directories (104), globs and variables (105), macOS ps's \\012 "
+                                                 "between words (106) are left")
         self.assertEqual(("removed", "would-stop"), (found[100]["class"], found[100]["action"]))
         self.assertIn(f"cwd {gone} is gone", found[100]["reason"])
         self.assertIn(f"{gone}/src/cli.mjs is in a directory that is gone", found[102]["reason"])

@@ -136,7 +136,8 @@ def program(cmd: str) -> str:
 
 
 def words(cmd: str) -> list[str]:
-    return cmd.split()
+    """The command's words; macOS ps writes a newline or tab inside an argument as \\012 or \\011."""
+    return cmd.replace("\\012", " ").replace("\\011", " ").split()
 
 
 def orphan_kind(cmd: str) -> str | None:
