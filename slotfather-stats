@@ -186,6 +186,8 @@ def machine(samples: list[dict], cores: int, capacity: int) -> dict:
     for (a, b), w in zip(zip(samples, samples[1:]), weights):
         if not (a.get("ticks") and b.get("ticks")) or len(a["ticks"]) != 4 or len(b["ticks"]) != 4:
             continue
+        if b["at"] - a["at"] > GAP:
+            continue  # no lease ran in between: the ticks would average idle time into the busy share
         delta = [(y - x) % (1 << 32) for x, y in zip(a["ticks"], b["ticks"])]
         if not sum(delta):
             continue

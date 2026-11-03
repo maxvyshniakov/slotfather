@@ -91,6 +91,8 @@ MACHINE_MAX = 4 << 20  # bytes of machine.jsonl before it becomes machine.jsonl.
 MACHINE_EVERY = 15  # seconds between machine samples while any lease runs
 SAMPLE_FIRST = 0.5  # seconds before a holder's first look at its command's process tree
 SAMPLE_MAX = 10  # longest interval between those looks; each is half as long again as the one before
+PS_TIMEOUT = 5  # seconds a ps or sysctl of the sampler may take before its answer is given up
+WATCH_JOIN = 5  # seconds a release waits for the sampler to stop, and for its lock; then it goes without
 ALL_NOTE = ("-n all holds every later request behind it until the whole machine is free; use it only for work that "
             "needs the machine to itself, such as a performance measurement, and otherwise ask for the slots the "
             "command uses")
@@ -236,8 +238,8 @@ def memory_short() -> str | None:
 
 def sysctl(name: str) -> str | None:
     try:
-        result = subprocess.run(["sysctl", "-n", name], capture_output=True, text=True)
-    except OSError:
+        result = subprocess.run(["sysctl", "-n", name], capture_output=True, text=True, timeout=PS_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired):
         return None
     return result.stdout.strip() if result.returncode == 0 else None
 
@@ -286,9 +288,13 @@ def started_at(lstart: str) -> float | None:
 
 
 def usage_table() -> dict[int, tuple[int, str, int, int, float]]:
-    """Live pid -> (ppid, start, uid, resident KB, CPU seconds of its own), from one ps over the machine."""
-    result = subprocess.run(["ps", "-axo", "pid=,ppid=,uid=,rss=,time=,lstart="], capture_output=True, text=True,
-                            env={**os.environ, "LC_ALL": "C"})
+    """Live pid -> (ppid, start, uid, resident KB, CPU seconds of its own), from one ps over the machine. Raises
+    SlotError when ps fails or takes longer than PS_TIMEOUT."""
+    try:
+        result = subprocess.run(["ps", "-axo", "pid=,ppid=,uid=,rss=,time=,lstart="], capture_output=True,
+                                text=True, env={**os.environ, "LC_ALL": "C"}, timeout=PS_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise SlotError(f"ps: {error}") from None
     table = {}
     for line in result.stdout.splitlines():
         parts = line.split(None, 5)
@@ -304,8 +310,11 @@ def carrying(pids: list[int], lease: str) -> set[int]:
     only for the user's own processes that are not platform binaries; the rest read as not carrying it."""
     if not pids:
         return set()
-    result = subprocess.run(["ps", "-wwE", "-o", "pid=,command=", "-p", ",".join(map(str, pids))],
-                            capture_output=True, text=True, env={**os.environ, "LC_ALL": "C"})
+    try:
+        result = subprocess.run(["ps", "-wwE", "-o", "pid=,command=", "-p", ",".join(map(str, pids))],
+                                capture_output=True, text=True, env={**os.environ, "LC_ALL": "C"}, timeout=PS_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
     mark = " SLOTFATHER_LEASE=" + lease
     found = set()
     for line in result.stdout.splitlines():
@@ -325,13 +334,15 @@ class TreeUsage:
     environment carries the lease (`marked`). CPU time of every process an attached parent reaps reaches the
     command's own rusage at its exit, so it is not summed here; a detached process is reaped by launchd, so its CPU
     is the last sample of its own time. Processes born and gone between two samples outside the attached tree are
-    not seen, nor is a child that exits unwaited-for before its parent exits (launchd reaps that zombie). Resident memory is the sum over the tree's processes (shared pages count once per process)."""
+    not seen, nor is a child that exits unwaited-for before its parent exits (launchd reaps that zombie). Resident
+    memory is the sum over the tree's processes (shared pages count once per process)."""
 
     def __init__(self, root: int, since: float, marked=None, uid: int | None = None):
         self.root, self.since = root, since
         self.marked = marked or (lambda pids: set())
         self.uid = os.getuid() if uid is None else uid
         self.root_start = None
+        self.root_gone = False  # set once wait4 has reaped the command: its pid may then be another process
         self.members = {}  # (pid, start) -> [own CPU seconds at the last sample, attached]
         self.checked = set()  # (pid, start) of launchd children already considered
         self.detached_gone = 0.0
@@ -340,7 +351,25 @@ class TreeUsage:
         self.rss_area = self.span = 0.0  # KB x seconds, seconds
         self.last = None  # (moment, resident KB) of the previous sample
 
-    def observe(self, moment: float, table: dict) -> None:
+    def candidates(self, table: dict) -> list[int]:
+        """Children of launchd started during the lease that have not been considered yet; each is returned once,
+        for `marked` to say whether it carries the lease."""
+        fresh = []
+        for pid, row in table.items():
+            key = (pid, row[1])
+            if row[0] == 1 and row[2] == self.uid and key not in self.members and key not in self.checked:
+                self.checked.add(key)
+                begun = started_at(row[1])
+                if begun is not None and begun >= self.since - 1:
+                    fresh.append(pid)
+        return fresh
+
+    def observe(self, moment: float, table: dict, adopted: set[int] | None = None) -> None:
+        """Takes in one process table. `adopted` are the candidates() of this table that carry the lease; without
+        it observe asks `marked` itself."""
+        if adopted is None:
+            fresh = self.candidates(table)
+            adopted = self.marked(fresh) if fresh else set()
         for key in list(self.members):
             row = table.get(key[0])
             if row is None or row[1] != key[1]:
@@ -360,18 +389,11 @@ class TreeUsage:
                     stack.extend(children.get(pid, ()))
             return found
 
-        if self.root_start is None and self.root in table:
+        if self.root_start is None and self.root in table and not self.root_gone:
             self.root_start = table[self.root][1]
-        attached = tree([self.root]) if self.root in table and table[self.root][1] == self.root_start else set()
-        fresh = []
-        for pid, row in table.items():
-            key = (pid, row[1])
-            if row[0] == 1 and row[2] == self.uid and key not in self.members and key not in self.checked:
-                self.checked.add(key)
-                begun = started_at(row[1])
-                if begun is not None and begun >= self.since - 1:
-                    fresh.append(pid)
-        adopted = self.marked(fresh) if fresh else set()
+        attached = set() if self.root_gone or self.root not in table or table[self.root][1] != self.root_start \
+            else tree([self.root])
+        adopted = {pid for pid in adopted if pid in table}
         detached = tree([pid for pid, _ in self.members if pid not in attached] + list(adopted)) - attached
         resident = 0
         for pid in attached | detached:
@@ -420,34 +442,48 @@ class Watch(threading.Thread):
         self.stopped = threading.Event()
         self.lock = threading.Lock()
 
+    def observe(self) -> None:
+        """One look at the tree. The ps calls run outside the lock, so finish() never waits on a slow ps for it."""
+        moment, table = time.time(), usage_table()
+        with self.lock:
+            fresh = self.usage.candidates(table)
+        adopted = self.usage.marked(fresh) if fresh else set()
+        with self.lock:
+            self.usage.observe(moment, table, adopted)
+
     def look(self) -> None:
         with contextlib.suppress(Exception):
-            table = usage_table()
-            with self.lock:
-                self.usage.observe(time.time(), table)
+            self.observe()
         with contextlib.suppress(Exception):
             sample_machine(self.directory)
 
     def run(self) -> None:
+        # Signals for the holder (forwarded to its command) must interrupt the holder's wait4, not this thread.
+        with contextlib.suppress(AttributeError, OSError, ValueError):
+            signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGHUP, signal.SIGINT})
         interval = min(SAMPLE_FIRST, self.most)
         while not self.stopped.wait(interval):
             self.look()
             interval = min(interval * 1.5, self.most)
 
     def finish(self, rusage, wall: float) -> dict | None:
-        """Stops sampling, takes the last look (after the command exited) and returns the usage."""
+        """Stops sampling, takes the last look (after the command exited) and returns the usage. Waits at most
+        WATCH_JOIN seconds for the sampler, and skips the last look when it is still stuck: the release goes on."""
+        self.usage.root_gone = True
         self.stopped.set()
-        self.join(timeout=30)
+        self.join(timeout=WATCH_JOIN)
+        if not self.is_alive():
+            with contextlib.suppress(Exception):
+                self.observe()
+        if rusage is None or not self.lock.acquire(timeout=WATCH_JOIN):
+            return None
         try:
-            table = usage_table()
-            with self.lock:
-                self.usage.observe(time.time(), table)
-                if rusage is None:
-                    return None
-                peak = rusage.ru_maxrss // 1024 if sys.platform == "darwin" else rusage.ru_maxrss  # bytes on macOS
-                return self.usage.result(rusage.ru_utime + rusage.ru_stime, peak, wall)
+            peak = rusage.ru_maxrss // 1024 if sys.platform == "darwin" else rusage.ru_maxrss  # bytes on macOS
+            return self.usage.result(rusage.ru_utime + rusage.ru_stime, peak, wall)
         except Exception:  # noqa: BLE001 - measuring must never cost the lease its release
             return None
+        finally:
+            self.lock.release()
 
 
 _host_port = None
@@ -583,25 +619,57 @@ def record(directory: Path, entry: dict, outcome: str, status: int | None = None
 def append_bounded(path: Path, line: str, limit: int) -> None:
     """Append a line; past `limit` bytes the file becomes <name>.1, replacing the previous one, so at most two
     files' worth stays. Readers read <name>.1 first, then <name>."""
-    with open(path, "a", encoding="utf-8") as handle:
-        handle.write(line)
+    fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o644)
+    try:
+        size = os.fstat(fd).st_size
+        # A torn earlier write (a holder killed mid-line) must not swallow this line: start it on a line of its own.
+        prefix = b"\n" if size and os.pread(fd, 1, size - 1) != b"\n" else b""
+        os.write(fd, prefix + line.encode("utf-8"))  # one write, at the end even with other appenders
+    finally:
+        os.close(fd)
     if path.stat().st_size > limit:
         path.replace(path.with_name(path.name + ".1"))
 
 
+def objects(lines) -> list[dict]:
+    """The JSON objects among lines; lines that do not parse (a torn write, a foreign line) are skipped."""
+    found = []
+    for line in lines:
+        with contextlib.suppress(ValueError, UnicodeDecodeError):
+            item = json.loads(line)
+            if isinstance(item, dict):
+                found.append(item)
+    return found
+
+
 def journal(path: Path):
-    """The JSON objects of a bounded file and its rotated predecessor, oldest first; lines that do not parse (a
-    torn write, a foreign line) are skipped."""
+    """The JSON objects of a bounded file and its rotated predecessor, oldest first."""
     for part in (path.with_name(path.name + ".1"), path):
         try:
-            text = part.read_text(encoding="utf-8")
-        except (FileNotFoundError, UnicodeDecodeError):
+            data = part.read_bytes()
+        except FileNotFoundError:
             continue
-        for line in text.splitlines():
-            with contextlib.suppress(ValueError):
-                item = json.loads(line)
-                if isinstance(item, dict):
-                    yield item
+        yield from objects(data.splitlines())
+
+
+def tail_objects(path: Path, limit: int) -> list[dict]:
+    """The last `limit` JSON objects of one file, read backwards from its end in blocks."""
+    try:
+        handle = open(path, "rb")
+    except FileNotFoundError:
+        return []
+    with handle:
+        end = handle.seek(0, os.SEEK_END)
+        block, data = 65536, b""
+        while True:
+            start = max(0, end - block)
+            handle.seek(start)
+            data = handle.read(end - start)
+            lines = data.splitlines()
+            found = objects(lines[1:] if start else lines)  # the first line of a block may be cut
+            if len(found) >= limit or not start:
+                return found[-limit:]
+            block *= 4
 
 
 def history_items(directory: Path | None = None) -> list[dict]:
@@ -611,9 +679,17 @@ def history_items(directory: Path | None = None) -> list[dict]:
 
 
 def history_lines(limit: int, directory: Path | None = None) -> list[str]:
-    """The last `limit` requests that left the queue, oldest first."""
+    """The last `limit` requests that left the queue (every one for 0), oldest first. The rotated part is read only
+    when the current file holds fewer."""
+    path = (directory or state_dir()) / "history.jsonl"
+    if limit:
+        items = tail_objects(path, limit)
+        if len(items) < limit:
+            items = tail_objects(path.with_name(path.name + ".1"), limit - len(items)) + items
+    else:
+        items = list(journal(path))
     found = []
-    for item in history_items(directory)[-limit:]:
+    for item in items:
         ended = seconds(item.get("ended"))
         when = time.strftime("%m-%d %H:%M", time.localtime(ended)) if ended is not None else "?"
         waited = "?" if item.get("waited") is None else duration(item["waited"])
@@ -958,6 +1034,8 @@ def run(count: int | str, label: str, argv: list[str], wait: float | None = None
         except ChildProcessError:
             status, rusage = child.wait(), None
         reaped.append(True)
+        if watch is not None:
+            watch.usage.root_gone = True  # before any later look: the pid may be reused from now on
         child.returncode = status
         if watch is not None and watch.is_alive():
             lease.usage = watch.finish(rusage, time.monotonic() - began)

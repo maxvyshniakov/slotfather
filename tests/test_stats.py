@@ -81,6 +81,15 @@ class StatsTests(SlotCase):
         self.assertEqual((0.25, 897), (found["pressure_elevated"], found["swap_free_mb_min"]))
         self.assertEqual(5.0, found["busy_cores_per_held_slot"])
 
+    def test_a_gap_with_no_lease_running_is_not_busy_time(self):
+        base = 1_800_000_000.0
+        # Two samples 15 s apart fully busy, then an idle hour before the next sample.
+        ticks = [[0, 0, 0, 0], [1000, 0, 0, 0], [1100, 0, 360000, 0]]
+        self.write("machine.jsonl", [{"v": 1, "at": at, "load": [1, 1, 1], "ticks": t, "cores": 12, "capacity": 4,
+                                      "held": 1} for at, t in zip((base, base + 15, base + 3615), ticks)])
+        found = json.loads(self.stats("--json"))["machine"]
+        self.assertEqual(1.0, found["busy_mean"], "the idle hour between leases is not averaged in")
+
     def test_an_empty_state_and_bad_options(self):
         self.assertIn("no request in range recorded its usage", self.stats())
         for args in (("--since", "yesterday"), ("--by", "pid"), ("--top",), ("--nonsense",)):

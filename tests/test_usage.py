@@ -7,10 +7,14 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import pathlib
+import signal
 import subprocess
 import sys
+import threading
 import time
 import unittest
+from unittest import mock
 
 from test_slotfather import TOOL, SlotCase
 
@@ -118,11 +122,82 @@ class TreeUsageTests(unittest.TestCase):
         self.assertEqual(5.0, usage.result(0.0, reaped_peak_kb=5120)["rss_peak_mb"],
                          "the largest single process from rusage bounds the peak when sampling missed it")
 
+    def test_a_command_whose_pid_was_reused_before_the_first_look_is_not_followed(self):
+        usage, _ = self.usage()
+        usage.root_gone = True  # wait4 returned: pid 100 is no longer the command
+        usage.observe(SINCE + 1, {100: row(HOLDER, 7.0, 4096), 101: row(100, 5.0, 4096)})
+        self.assertEqual((0, 0, 0.0), (usage.processes, usage.rss_peak, usage.result(1.0)["cpu_detached"]))
+
     def test_ps_cpu_times_parse(self):
         for text, value in (("0:00.05", 0.05), ("593:13.58", 35593.58), ("1:02:03.50", 3723.5),
                             ("2-01:00:00", 176400.0)):
             self.assertAlmostEqual(value, sf.cpu_seconds(text))
         self.assertIsNone(sf.cpu_seconds("n/a"))
+
+
+class WatchTests(unittest.TestCase):
+    """The sampler thread against stand-ins for ps: it must never hold up the lease's release."""
+
+    def watch(self, marked=None):
+        usage = sf.TreeUsage(100, SINCE, marked, uid=UID)
+        watch = sf.Watch(usage, pathlib.Path("/nonexistent"))
+        watch.most = 0.01
+        return watch
+
+    def patch(self, name, value):
+        patcher = mock.patch.object(sf, name, value)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_the_environment_query_runs_outside_the_lock(self):
+        held = []
+        table = {100: row(HOLDER, 1.0), 200: row(1, 1.0, born=5)}
+        self.patch("usage_table", lambda: table)
+        self.patch("sample_machine", lambda directory: None)
+        watch = self.watch(lambda pids: held.append(watch.lock.locked()) or set())
+        watch.look()
+        self.assertEqual([False], held)
+
+    def test_a_stalled_ps_does_not_hold_up_finish(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+        self.patch("usage_table", lambda: release.wait(60) and {})
+        self.patch("sample_machine", lambda directory: None)
+        watch = self.watch()
+        watch.start()
+        time.sleep(0.2)  # the thread is now inside the stalled ps
+        began = time.monotonic()
+        rusage = mock.Mock(ru_utime=1.0, ru_stime=0.5, ru_maxrss=0)
+        found = watch.finish(rusage, 2.0)
+        self.assertLess(time.monotonic() - began, sf.WATCH_JOIN + 2)
+        self.assertEqual(1.5, found["cpu"], "the usage so far, without a last look")
+
+    def test_ps_calls_give_up_after_their_timeout(self):
+        def stalled(*args, **kwargs):
+            self.assertEqual(sf.PS_TIMEOUT, kwargs.get("timeout"))
+            raise subprocess.TimeoutExpired(args[0], kwargs["timeout"])
+        self.patch("subprocess", mock.Mock(run=stalled, TimeoutExpired=subprocess.TimeoutExpired))
+        self.assertEqual(set(), sf.carrying([1, 2], "/lease"))
+        with self.assertRaises(sf.SlotError):
+            sf.usage_table()
+        self.assertIsNone(sf.sysctl("kern.memorystatus_level"))
+
+    def test_the_sampler_thread_leaves_signals_to_the_holder(self):
+        masks, looked = [], threading.Event()
+
+        def table():
+            if threading.current_thread() is watch:
+                masks.append(signal.pthread_sigmask(signal.SIG_BLOCK, []))
+                looked.set()
+            return {}
+        self.patch("usage_table", table)
+        self.patch("sample_machine", lambda directory: None)
+        watch = self.watch()
+        watch.start()
+        self.assertTrue(looked.wait(10))
+        watch.finish(None, 0.0)
+        self.assertTrue(masks)
+        self.assertLessEqual({signal.SIGTERM, signal.SIGHUP, signal.SIGINT}, masks[0])
 
 
 class RunUsageTests(SlotCase):
@@ -194,6 +269,25 @@ class BoundedHistoryTests(SlotCase):
         self.assertEqual(labels, sorted(labels, key=lambda name: int(name[1:])), "oldest first across both files")
         self.assertEqual("r39", labels[-1])
         self.assertLess(len(labels), 40, "the rotated file replaced an older one")
+
+    def test_a_torn_line_does_not_swallow_the_next_one(self):
+        self.state.mkdir(parents=True)
+        (self.state / "history.jsonl").write_text('{"label": "torn", "cou')
+        sf.record(self.state, {"label": "whole", "count": 1}, "left")
+        self.assertEqual(["whole"], [item["label"] for item in sf.history_items(self.state)])
+
+    def test_a_short_listing_reads_only_the_current_file(self):
+        self.state.mkdir(parents=True)
+        older = self.state / "history.jsonl.1"
+        older.write_text(json.dumps({"label": "older", "count": 1}) + "\n")
+        for n in range(3):
+            sf.record(self.state, {"label": f"r{n}", "count": 1}, "left")
+        older.chmod(0)
+        self.addCleanup(older.chmod, 0o644)
+        self.assertEqual(2, len(sf.history_lines(2, self.state)))
+        older.chmod(0o644)
+        self.assertIn("1 slot(s) older ", sf.history_lines(4, self.state)[0])
+        self.assertEqual(4, len(sf.history_lines(0, self.state)))
 
     def test_lines_written_before_version_2_still_read(self):
         self.state.mkdir(parents=True)
