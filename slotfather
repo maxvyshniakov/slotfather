@@ -140,6 +140,8 @@ YIELD_BEHIND = 0.001  # seconds behind the waiter it yields to that a yielded le
 SHELLS = ("sh", "bash", "zsh", "dash", "fish")
 ESTIMATE_RUNS = 20  # recent runs of a kind its estimate takes the median of
 ESTIMATE_BYTES = 1 << 20  # of the history's end (and of its rotated part) read for estimates
+UNFINISHED = ("reaped", "left")  # history outcomes whose time is no run of their kind: left out of the estimates
+ESTIMATES_VERSION = 2  # estimates.json: 2 leaves UNFINISHED out; a file without it (or older) is worked out again
 HISTORY_MAX = 4 << 20  # bytes of history.jsonl; past it the file becomes history.jsonl.1, replacing the older one
 # history.jsonl lines: version 1 had no "v" field and no usage; version 2 adds "v", what a `run` used (cpu,
 # cpu_detached, wall, rss_peak_mb, rss_mean_mb, processes, samples) and the machine's cores and capacity.
@@ -1368,8 +1370,10 @@ class Estimates:
 
 
 def history_estimates(directory: Path) -> Estimates:
-    """Estimates from the end of history.jsonl (ESTIMATE_BYTES of it): every request that was granted and ran.
-    Requests whose holder ran a slotfather that records no history (before #635) are not in it."""
+    """Estimates from the end of history.jsonl (ESTIMATE_BYTES of it): every request that was granted and ran to its
+    release. A reaped lease is left out: its holder died, and its time runs to whenever a look noticed, such as an
+    orphan of a hung CI job that kept its slots for most of an hour; so is one that gave up (`left`). Requests whose
+    holder ran a slotfather that records no history (before #635) are not in it."""
     path = directory / "history.jsonl"
     runs = []
     for part in (path.with_name(path.name + ".1"), path):
@@ -1381,7 +1385,8 @@ def history_estimates(directory: Path) -> Estimates:
         except FileNotFoundError:
             continue
         for item in objects(lines[1:] if end > ESTIMATE_BYTES else lines):
-            if isinstance(item.get("ran"), (int, float)) and item.get("granted"):
+            if isinstance(item.get("ran"), (int, float)) and item.get("granted") and \
+                    item.get("outcome") not in UNFINISHED:
                 runs.append((item.get("label"), item.get("cmd"), item["ran"]))
     return Estimates(runs)
 
@@ -1627,7 +1632,9 @@ _estimates = {}  # history files' (size, mtime) -> Estimates, so a waiter's repe
 def cached_estimates(directory: Path) -> Estimates:
     """history_estimates(), kept in this process and in estimates.json beside the history, both keyed by the
     history files' size and modification time: a new process, a release or `available` reads the small file
-    instead of the history until the history changes."""
+    instead of the history until the history changes. A file another version wrote (its "v" differs) is worked out
+    again, so runs that version counted (reaped leases, before version 2) do not linger until the history changes;
+    an older client reads past the "v"."""
     path = directory / "history.jsonl"
     stamp = []
     for part in (path.with_name(path.name + ".1"), path):
@@ -1641,13 +1648,13 @@ def cached_estimates(directory: Path) -> Estimates:
     found = None
     with contextlib.suppress(OSError, ValueError, TypeError, AttributeError, KeyError):
         saved = json.loads(cache.read_text())
-        if saved["stamp"] == stamp:
+        if saved["stamp"] == stamp and saved.get("v") == ESTIMATES_VERSION:
             found = Estimates.load(saved["runs"])
     if found is None:
         found = history_estimates(directory)
         if foreign_owner(directory) is None:
             with contextlib.suppress(OSError):
-                write(cache, {"stamp": stamp, "runs": found.save()})
+                write(cache, {"v": ESTIMATES_VERSION, "stamp": stamp, "runs": found.save()})
     _estimates.clear()
     _estimates[key] = found
     return found

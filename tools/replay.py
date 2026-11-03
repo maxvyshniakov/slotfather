@@ -76,7 +76,7 @@ def log_requests(path: Path) -> list[dict]:
             found.append({"seq": int(match[2]), "pid": pid, "label": label, "count": int(match[1]),
                           "granted": granted, "ended": when})
             continue
-        match = re.match(r"reaped held lease of (\d+) for (.*) \(pid (\d+)\) exited\)$", rest)
+        match = re.match(r"reaped held lease of (\d+) for (.*) \(pid (\d+) exited\)$", rest)
         if match and int(match[3]) in grants:
             granted, count, label = grants.pop(int(match[3]))
             found.append({"seq": None, "pid": int(match[3]), "label": label, "count": count, "granted": granted,
@@ -85,9 +85,10 @@ def log_requests(path: Path) -> list[dict]:
 
 
 def requests(directory: Path, moment: float) -> list[dict]:
-    """The recorded requests, in arrival order: {label, cmd, count, arrival, run, patience, waited, source}.
+    """The recorded requests, in arrival order: {label, cmd, count, arrival, run, patience, waited, source, outcome}.
     `run` is None where it never ran (estimated in the replay); `patience` is how long a request that left the queue
-    waited before it gave up; `waited` is the recorded wait where known.
+    waited before it gave up; `waited` is the recorded wait where known; `outcome` is the history's (a reaped lease
+    holds its slots in the replay as it did, but its time is no run of its kind: the estimates leave it out).
 
     history.jsonl gives arrivals. A request it lacks (its holder ran a slotfather that records no history) is
     known from queue.log by its queue sequence: it arrived after the request before it in the sequence and before
@@ -102,7 +103,7 @@ def requests(directory: Path, moment: float) -> list[dict]:
         request = {"label": item.get("label"), "cmd": item.get("cmd"), "count": item["count"], "arrival": arrival,
                    "run": item.get("ran") if granted is not None else None,
                    "patience": item.get("waited") if granted is None else None,
-                   "waited": item.get("waited"), "source": "history"}
+                   "waited": item.get("waited"), "source": "history", "outcome": item.get("outcome")}
         found.append(request)
         by_pid.setdefault(item.get("pid"), []).append((sf.seconds(item.get("ended")), request))
     start = min((r["arrival"] for r in found), default=moment)
@@ -127,7 +128,7 @@ def requests(directory: Path, moment: float) -> list[dict]:
             live.append({"label": entry.get("label"), "cmd": entry.get("cmd"), "count": entry["count"],
                          "arrival": arrival, "run": None if granted is None else max(0.0, moment - granted),
                          "patience": None, "waited": None if granted is None else granted - arrival,
-                         "source": "live"})
+                         "source": "live", "outcome": None})
     known_seqs = sorted(arrivals)
 
     def bounds(seq):
@@ -141,12 +142,14 @@ def requests(directory: Path, moment: float) -> list[dict]:
         if left["granted"] is not None:
             arrival = left["granted"] if high is None else min(high, left["granted"])
             found.append({"label": left["label"], "cmd": None, "count": left["count"], "arrival": arrival,
-                          "run": left["ended"] - left["granted"], "patience": None, "waited": None, "source": "log"})
+                          "run": left["ended"] - left["granted"], "patience": None, "waited": None, "source": "log",
+                          "outcome": "released" if left["seq"] is not None else "reaped"})
         else:
             high = left["ended"] if high is None else min(high, left["ended"])
             arrival = high if low is None else (low + high) / 2
             found.append({"label": "(left, unrecorded)", "cmd": None, "count": left["count"], "arrival": arrival,
-                          "run": None, "patience": left["ended"] - arrival, "waited": None, "source": "log"})
+                          "run": None, "patience": left["ended"] - arrival, "waited": None, "source": "log",
+                          "outcome": "left"})
     found += live
     found.sort(key=lambda r: r["arrival"])
     for number, request in enumerate(found):
@@ -155,9 +158,10 @@ def requests(directory: Path, moment: float) -> list[dict]:
 
 
 def seed_runs(directory: Path, before: float) -> list[tuple]:
-    """Runs that ended before the replay starts, for the estimates: queue.log holds (label only)."""
+    """Runs that ended before the replay starts, for the estimates: queue.log holds (label only); reaped leases
+    (no sequence) are left out, as the queue's estimates leave them out."""
     return [(r["label"], None, r["ended"] - r["granted"]) for r in log_requests(directory / "queue.log")
-            if r["granted"] is not None and r["ended"] < before]
+            if r["granted"] is not None and r["seq"] is not None and r["ended"] < before]
 
 
 # Classes for the replay: no recorded request carried one, so they come from its label and command
@@ -341,7 +345,8 @@ class Replay:
                     continue  # it yielded before this end
                 entry = held.pop(number)
                 asked.pop(number, None)
-                self.estimates.add(entry["label"], entry["cmd"], self.run_of(request))
+                if request.get("outcome") not in sf.UNFINISHED:  # as history_estimates() leaves them out
+                    self.estimates.add(entry["label"], entry["cmd"], self.run_of(request))
                 result[number]["ended"] = moment
             elif kind == "yield":
                 if number not in held or number not in asked or generation.get(number) != extra or \
@@ -475,6 +480,14 @@ POLICIES = {
     "  estimates noisy": {"order": "backfill", "env": WINDOW, "settings": SHIPPED, "step": 300, "noise": 1.0},
     "backfill, no window": {"order": "backfill", "env": {"SLOTFATHER_OVERTAKE_WINDOW": "0"}},
     "backfill, safety 1.5": {"order": "backfill", "env": WINDOW, "settings": {"safety": 1.5}},
+    "backfill, safety 2": {"order": "backfill", "env": WINDOW, "settings": {"safety": 2}},
+    "backfill, safety 2.5": {"order": "backfill", "env": WINDOW, "settings": {"safety": 2.5}},
+    "  safety 2, estimates noisy": {"order": "backfill", "env": WINDOW, "noise": 1.0, "settings": {"safety": 2}},
+    "  safety 2, estimates x0.5": {"order": "backfill", "env": WINDOW, "bias": 0.5, "settings": {"safety": 2}},
+    "classes + yields, safety 2": {"order": "backfill", "env": WINDOW, "settings": {**SHIPPED, "safety": 2},
+                                   "step": 300},
+    "  same, estimates noisy": {"order": "backfill", "env": WINDOW, "settings": {**SHIPPED, "safety": 2},
+                                "step": 300, "noise": 1.0},
     "backfill, no head limit": {"order": "backfill", "env": WINDOW, "settings": {"limit": 0}},
     "backfill, -n all only": {"order": "all-only", "env": WINDOW},
     "short class + window": {"order": "short", "reorder": short_first(300, 1800), "env": WINDOW},
@@ -511,7 +524,8 @@ def compare(directory: Path, moment: float, slots: int, policies: dict = POLICIE
     start = min((r["arrival"] for r in found if r["source"] == "history"), default=moment)
     until = max((r["arrival"] for r in found), default=moment) if until is None else until
     first = start if since is None else since
-    whole = sf.Estimates((r["label"], r["cmd"], r["run"]) for r in found if r["run"] is not None)
+    whole = sf.Estimates((r["label"], r["cmd"], r["run"]) for r in found
+                         if r["run"] is not None and r.get("outcome") not in sf.UNFINISHED)
     seed = seed_runs(directory, start) if seed_log else []
     table, validation = {}, None
     for name, policy in policies.items():

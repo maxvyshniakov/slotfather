@@ -165,6 +165,34 @@ class TraceTests(unittest.TestCase):
         replayed = replay.Replay(found, 6, replay.POLICIES[CURRENT]).simulate()
         self.assertEqual([0, 0, 900, 900], [r["granted"] - q["arrival"] for r, q in zip(replayed, found)])
 
+    def test_a_reaped_lease_holds_its_slots_but_is_no_run_of_its_kind(self):
+        """A reaped held lease (queue.log only, or a history line) keeps its slots in the replay for as long as it
+        did, as the queue saw it; the estimates, the replay's and the seed's, leave its time out as the queue's do."""
+        (self.dir / "queue.log").write_text(
+            "2026-11-02T08:00:00Z granted 1 to ci (pid 21)\n"
+            "2026-11-02T08:05:00Z released 1 (0000000001-21.json)\n"
+            "2026-11-02T08:10:00Z granted 1 to ci (pid 22)\n"
+            "2026-11-02T08:56:40Z reaped held lease of 1 for ci (pid 22 exited)\n"
+            "2026-11-02T09:30:00Z granted 1 to orphan (pid 23)\n"
+            "2026-11-02T10:16:40Z reaped held lease of 1 for orphan (pid 23 exited)\n")
+        items = [self.history("ci", 1, "10:00:00", "10:00:00", "10:05:00", 24),
+                 self.history("ci", 1, "10:20:00", "10:20:00", "11:06:40", 25, outcome="reaped")]
+        for item in items:
+            item["cmd"] = None
+        (self.dir / "history.jsonl").write_text("".join(json.dumps(i) + "\n" for i in items))
+        logged = replay.log_requests(self.dir / "queue.log")
+        self.assertEqual([("ci", 1), ("ci", None), ("orphan", None)], [(r["label"], r["seq"]) for r in logged])
+        self.assertEqual([("ci", None, 300)], replay.seed_runs(self.dir, sf.seconds("2026-11-02T09:00:00Z")))
+        found = replay.requests(self.dir, sf.seconds("2026-11-02T12:00:00Z"))
+        self.assertEqual([("orphan", "log", "reaped", 2800), ("ci", "history", "released", 300),
+                          ("ci", "history", "reaped", 2800)],
+                         [(r["label"], r["source"], r["outcome"], r["run"]) for r in found])
+        run = replay.Replay(found, 1, replay.POLICIES[SHIPPED])
+        results = run.simulate()
+        self.assertEqual(sf.seconds("2026-11-02T10:16:40Z"), results[1]["granted"], "the orphan held the slot")
+        self.assertEqual([300.0], run.estimates.runs[("label", "ci")])
+        self.assertIsNone(run.estimates.of("orphan", None))
+
     def test_a_long_request_does_not_take_a_slot_the_head_needs_when_leases_end_out_of_order(self):
         # #643 review: x and z were expected to end within ten minutes and y in two hours, so by the expected order
         # one slot was spare for `long`; y ends early and z overruns, and the head would have waited for z.

@@ -260,6 +260,38 @@ class EstimateTests(unittest.TestCase):
                                                found.of("gave-up", "x y")))
 
 
+    def test_a_reaped_or_abandoned_lease_is_no_run_of_its_kind(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory)
+            ran = {"v": 2, "label": "ci", "cmd": "sh heavy.sh check", "count": 1, "queued": "2026-11-03T10:00:00Z",
+                   "granted": "2026-11-03T10:00:00Z", "ended": "2026-11-03T10:05:00Z", "outcome": "released",
+                   "waited": 0, "ran": 300}
+            # An orphan of a hung CI job: its holder died and the lease was reaped when a look noticed, 2800 s on.
+            orphan = {**ran, "ended": "2026-11-03T10:46:40Z", "outcome": "reaped", "ran": 2800, "status": None}
+            left = {**ran, "outcome": "left", "ran": 1500}  # granted and left: not a run either, whatever wrote it
+            (path / "history.jsonl").write_text("".join(json.dumps(item) + "\n" for item in
+                                                        (ran, orphan, orphan, left, ran)))
+            for found in (sf.history_estimates(path), sf.cached_estimates(path)):
+                self.assertEqual(300, found.of("ci", "sh heavy.sh check"))
+                self.assertEqual([300.0, 300.0], found.runs[("label", "ci", sf.kind("sh heavy.sh check"))])
+            self.assertEqual(sf.ESTIMATES_VERSION, json.loads((path / "estimates.json").read_text())["v"])
+
+    def test_estimates_kept_by_an_earlier_version_are_worked_out_again(self):
+        """estimates.json written by a version that counted reaped leases, for the same history: not used."""
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory)
+            line = {"label": "a", "cmd": "make a", "count": 1, "granted": "2026-11-02T10:01:00Z", "ran": 600,
+                    "outcome": "released"}
+            (path / "history.jsonl").write_text(json.dumps(line) + "\n" +
+                                                json.dumps({**line, "ran": 2800, "outcome": "reaped"}) + "\n")
+            self.assertEqual(600, sf.cached_estimates(path).of("a", "make a"))
+            saved = json.loads((path / "estimates.json").read_text())
+            old = {"stamp": saved["stamp"], "runs": sf.Estimates([("a", "make a", 600), ("a", "make a", 2800)]).save()}
+            (path / "estimates.json").write_text(json.dumps(old))
+            sf._estimates.clear()  # another process
+            self.assertEqual(600, sf.cached_estimates(path).of("a", "make a"))
+            self.assertEqual(sf.ESTIMATES_VERSION, json.loads((path / "estimates.json").read_text()).get("v"))
+
     def test_the_estimates_are_kept_beside_the_history_until_it_changes(self):
         with tempfile.TemporaryDirectory() as directory:
             path = pathlib.Path(directory)
