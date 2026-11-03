@@ -5,6 +5,7 @@ and `advise` under them, an older client reading a memory-mode capacity, the gua
 lease found in /proc/PID/environ, machine samples, and on Linux itself the real ps and /proc."""
 from __future__ import annotations
 
+import io
 import json
 import os
 import pathlib
@@ -364,3 +365,149 @@ class LinuxEnvironmentTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewCgroupTests(unittest.TestCase):
+    """Review of 4cf0233: a cgroup's limit is the smallest on its path (P3), and a capacity with a cgroup follows that
+    limit alone, not the machine's MemTotal a balloon shrinks (P1)."""
+
+    def setUp(self):
+        self.dir = pathlib.Path(tempfile.mkdtemp(prefix="slotfather-review-"))
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+
+    def env(self, proc="runner", cgroup="calm", **values):
+        return clean_environment(**{"SLOTFATHER_PROC": str(PROC / proc), "SLOTFATHER_CGROUP_ROOT": str(CGROUP / cgroup),
+                                    "SLOTFATHER_DIR": str(self.dir), **values})
+
+    def test_the_limit_of_a_cgroup_is_the_smallest_on_its_path(self):
+        with mock.patch.dict(os.environ, self.env(cgroup="nested", SLOTFATHER_CGROUP=SLICE), clear=True):
+            self.assertEqual(8 << 30, sf.cgroup_limit(SLICE))
+            self.assertEqual(8.0, sf.memory_gib(), "ci.slice's 8 GiB bounds the slice's 10")
+            self.assertEqual(8 * 1024, round(sf.linux_memory()["cgroup_max"]))
+
+    def test_a_ballooned_vm_keeps_the_capacity_of_its_cgroup(self):
+        (self.dir / "capacity.json").write_text(json.dumps({"slots": 2, "mode": "memory", "gib_per_slot": 5,
+                                                            "cgroup": SLICE}))
+        with mock.patch.dict(os.environ, self.env(proc="ballooned", SLOTFATHER_CORES="6"), clear=True):
+            self.assertEqual(2, sf.capacity_basis()["slots"], "10 GiB of the slice, not 4 of MemTotal")
+            os.environ["SLOTFATHER_MIN_AVAILABLE_MB"] = "4096"
+            self.assertEqual("available memory 3072 MB is under 4096 MB", sf.memory_short(),
+                             "MemTotal's MemAvailable stays in the admission guard")
+
+
+class OwnerTests(unittest.TestCase):
+    """Review of 4cf0233 (P2-b): a process of another user (root by the guest agent) must not write into the queue
+    of the user it belongs to: changes are refused, reading commands create nothing."""
+
+    def setUp(self):
+        self.dir = pathlib.Path(tempfile.mkdtemp(prefix="slotfather-owner-")) / "state"
+        self.addCleanup(shutil.rmtree, self.dir.parent, ignore_errors=True)
+        patcher = mock.patch.dict(os.environ, clean_environment(SLOTFATHER_DIR=str(self.dir),
+                                                                SLOTFATHER_LEGACY_DIRS="",
+                                                                SLOTFATHER_MEMORY_GIB="64"), clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.foreign = mock.patch.object(sf.os, "geteuid", return_value=os.geteuid() + 4242)
+
+    def files(self):
+        return sorted(str(p.relative_to(self.dir.parent)) for p in self.dir.parent.rglob("*"))
+
+    def test_changes_are_refused_for_another_users_queue(self):
+        before = self.files()
+        for argv in (["run", "--", "true"], ["slots", "3"], ["order", "window"], ["yield"]):
+            with self.subTest(argv=argv), self.foreign, mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+                self.assertEqual(2, sf.main(argv))
+                self.assertIn("belongs to uid", err.getvalue())
+        self.assertEqual(before, self.files())
+        with self.foreign, self.assertRaises(sf.SlotError):
+            sf.acquire(1, "library")
+
+    def test_reading_commands_create_nothing(self):
+        before = self.files()
+        for argv in (["status"], ["status", "--json"], ["history"], ["slots"], ["order"], ["available"], ["advise"]):
+            with self.subTest(argv=argv), self.foreign, mock.patch("sys.stdout", new_callable=io.StringIO):
+                self.assertEqual(0, sf.main(argv))
+        self.assertEqual(before, self.files())
+
+    def test_the_owner_itself_is_unaffected(self):
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(0, sf.main(["slots", "3"]))
+        self.assertTrue((self.dir / "capacity.json").exists())
+
+    @unittest.skipUnless(os.geteuid() == 0 and LINUX, "root on Linux (the container run)")
+    def test_root_running_the_command_against_a_runner_queue(self):
+        self.dir.mkdir(parents=True)
+        os.chown(self.dir, 65534, 65534)
+        env = {**os.environ}
+        refused = subprocess.run([TOOL, "run", "--", "true"], env=env, capture_output=True, text=True, timeout=20)
+        self.assertEqual(2, refused.returncode)
+        self.assertIn("sudo -u", refused.stderr)
+        listed = subprocess.run([TOOL, "status"], env=env, capture_output=True, text=True, timeout=20)
+        self.assertEqual(0, listed.returncode, listed.stderr)
+        self.assertEqual([], list(self.dir.iterdir()))
+
+
+class ShrinkingCapacityTests(SlotCase):
+    """Review of 4cf0233 (P1): a memory capacity that shrinks under waiters (a VM's balloon takes memory) must not
+    leave a request larger than the new capacity waiting for ever: it takes every slot when it starts, as a request
+    above the total always has; `-n all` is the capacity at its grant."""
+
+    def setUp(self):
+        super().setUp()
+        del self.env["SLOTFATHER_MEMORY_GIB"]
+        self.proc = self.tmp / "proc"
+        self.proc.mkdir()
+        self.memory_total(16)
+        self.env.update(SLOTFATHER_PROC=str(self.proc), SLOTFATHER_CORES="12")
+
+    def memory_total(self, gib: int):
+        pending = self.proc / "meminfo.pending"
+        pending.write_text(f"MemTotal: {gib << 20} kB\nMemAvailable: {gib << 19} kB\nSwapTotal: 0 kB\n")
+        os.replace(pending, self.proc / "meminfo")
+
+    def shrink_under_waiters(self, order: str):
+        self.env["SLOTFATHER_QUEUE"] = order
+        saved = self.tool("slots", "memory", "4")
+        self.assertEqual("4 slots (saved: one per 4 GiB of 16 GiB)", saved.stdout.strip(), saved.stderr)
+        self.assertIn("no cgroup with a memory limit", saved.stderr, "a count that follows MemTotal says so")
+        holder = self.request("holder", 1)
+        self.started("holder")
+        four = self.request("four", 4)
+        self.wait_for(lambda: "waiting: 4 slot(s) four" in self.status(), "the 4-slot request to queue")
+        whole = self.request("whole", "all")
+        self.wait_for(lambda: "slot(s) whole" in self.status(), "the all-slot request to queue")
+        self.memory_total(8)  # two slots now
+        self.release("holder")
+        self.started("four")
+        self.assertIn("2 of 2 slots held", self.status())
+        self.release("four")
+        self.started("whole")
+        self.assertIn("held: 2 slot(s) whole", self.status())
+        self.memory_total(16)
+        self.release("whole")
+        for process in (holder, four, whole):
+            self.finish(process)
+        history = {json.loads(line)["label"]: json.loads(line) for line in
+                   (self.state / "history.jsonl").read_text().splitlines()}
+        self.assertEqual((2, 2), (history["four"]["count"], history["whole"]["count"]))
+
+    def test_backfill(self):
+        self.shrink_under_waiters("backfill")
+
+    def test_window(self):
+        self.shrink_under_waiters("window")
+
+    def test_all_takes_the_capacity_at_its_grant_when_it_grew(self):
+        self.assertEqual(0, self.tool("slots", "memory", "4").returncode)
+        self.memory_total(8)
+        holder = self.request("holder", 1)
+        self.started("holder")
+        whole = self.request("whole", "all")
+        self.wait_for(lambda: "waiting: 2 slot(s) whole" in self.status(), "the all-slot request to queue")
+        self.memory_total(16)
+        self.release("holder")
+        self.started("whole")
+        self.assertIn("held: 4 slot(s) whole", self.status())
+        self.release("whole")
+        for process in (holder, whole):
+            self.finish(process)

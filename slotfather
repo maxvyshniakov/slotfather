@@ -18,8 +18,9 @@ machine busy takes 1 to 2 slots, a full gate that must not share the machine tak
 
 Slots: one per three cores, at least one, and no more than one per 4 GiB of memory, so
 `total = min(max(1, cores // 3), max(1, memory_GiB // 4))`: 4 on a 12-core M2 Max with 32 GiB, 2 on a 6-core VM with
-12 GiB (on Linux the memory is at most the memory.max of the queue's cgroup: SLOTFATHER_CGROUP, the one saved
-with the capacity, or the caller's outermost limited one). `slotfather slots N` saves shared capacity; `slots memory G` one slot per G GiB of memory, `slots lower G` the
+12 GiB (on Linux the memory is the limit of the queue's cgroup where it has one: SLOTFATHER_CGROUP, the one
+install.py --cgroup wrote in, the one saved with the capacity, or the caller's outermost limited one). A request
+above a capacity that shrank takes every slot at its grant, and -n all the capacity then. `slotfather slots N` saves shared capacity; `slots memory G` one slot per G GiB of memory, `slots lower G` the
 lower of that and the CPU budget (#653); `slotfather slots reset` restores the automatic default. SLOTFATHER_CORES
 replaces the core count, SLOTFATHER_MEMORY_GIB the memory. A request above the total takes every slot.
 
@@ -55,7 +56,8 @@ request waits for them), a slot counting while at least half its cores are idle,
 the total) nor, without --exclusive, the free slots, and at least 1. SLOTFATHER_LOADAVG replaces the load
 averages: "load1 load5 load15", or one number for all three.
 
-State: ~/.local/state/slotfather (SLOTFATHER_DIR replaces it; queue.log records grants, releases and
+State: ~/.local/state/slotfather (SLOTFATHER_DIR replaces it; another user's queue is read only: changes are
+refused and reading creates nothing; queue.log records grants, releases and
 reaps; history.jsonl, which `history` lists, has a line per request that left the queue: its command, directory,
 wait, run and outcome, and for `run` what its process tree used; machine.jsonl samples the machine while leases
 run; `stats` reads both). While its command runs, the holder looks at the command's process tree every
@@ -77,8 +79,10 @@ import json
 import math
 import os
 from pathlib import Path
+import pwd
 import re
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -90,6 +94,7 @@ if sys.version_info < MIN_PYTHON:
              f"{sys.executable}; reinstall with a newer one: /path/to/python3 install.py")
 
 DEFAULT_DIR = "~/.local/state/slotfather"
+DEFAULT_CGROUP = None  # install.py --cgroup writes the queue's cgroup here, so every client of the queue names it
 DEFAULT_LEGACY_DIRS = "~/.local/state/straylight-verification/slots"
 LEGACY_TOTAL = 4  # the earlier queue's fixed slot count
 CORES_PER_SLOT = 3
@@ -185,19 +190,20 @@ def cores() -> int:
 
 
 def memory_gib(group: str | None = None) -> float | None:
-    """The memory the queue's leases share, in GiB (SLOTFATHER_MEMORY_GIB replaces it), or None where unknown: the
-    machine's, and on Linux no more than the memory.max of `group` (else of the queue's cgroup, memory_cgroup())."""
+    """The memory the queue's leases share, in GiB (SLOTFATHER_MEMORY_GIB replaces it), or None where unknown: on
+    Linux the limit of `group` (else of the queue's cgroup, memory_cgroup(); "" for none) where it has one, else the
+    machine's."""
     value = setting("MEMORY_GIB") or ""
     with contextlib.suppress(ValueError):
         if float(value) > 0:
             return float(value)
     if linux():
-        found = meminfo().get("MemTotal")
-        total = found * 1024 if found else None
-        limit = cgroup_value(memory_cgroup() if group is None else group, "memory.max")
+        # A cgroup's limit alone where there is one: MemTotal moves with a VM's balloon, and stays in the guard.
+        limit = cgroup_limit(memory_cgroup() if group is None else group)
         if limit is not None:
-            total = limit if total is None else min(total, limit)
-        return total / (1 << 30) if total else None
+            return limit / (1 << 30)
+        found = meminfo().get("MemTotal")
+        return found / (1 << 20) if found else None
     if sys.platform == "darwin":
         found = sysctl("hw.memsize")
         return int(found) / (1 << 30) if found and found.isdigit() else None
@@ -460,6 +466,15 @@ def cgroup_value(group: str | None, name: str) -> int | None:
     return int(value) if value.isdigit() else None
 
 
+def cgroup_limit(group: str | None) -> int | None:
+    """A cgroup's effective memory limit in bytes: the smallest memory.max on its path from the root; None for none."""
+    if not group:
+        return None
+    parts = [p for p in group.strip("/").split("/") if p]
+    limits = [cgroup_value("/" + "/".join(parts[:n]), "memory.max") for n in range(len(parts) + 1)]
+    return min((v for v in limits if v is not None), default=None)
+
+
 def own_cgroup() -> str | None:
     """This process's cgroup v2 path, from /proc/self/cgroup's "0::" line; None on cgroup v1 or off Linux."""
     with contextlib.suppress(OSError):
@@ -484,12 +499,13 @@ def limited_cgroup(group: str | None = None) -> str | None:
 
 
 def memory_cgroup() -> str | None:
-    """The cgroup whose memory the queue's leases share: SLOTFATHER_CGROUP, else the one saved with the capacity
+    """The cgroup whose memory the queue's leases share: SLOTFATHER_CGROUP, else the one install.py --cgroup wrote
+    in (DEFAULT_CGROUP), else the one saved with the capacity
     (`slots memory|lower` saves the saver's), else this process's limited_cgroup(); None off Linux or without a
     limit. Every client of a queue should name the same one: the capacity and the guard read its limit and pressure."""
     if not linux():
         return None
-    named = setting("CGROUP")
+    named = setting("CGROUP") or DEFAULT_CGROUP
     if named:
         return named
     with contextlib.suppress(OSError, ValueError, AttributeError):
@@ -506,7 +522,7 @@ def linux_memory(info: dict[str, int] | None = None, pressure: dict | None = Non
     reported). PSI is the cgroup's memory.pressure where there is one, else /proc/pressure/memory's."""
     info = meminfo() if info is None else info
     group = memory_cgroup() if group is None else group
-    limit = cgroup_value(group, "memory.max")
+    limit = cgroup_limit(group)
     if pressure is None and group:
         with contextlib.suppress(OSError):
             pressure = psi((cgroup_path(group) / "memory.pressure").read_text())
@@ -919,8 +935,50 @@ def sample_machine(directory: Path) -> bool:
 
 # Queue
 
+def foreign_owner(directory: Path) -> int | None:
+    """The uid that owns the queue when it is not this process's (effective) one, else None. A queue not made yet
+    belongs to the owner of the directory it would be made in, unless that is a sticky shared one such as /tmp.
+    Another user's queue is read only (#653 review: root through the guest agent running the installed command
+    must not leave root's files in the runner's queue)."""
+    path = Path(directory)
+    while not os.path.lexists(path) and path != path.parent:
+        path = path.parent
+    try:
+        info = path.stat()
+    except OSError:
+        return None
+    if info.st_uid == os.geteuid() or (path != Path(directory) and info.st_mode & stat.S_ISVTX):
+        return None
+    return info.st_uid
+
+
+def require_own(directory: Path, what: str) -> None:
+    """Refuses `what`, a change to the queue, from a user other than the queue's owner."""
+    owner = foreign_owner(directory)
+    if owner is None:
+        return
+    try:
+        name = pwd.getpwuid(owner).pw_name
+    except KeyError:
+        name = str(owner)
+    raise SlotError(f"the queue {directory} belongs to uid {owner} ({name}): {what} by uid {os.geteuid()} would leave "
+                    f"files that user cannot write; run it as that user: sudo -u {name} slotfather ...")
+
+
 @contextlib.contextmanager
 def locked(directory: Path):
+    """The queue's lock. In another user's queue (foreign_owner()) nothing is created: an existing lock is taken
+    through a read-only handle, a missing queue is read as it is."""
+    if foreign_owner(directory) is not None:
+        try:
+            handle = open(directory / ".lock", "r")
+        except OSError:
+            yield
+            return
+        with handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            yield
+        return
     (directory / "queue").mkdir(parents=True, exist_ok=True)
     with open(directory / ".lock", "a") as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
@@ -946,12 +1004,14 @@ def write(path: Path, entry: dict) -> None:
 
 
 def reap(directory: Path, table: dict) -> list[tuple[Path, dict]]:
-    """Live entries in queue order; removes those whose holder exited or crashed."""
+    """Live entries in queue order; removes those whose holder exited or crashed (in another user's queue it only
+    leaves them out)."""
     live = []
+    readonly = foreign_owner(directory) is not None
     for path, entry in entries(directory):
         if alive(entry, table):
             live.append((path, entry))
-        else:
+        elif not readonly:
             path.unlink(missing_ok=True)
             marker(path).unlink(missing_ok=True)
             log(directory, f"reaped {entry.get('state')} lease of {entry.get('count')} for "
@@ -1387,6 +1447,17 @@ def reserve(found: Plan, held: list[dict], slots: int, used: int, moment: float,
     return max(0, min(have, slots - other - largest) - found.head["count"])
 
 
+def fit(waiters: list[dict], slots: int) -> list[dict]:
+    """Makes each waiter ask for at most the capacity `slots`, and an `-n all` one (its entry's `all`) for exactly
+    it: a capacity that shrank under a waiter (a memory budget when a VM's balloon takes memory) would otherwise
+    leave it waiting for slots that no longer exist. The change is the waiter's own entry's: a grant writes it and
+    the holder takes its count from there. Only for the queue's whole capacity, not a share of it."""
+    for entry in waiters:
+        if entry.get("all") or entry["count"] > slots:
+            entry["count"] = slots
+    return waiters
+
+
 def plan(waiters: list[dict], held: list[dict], slots: int, moment: float, order: str | None = None,
          estimate=None, other: int = 0, reserve_head: bool = False, settings: dict | None = None) -> Plan:
     """Which of `waiters` (queue order) start now beside `held` (entries; `other` slots more held without one) on
@@ -1537,6 +1608,8 @@ def room(waiters: list[dict], free: int, held: list[dict] | None = None, estimat
     for `command` under `label`, whose run the estimates know, or else one of unknown run (the fallback). Without
     `held` (the entries holding slots; `other` slots more held without one), the window order's answer."""
     slots = free + sum(e["count"] for e in held or ()) + other
+    if held is not None:  # the whole capacity: what grant() fits the waiters to
+        fit(waiters, slots)
     moment = time.time()
     settings = settings or order_settings()
     order = settings["order"] if held is not None else "window"
@@ -1572,8 +1645,9 @@ def cached_estimates(directory: Path) -> Estimates:
             found = Estimates.load(saved["runs"])
     if found is None:
         found = history_estimates(directory)
-        with contextlib.suppress(OSError):
-            write(cache, {"stamp": stamp, "runs": found.save()})
+        if foreign_owner(directory) is None:
+            with contextlib.suppress(OSError):
+                write(cache, {"stamp": stamp, "runs": found.save()})
     _estimates.clear()
     _estimates[key] = found
     return found
@@ -1734,7 +1808,8 @@ def grant(directory: Path, table: dict) -> str | None:
     paths = {id(e): path for path, e in live}
     estimate = estimator(directory)
     other = legacy_used(table)
-    found = plan(waiters, held, total(), time.time(), estimate=estimate, other=other,
+    slots = total()
+    found = plan(fit(waiters, slots), held, slots, time.time(), estimate=estimate, other=other,
                  settings=order_settings(directory))
     used = sum(e["count"] for e in held) + other
     short = None
@@ -2037,9 +2112,11 @@ def acquire(count: int | str, label: str, command: str = "", out=sys.stderr, wai
         cwd = os.getcwd()
     except OSError:
         cwd = ""
+    require_own(directory, "a lease")
     with locked(directory):
-        # Admission and capacity changes share this lock; resolve all only now.
-        count = total() if count == "all" else min(count, total())
+        # Admission and capacity changes share this lock; resolve all only now (and again at the grant: plan()).
+        whole = count == "all"
+        count = total() if whole else min(count, total())
         sequence_file = directory / "sequence"
         try:
             sequence = int(sequence_file.read_text() or 0) + 1
@@ -2049,6 +2126,8 @@ def acquire(count: int | str, label: str, command: str = "", out=sys.stderr, wai
         path = directory / "queue" / f"{sequence:010d}-{me}.json"
         entry = {"pid": me, "start": table.get(me, (0, ""))[1], "count": count, "label": label, "cmd": command,
                  "cwd": cwd, "since": now(), "state": "waiting"}
+        if whole:
+            entry["all"] = True  # the capacity at the grant; older clients read past fields they do not know
         if meta:
             entry["meta"] = meta  # older clients read past fields they do not know
         if yieldable:
@@ -2074,10 +2153,13 @@ def acquire(count: int | str, label: str, command: str = "", out=sys.stderr, wai
                 interval = poll if waiting != said else min(interval * 1.5, poll_max)
                 look = time.monotonic() + interval
             try:
-                state = json.loads(path.read_text())["state"]  # written whole by rename: no lock needed
-            except (OSError, ValueError):
+                current = json.loads(path.read_text())  # written whole by rename: no lock needed
+                state = current["state"]
+            except (OSError, ValueError, KeyError, TypeError):
                 raise SlotError("the lease vanished from the queue") from None
             if state == "held":
+                if isinstance(current.get("count"), int) and current["count"] >= 1:
+                    count = lease.count = current["count"]  # the capacity changed while it waited (plan())
                 if said:
                     print(f"slot: granted {count} slot(s) to {label}", file=out, flush=True)
                 return lease
@@ -2257,6 +2339,7 @@ def yield_command(argv: list[str]) -> int:
     lease is held again; returns at once when nothing asked. Exit 0 either way."""
     if argv:
         raise SlotError("yield takes no arguments")
+    require_own(state_dir(), "yield")
     found = inherited_lease(processes())
     if found is None or found[0].parent.parent != state_dir():
         raise SlotError("yield runs inside a lease of this queue (SLOTFATHER_LEASE, or a holder among its ancestors)")
@@ -2317,6 +2400,7 @@ def order_command(argv: list[str]) -> int:
     if reset and changes:
         raise SlotError("order reset takes nothing else")
     if changes or reset:
+        require_own(directory, "an order change")
         with locked(directory):
             saved = dict(ORDER_DEFAULTS)  # what is saved, without this client's environment
             with contextlib.suppress(OSError, ValueError, TypeError, AttributeError):
@@ -2352,22 +2436,29 @@ def slots_value(argv: list[str]) -> dict | None:
         if math.isfinite(per_slot) and per_slot > 0:
             per_slot = int(per_slot) if per_slot.is_integer() else per_slot
             # The cgroup is the saver's (SLOTFATHER_CGROUP, or its outermost limited one), not the one saved before.
-            group = (setting("CGROUP") or limited_cgroup()) if linux() else None
+            group = (setting("CGROUP") or DEFAULT_CGROUP or limited_cgroup()) if linux() else None
+            if linux() and cgroup_limit(group) is None:
+                print("slotfather: note: no cgroup with a memory limit here or in SLOTFATHER_CGROUP: the count "
+                      "follows MemTotal, which a VM's balloon moves and which differs from what clients inside a "
+                      "limited cgroup see; name the cgroup the leases share (SLOTFATHER_CGROUP=/a.slice/b.slice, "
+                      "or install.py --cgroup)", file=sys.stderr)
             by_memory = memory_slots(memory_gib(group or ""), per_slot)
             if by_memory is None:
                 raise SlotError("the machine's memory is unknown here; save a count instead (slotfather slots N)")
             cpu = max(1, cores() // CORES_PER_SLOT)
             found = {"slots": by_memory if argv[0] == "memory" else min(cpu, by_memory), "mode": argv[0],
                      "gib_per_slot": per_slot}
-            if group and cgroup_value(group, "memory.max") is not None:
+            if cgroup_limit(group) is not None:
                 found["cgroup"] = group
             return found
     raise SlotError("slots takes a positive integer, memory GIB or lower GIB (GiB per slot), or reset")
 
 
 def slots_command(argv: list[str]) -> int:
-    value = slots_value(argv) if argv else None
     directory = state_dir()
+    if argv:
+        require_own(directory, "a capacity change")
+    value = slots_value(argv) if argv else None
     with locked(directory):
         if argv:
             table = processes()

@@ -415,6 +415,7 @@ def dashboard_model() -> dict:
     settings, start = sf.order_settings(directory), None
     order = settings["order"]
     live_waiters = [e for e in live if e["state"] != "held"]
+    sf.fit(live_waiters, slots)  # as the queue grants them when the capacity shrank under them
     if order == "backfill":
         live_waiters = sf.ranked(live_waiters, settings)  # the order the queue serves them in
     waiters = [item(e, "waiting", e["count"]) for e in live_waiters]

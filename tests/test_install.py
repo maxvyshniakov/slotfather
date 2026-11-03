@@ -247,6 +247,24 @@ class SharedQueueInstallTests(unittest.TestCase):
         stats = subprocess.run([str(self.system_bin / "slotfather-stats")], env=env, capture_output=True, text=True)
         self.assertEqual("stats fixture\n", stats.stdout, "the companions are installed beside it")
 
+    def test_the_cgroup_the_leases_share_is_written_in_for_every_client(self):
+        module = self.installer()
+        module.install(self.home, self.source / "slotfather", sys.executable, self.system_bin, pinned=True,
+                       cgroup="/ci.slice/ci-runners.slice")
+        self.assertIn('DEFAULT_CGROUP = "/ci.slice/ci-runners.slice"  #', (self.system_bin / "slotfather").read_text())
+        # A shell outside the slice (no limited cgroup of its own) counts the slice's 10 GiB.
+        fixtures = ROOT / "tests" / "fixtures"
+        env = {k: v for k, v in os.environ.items() if not k.startswith("SLOTFATHER")}
+        env.update(SLOTFATHER_LEGACY_DIRS="", SLOTFATHER_CORES="16", SLOTFATHER_PROC=str(fixtures / "proc" / "calm"),
+                   SLOTFATHER_CGROUP_ROOT=str(fixtures / "cgroup" / "calm"))
+        listed = subprocess.run([str(self.system_bin / "slotfather"), "slots"], env=env, capture_output=True,
+                                text=True, timeout=20)
+        self.assertEqual("2 slots (automatic, by memory: one per 4 GiB of 10 GiB in /ci.slice/ci-runners.slice; "
+                         "5 by 16 cores)", listed.stdout.strip(), listed.stderr)
+        for bad in ("ci.slice", "/a/../b"):
+            with self.subTest(cgroup=bad):
+                self.assertIn("--cgroup takes", self.run_install("--cgroup", bad).stderr)
+
     def test_a_source_without_the_state_line_is_refused(self):
         (self.source / "slotfather").write_bytes(PAYLOAD)
         module = self.installer()
