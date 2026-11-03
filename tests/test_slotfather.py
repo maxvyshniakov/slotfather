@@ -37,7 +37,8 @@ class SlotCase(unittest.TestCase):
         self.env = {k: v for k, v in os.environ.items() if not k.startswith(("SLOTFATHER", "STRAYLIGHT_SLOT"))}
         self.env.update(SLOTFATHER_DIR=str(self.state), SLOTFATHER_LEGACY_DIRS="", SLOTFATHER_POLL="0.05", SLOTFATHER_POLL_MAX="0.5",
                         SLOTFATHER_OVERTAKE_WINDOW="0",
-                        SLOTFATHER_CORES="12", SLOTFATHER_MEMORY_FILE=str(self.memory), LOG=str(self.log),
+                        SLOTFATHER_CORES="12", SLOTFATHER_MEMORY_GIB="64", SLOTFATHER_MEMORY_FILE=str(self.memory),
+                        LOG=str(self.log),
                         RELEASE=str(self.release_dir))
         self.processes = []
         self.addCleanup(self.stop_all)
@@ -335,7 +336,8 @@ class HistoryTests(SlotCase):
                                                            found["fails"]["cmd"]))
         listing = self.tool("history").stdout
         self.assertRegex(listing, r"left: 1 slot\(s\) late waited \d+s cmd=sh")
-        self.assertRegex(listing, r"released: 1 slot\(s\) fails waited \d+s ran \d+s exit 3 used [\d.]+ cores, \d+ MB "
+        # A command that ends within 5 ms records a wall of 0.00 s and shows its CPU seconds instead of cores.
+        self.assertRegex(listing, r"released: 1 slot\(s\) fails waited \d+s ran \d+s exit 3 used (?:[\d.]+ cores|\d+ s CPU), \d+ MB "
                                   r"cmd=sh -c exit 3")
         self.assertEqual(1, len(self.tool("history", "1").stdout.splitlines()))
 

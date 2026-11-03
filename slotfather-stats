@@ -181,9 +181,15 @@ def machine(samples: list[dict], cores: int, capacity: int) -> dict:
         if a.get("held"):
             held_area += w * a["held"]
             busy_area += w * share * here
-    pressure = [s.get("pressure") for s in samples]
     swap_free = [s.get("swap_free_mb") for s in samples if s.get("swap_total_mb")]
     memory_free = [s.get("memory_free_pct") for s in samples]
+    available = [s.get("memory_available_mb") for s in samples]
+
+    def elevated(sample: dict) -> bool:
+        """macOS: the pressure level above normal; Linux: PSI memory avg10 at the guard's limits."""
+        level, some, full = (sample.get(k) for k in ("pressure", "psi_some", "psi_full"))
+        return (level is not None and level > 1) or (some is not None and some >= sf.MAX_PSI_SOME) or \
+            (full is not None and full >= sf.MAX_PSI_FULL)
     return {
         "samples": len(samples), "hours": round(total_weight / 3600, 3),
         "load1_p50": percentile(load1, 50), "load1_p90": percentile(load1, 90),
@@ -192,10 +198,10 @@ def machine(samples: list[dict], cores: int, capacity: int) -> dict:
         "busy_mean": None if not busy_weight else round(busy_sum / busy_weight, 3),
         "slot_idle": None if not busy_weight else round(idle_slot / busy_weight, 3),
         "busy_cores_per_held_slot": round(busy_area / held_area, 2) if held_area else None,
-        "pressure_elevated": round(sum(w for w, p in zip(weights, pressure) if p is not None and p > 1)
-                                   / total_weight, 3),
+        "pressure_elevated": round(sum(w for w, s in zip(weights, samples) if elevated(s)) / total_weight, 3),
         "memory_free_pct_min": min((m for m in memory_free if m is not None), default=None),
         "swap_free_mb_min": min((f for f in swap_free if f is not None), default=None),
+        "memory_available_mb_min": min((a for a in available if a is not None), default=None),
     }
 
 
@@ -227,7 +233,7 @@ def summarize(directory: Path | None = None, since: float | None = None, label: 
     try:
         capacity, saved = sf.capacity()
     except sf.SlotError:
-        capacity, saved = max(1, sf.cores() // sf.CORES_PER_SLOT), False
+        capacity, saved = sf.automatic_capacity(), False
     cores = sf.cores()
     samples = [s for s in sf.journal(directory / "machine.jsonl")
                if since is None or (isinstance(s.get("at"), (int, float)) and s["at"] >= since)]
@@ -235,7 +241,7 @@ def summarize(directory: Path | None = None, since: float | None = None, label: 
     per_slot = overall["cores_per_slot"]
     return {
         "since": since, "label": label, "by": by, "cores": cores, "capacity": capacity, "saved": saved,
-        "automatic": max(1, cores // sf.CORES_PER_SLOT),
+        "automatic": sf.automatic_capacity(),
         "first": items[0].get("ended") if items else None, "last": items[-1].get("ended") if items else None,
         "versions": {str(v): sum((i.get("v") or 1) == v for i in items)
                      for v in sorted({i.get("v") or 1 for i in items})},
@@ -323,7 +329,9 @@ def report(summary: dict, top: int = 25) -> str:
                      f"time, under {share(m['under_cores'])}; CPU busy mean {share(m['busy_mean'])}, a slot's cores "
                      f"idle {share(m['slot_idle'])}; {number(m['busy_cores_per_held_slot'])} busy cores per held slot; "
                      f"memory pressure above normal {share(m['pressure_elevated'])}"
-                     + ("" if m["swap_free_mb_min"] is None else f"; least free swap {m['swap_free_mb_min']} MB"))
+                     + ("" if m["swap_free_mb_min"] is None else f"; least free swap {m['swap_free_mb_min']} MB")
+                     + ("" if m.get("memory_available_mb_min") is None
+                        else f"; least available memory {m['memory_available_mb_min']} MB"))
     else:
         lines.append("no machine samples in range")
     return "\n".join(lines)

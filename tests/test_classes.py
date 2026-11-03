@@ -306,7 +306,8 @@ class ProtocolTests(SlotCase):
         sf.write(sf.marker(gate), {"by": asker.stem, "label": "quick", "class": "interactive", "count": 4,
                                    "at": "2026-11-03T00:12:00Z"})
         with mock.patch.dict(os.environ, {"SLOTFATHER_DIR": str(self.state), "SLOTFATHER_LEGACY_DIRS": "",
-                                          "SLOTFATHER_CORES": "12", "SLOTFATHER_MEMORY_FILE": str(self.memory)}):
+                                          "SLOTFATHER_CORES": "12", "SLOTFATHER_MEMORY_GIB": "64",
+                                          "SLOTFATHER_MEMORY_FILE": str(self.memory)}):
             self.assertFalse(sf.yield_lease(gate))
         self.assertEqual("held", json.loads(gate.read_text())["state"])
         self.assertFalse(sf.marker(gate).exists(), "the request is withdrawn")

@@ -7,6 +7,15 @@ queue as the new queue or a named backup, and blocks old clients with file guard
 The installed commands run on one named interpreter: `#!/usr/bin/env python3` becomes
 the interpreter running this installer (or --python), so an agent inside a project's
 virtual environment still runs slotfather on the Python it was installed with.
+
+`--user NAME` installs for another user (root only) or pins the queue for this one: the
+queue is NAME's ~/.local/state/slotfather, written into the installed slotfather as its
+default state directory, so every process that runs these commands shares that one queue
+whatever its HOME (several CI runner services of one user, #653). Paths it creates under
+NAME's home are given to NAME. `--bin DIR` puts the commands in DIR instead of
+~/.local/bin, such as /usr/local/bin, which service PATHs already hold:
+
+    sudo python3 install.py --user runner --bin /usr/local/bin
 """
 from contextlib import ExitStack, contextmanager
 import ctypes
@@ -14,6 +23,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import pwd
 import subprocess
 import sys
 import tempfile
@@ -22,7 +32,8 @@ import uuid
 MIN_PYTHON = (3, 9)
 ENV_SHEBANG = b"#!/usr/bin/env python3\n"
 COMMANDS = ("slotfather", "slotfather-dashboard", "slotfather-stats")
-USAGE = "usage: python3 install.py [--python /path/to/python3]"
+USAGE = "usage: python3 install.py [--python /path/to/python3] [--user NAME] [--bin DIR]"
+STATE_LINE = b'DEFAULT_DIR = "~/.local/state/slotfather"\n'  # in slotfather; --user replaces it
 GUARD = b"Retired queue: use slotfather with ~/.local/state/slotfather. Update this checkout before running heavy work.\n"
 
 
@@ -42,7 +53,9 @@ def lock(path):
 
 
 def live_processes():
-    result = subprocess.run(["ps", "-axo", "pid=,stat=,lstart="], capture_output=True, text=True)
+    # Linux: the C locale, as slotfather's own ps (procps writes lstart in the locale's words).
+    env = {**os.environ, "LC_ALL": "C"} if sys.platform.startswith("linux") else None
+    result = subprocess.run(["ps", "-axo", "pid=,stat=,lstart="], capture_output=True, text=True, env=env)
     if result.returncode:
         raise InstallError("cannot establish whether old queue processes are live: ps failed")
     table = {}
@@ -93,13 +106,21 @@ def make_guard(path):
     return path.stat().st_ino
 
 
-def interpreter(argv):
+def options(argv):
+    """--python, --user and --bin, each at most once with a value."""
+    found = {}
+    while argv:
+        if argv[0] not in ("--python", "--user", "--bin") or len(argv) < 2 or argv[0] in found:
+            raise InstallError(USAGE)
+        found[argv[0]], argv = argv[1], argv[2:]
+    return found
+
+
+def interpreter(python=None):
     """The interpreter the commands will name: --python PATH, else this one unless it belongs to a virtual
     environment, whose interpreter disappears with the project. It must exist and be Python 3.9 or later."""
-    if argv:
-        if len(argv) != 2 or argv[0] != "--python":
-            raise InstallError(USAGE)
-        python = os.path.abspath(os.path.expanduser(argv[1]))
+    if python:
+        python = os.path.abspath(os.path.expanduser(python))
     elif sys.prefix != sys.base_prefix:
         raise InstallError("this Python belongs to a virtual environment; run install.py with a Python outside it, "
                            "or name one with --python")
@@ -116,10 +137,14 @@ def interpreter(argv):
     return python
 
 
-def install_binary(source, target, python):
+def install_binary(source, target, python, state=None):
     payload = source.read_bytes()
     if payload.startswith(ENV_SHEBANG):
         payload = b"#!" + os.fsencode(python) + b"\n" + payload[len(ENV_SHEBANG):]
+    if state is not None:
+        if payload.count(STATE_LINE) != 1:
+            raise InstallError(f"cannot pin the state directory in {source}: its DEFAULT_DIR line is not the expected one")
+        payload = payload.replace(STATE_LINE, b"DEFAULT_DIR = " + json.dumps(str(state)).encode() + b"\n")
     target.parent.mkdir(parents=True, exist_ok=True)
     pending = None
     try:
@@ -135,7 +160,10 @@ def install_binary(source, target, python):
             pending.unlink(missing_ok=True)
 
 
-def install(home, source, python):
+def install(home, source, python, bin_dir=None, pinned=False):
+    """Install into `bin_dir` (default HOME/.local/bin) for the queue in HOME/.local/state/slotfather; `pinned`
+    writes that queue into slotfather as its default."""
+    bin_dir = bin_dir or home / ".local/bin"
     state = home / ".local/state"
     destination = state / "slotfather"
     old_paths = (state / "machine-slots", state / "straylight-verification/slots")
@@ -210,10 +238,11 @@ def install(home, source, python):
             # The companions (dashboard, stats) first: an executable that names a missing one is the shorter-lived
             # mismatch.
             for name in reversed(COMMANDS):
-                install_binary(source.with_name(name), home / ".local/bin" / name, python)
+                install_binary(source.with_name(name), bin_dir / name, python,
+                               destination if pinned and name == "slotfather" else None)
             old_command.unlink(missing_ok=True)
-            print(f"Installed {home / '.local/bin/slotfather'}, slotfather-dashboard and slotfather-stats for "
-                  f"{python}; old queue paths are file guards")
+            print(f"Installed {bin_dir / 'slotfather'}, slotfather-dashboard and slotfather-stats for "
+                  f"{python}; old queue paths are file guards" + (f"; queue {destination}" if pinned else ""))
         finally:
             # An idleness refusal leaves original state and commands untouched.
             # Once exchanges begin, preserve every guard and backup even on error.
@@ -223,13 +252,45 @@ def install(home, source, python):
                         path.unlink()
 
 
+def give(home, user, bin_dir, owner_of=lambda path: os.lstat(path).st_uid, chown=os.lchown):
+    """Hands what this (root) run created under `home` to `user`: the state paths the installer writes, and the
+    commands when they live in the user's home. Only root-owned paths change hands; commands elsewhere stay root's."""
+    state = home / ".local/state"
+    paths = [home / ".local", state, home / ".local/bin", state / ".slotfather-install.lock"]
+    for name in ("slotfather", "machine-slots", "straylight-verification", "slotfather-migrations"):
+        top = state / name
+        paths.append(top)
+        if top.is_dir() and not top.is_symlink():
+            paths += sorted(top.rglob("*"))
+    if home in bin_dir.parents or bin_dir == home:
+        paths += [bin_dir] + [bin_dir / name for name in COMMANDS]
+    for path in paths:
+        if os.path.lexists(path) and owner_of(path) == 0:
+            chown(path, user.pw_uid, user.pw_gid)
+
+
 def main():
     if sys.argv[1:] == ["--help"]:
         print(USAGE)
         return 0
     try:
-        python = interpreter(sys.argv[1:])
-        install(Path.home(), Path(__file__).resolve().with_name("slotfather"), python)
+        found = options(sys.argv[1:])
+        python = interpreter(found.get("--python"))
+        home, user = Path.home(), None
+        if "--user" in found:
+            try:
+                user = pwd.getpwnam(found["--user"])
+            except KeyError:
+                raise InstallError(f"no user {found['--user']!r} on this machine") from None
+            if user.pw_uid != os.getuid() and os.getuid() != 0:
+                raise InstallError(f"installing for {user.pw_name} needs root (sudo)")
+            home = Path(user.pw_dir)
+        bin_dir = Path(os.path.expanduser(found["--bin"])) if "--bin" in found else None
+        if bin_dir is not None and not bin_dir.is_absolute():
+            raise InstallError("--bin takes an absolute directory")
+        install(home, Path(__file__).resolve().with_name("slotfather"), python, bin_dir, pinned=user is not None)
+        if user is not None and os.getuid() == 0 and user.pw_uid != 0:
+            give(home, user, bin_dir or home / ".local/bin")
     except (InstallError, OSError) as error:
         print(f"slotfather install: {error}", file=sys.stderr)
         return 2

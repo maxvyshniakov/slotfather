@@ -18,7 +18,7 @@ from test_usage import load
 sf = load(TOOL, "slotfather_order_core")
 
 M = 1_800_000_000.0  # the moment plan() decides at
-SETTINGS = {"SLOTFATHER_OVERTAKE_WINDOW": "600"}  # every other knob at its default unless a test sets it
+SETTINGS = {"SLOTFATHER_OVERTAKE_WINDOW": "600", "SLOTFATHER_MEMORY_GIB": "64"}  # every other knob at its default unless a test sets it
 
 
 def stamp(offset: float) -> str:

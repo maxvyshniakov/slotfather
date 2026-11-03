@@ -1,5 +1,7 @@
 """Public one-time installer checks; every invocation has its own HOME and queue trees."""
+import contextlib
 import fcntl
+import io
 import json
 import os
 from pathlib import Path
@@ -198,3 +200,108 @@ class InstallTests(unittest.TestCase):
         self.assertIn("operation in progress", result.stderr)
         self.assertEqual(before, self.contents(self.old))
         self.assertEqual("old command", (self.bin / "machine-slot").read_text())
+
+
+class SharedQueueInstallTests(unittest.TestCase):
+    """`--user NAME [--bin DIR]` (#653): one queue for every process of a user whatever its HOME, such as the runner
+    services of a CI VM, with the commands where those services' PATH looks."""
+
+    run_install = InstallTests.run_install
+
+    def setUp(self):
+        InstallTests.setUp(self)
+        shutil.copyfile(ROOT / "slotfather", self.source / "slotfather")
+        self.system_bin = self.tmp / "usr-local-bin"
+
+    def installer(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("slotfather_installer", self.source / "install.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        install = module.install
+
+        def quiet(*args, **kwargs):
+            with contextlib.redirect_stdout(io.StringIO()):
+                return install(*args, **kwargs)
+        module.install = quiet
+        return module
+
+    def test_a_pinned_install_names_the_users_queue_in_the_installed_command(self):
+        module = self.installer()
+        module.install(self.home, self.source / "slotfather", sys.executable, self.system_bin, pinned=True)
+        installed = (self.system_bin / "slotfather").read_text()
+        self.assertIn(f'DEFAULT_DIR = {json.dumps(str(self.new))}\n', installed)
+        self.assertTrue(installed.startswith(f"#!{sys.executable}\n"))
+        self.assertFalse((self.bin / "slotfather").exists(), "--bin replaces ~/.local/bin")
+        self.assertTrue(self.new.is_dir())
+        # Any HOME, one queue: a job that moved HOME still shares it.
+        env = {k: v for k, v in os.environ.items() if not k.startswith("SLOTFATHER")}
+        env.update(HOME=str(self.tmp / "elsewhere"), SLOTFATHER_LEGACY_DIRS="", SLOTFATHER_CORES="6",
+                   SLOTFATHER_MEMORY_GIB="11.68")
+        saved = subprocess.run([str(self.system_bin / "slotfather"), "slots", "memory", "5"], env=env,
+                               capture_output=True, text=True, timeout=20)
+        self.assertEqual("2 slots (saved: one per 5 GiB of 11.7 GiB)", saved.stdout.strip(), saved.stderr)
+        self.assertEqual({"slots": 2, "mode": "memory", "gib_per_slot": 5},
+                         json.loads((self.new / "capacity.json").read_text()))
+        self.assertFalse((self.tmp / "elsewhere").exists())
+        stats = subprocess.run([str(self.system_bin / "slotfather-stats")], env=env, capture_output=True, text=True)
+        self.assertEqual("stats fixture\n", stats.stdout, "the companions are installed beside it")
+
+    def test_a_source_without_the_state_line_is_refused(self):
+        (self.source / "slotfather").write_bytes(PAYLOAD)
+        module = self.installer()
+        with self.assertRaises(module.InstallError):
+            module.install(self.home, self.source / "slotfather", sys.executable, self.system_bin, pinned=True)
+        self.assertFalse((self.system_bin / "slotfather").exists())
+
+    def test_give_hands_only_root_owned_paths_under_the_home_to_the_user(self):
+        module = self.installer()
+        module.install(self.home, self.source / "slotfather", sys.executable, self.system_bin, pinned=True)
+        changed = []
+        (self.new / "keep-mine").write_text("someone else's")
+        user = type("User", (), {"pw_uid": 1001, "pw_gid": 1001})()
+        module.give(self.home, user, self.system_bin, owner_of=lambda path: 4242 if "keep" in str(path) else 0,
+                    chown=lambda path, uid, gid: changed.append((Path(path), uid, gid)))
+        paths = {path for path, _, _ in changed}
+        self.assertIn(self.new, paths)
+        self.assertIn(self.state / ".slotfather-install.lock", paths)
+        self.assertIn(self.old, paths)
+        self.assertNotIn(self.new / "keep-mine", paths)
+        self.assertFalse(any(self.system_bin in p.parents or p == self.system_bin for p in paths),
+                         "commands outside the home stay root's")
+        self.assertEqual({(1001, 1001)}, {(uid, gid) for _, uid, gid in changed})
+
+    def test_user_errors_come_before_any_change(self):
+        for options, message in ((("--user", "no-such-user-653"), "no user"), (("--bin", "relative/bin"), "absolute"),
+                                 (("--user", "a", "--user", "b"), "usage")):
+            with self.subTest(options=options):
+                result = self.run_install(*options)
+                self.assertEqual(2, result.returncode, result.stdout)
+                self.assertIn(message, result.stderr)
+                self.assertFalse(self.new.exists())
+        if os.getuid() != 0:
+            result = self.run_install("--user", "root")
+            self.assertIn("needs root", result.stderr)
+            self.assertFalse(self.new.exists())
+
+    @unittest.skipUnless(os.getuid() == 0 and os.environ.get("SLOTFATHER_TEST_USERADD") == "1" and shutil.which("useradd"),
+                         "root in a disposable container with SLOTFATHER_TEST_USERADD=1")
+    def test_root_installs_for_a_runner_user_who_then_owns_the_queue(self):
+        name, home = "sfrunner653", self.tmp / "runner-home"
+        subprocess.run(["useradd", "-d", str(home), "-m", name], check=True)
+        self.addCleanup(subprocess.run, ["userdel", name])
+        self.tmp.chmod(0o755)
+        result = self.run_install("--user", name, "--bin", str(self.system_bin))
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        import pwd
+        user = pwd.getpwnam(name)
+        queue = home / ".local/state/slotfather"
+        self.assertEqual((user.pw_uid, user.pw_gid), (queue.stat().st_uid, queue.stat().st_gid))
+        self.assertEqual(0, (self.system_bin / "slotfather").stat().st_uid)
+        env = {"PATH": f"{self.system_bin}:/usr/bin:/bin", "HOME": "/tmp", "SLOTFATHER_LEGACY_DIRS": ""}
+        run = subprocess.run(["setpriv", f"--reuid={user.pw_uid}", f"--regid={user.pw_gid}", "--clear-groups",
+                              "slotfather", "run", "-n", "1", "--", "slotfather", "status"], env=env,
+                             capture_output=True, text=True, timeout=30)
+        self.assertEqual(0, run.returncode, run.stdout + run.stderr)
+        self.assertIn("1 of", run.stdout)
+        self.assertEqual(user.pw_uid, (queue / "history.jsonl").stat().st_uid)

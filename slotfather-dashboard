@@ -278,6 +278,10 @@ def memory_facts() -> dict:
             free, level = (float(v) for v in Path(seam).read_text().split()[:2])
             return {"swap_free": free, "swap_total": None, "level": level}
         return {"swap_free": None, "swap_total": None, "level": None}
+    if sf.linux():  # no pressure level: MemAvailable and PSI, as the guard reads them
+        facts = sf.linux_memory()
+        return {"swap_total": facts["swap_total"], "swap_free": facts["swap_free"], "level": None,
+                "available": facts["available"], "total": facts["total"], "psi_some": facts["psi_some"]}
     total, free = sf.swap_usage() or (None, None)
     return {"swap_total": total, "swap_free": free, "level": sf.pressure_level()}
 
@@ -689,8 +693,13 @@ def draw_machine(canvas: Canvas, y: int, x: int, height: int, width: int, model:
     trend = "↗" if load1 > load15 * 1.15 + 0.2 else "↘" if load1 < load15 * 0.85 - 0.2 else "→"
     advice, memory, guard = model["advice"], model["memory"], model["guard"]
     level = memory["level"]
-    pressure = {1: ("normal", "ok"), 2: ("warning", "warn"), 4: ("critical", "bad")}.get(
-        int(level) if level is not None else 0, ("unknown", "dim"))
+    pressure = {1: ("pressure normal", "ok"), 2: ("pressure warning", "warn"), 4: ("pressure critical", "bad")}.get(
+        int(level) if level is not None else 0, ("pressure unknown", "dim"))
+    if level is None and memory.get("available") is not None:  # Linux
+        psi = memory.get("psi_some")
+        pressure = (f"{megabytes(memory['available'])} available"
+                    + (f" of {megabytes(memory['total'])}" if memory.get("total") else "")
+                    + ("" if psi is None else f" · psi {psi:g}%"), "bad" if guard else "ok")
     if memory["swap_total"] == 0:
         swap = ("swap off", "text")
     else:
@@ -706,7 +715,7 @@ def draw_machine(canvas: Canvas, y: int, x: int, height: int, width: int, model:
         (5, "", [(f"load 1m {load1:.1f} · 5m {load5:.1f} · 15m {load15:.1f}", "dim")]),
         (6, "unleased", [(f"≈{advice['unleased_load']:.1f} cores · advise {advice['jobs']} "
                           f"job{'s' * (advice['jobs'] != 1)}", "dim")]),
-        (1, "memory", [(f"pressure {pressure[0]}", pressure[1]), (" · ", "dim"), swap]),
+        (1, "memory", [pressure, (" · ", "dim"), swap]),
         (2, "guard", [(f"on · {guard.replace(' is under ', ' < ')}" if guard else "off · leases start on capacity alone",
                        "bad" if guard else "dim")]),
     ]
