@@ -55,31 +55,7 @@ def percentile(values: list[float], q: float) -> float | None:
     return ordered[low] + (ordered[high] - ordered[low]) * (rank - low)
 
 
-def kind(command: str | None) -> str:
-    """The kind of check a command is: its program's name and first argument; a comma list counts its items, a path
-    keeps its last part, an option keeps its name, and a short option value follows it."""
-    words = [w for w in (command or "").split()]
-    while words and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0]):
-        words.pop(0)  # VAR=value before the program
-    if not words:
-        return "?"
-    found = [os.path.basename(words[0]) or words[0]]
-    rest = words[1:]
-    if rest:
-        first = rest[0]
-        if first.startswith("-"):
-            found.append(first.split("=", 1)[0])
-            value = rest[1] if len(rest) > 1 and "=" not in first else ""
-            if value and not value.startswith("-"):
-                if "," in value:
-                    found.append(f"[{len([v for v in value.split(',') if v])}]")
-                elif len(value) <= 40 and "=" not in value:
-                    found.append(os.path.basename(value.rstrip("/")) or value)
-        elif "," in first:
-            found.append(f"[{len([v for v in first.split(',') if v])}]")
-        else:
-            found.append(os.path.basename(first.rstrip("/")) or first)
-    return " ".join(found)[:60]
+kind = sf.kind  # the command kind the queue's run-time estimates use too
 
 
 def parse_since(text: str, moment: float | None = None) -> float:

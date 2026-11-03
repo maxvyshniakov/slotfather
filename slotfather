@@ -17,11 +17,15 @@ Slots: one per three cores, at least one, so `total = max(1, cores // 3)`: 4 on 
 `slotfather slots N` saves shared capacity; `slotfather slots reset` restores the automatic default.
 SLOTFATHER_CORES replaces the core count. A request above the total takes every slot.
 
-Requests are served in arrival order, with one exception: a waiter that does not fit lets later requests that fit
-start before it until it has waited SLOTFATHER_OVERTAKE_WINDOW seconds (default 600; 0 serves strictly in order).
-Past that it holds back everyone behind it, so an all-slot request starts at most the window plus the longest run
-admitted meanwhile after it queued. A process that already runs under a lease (SLOTFATHER_LEASE, or a holder among its
-ancestors) runs without a second lease, so nested wrappers neither deadlock nor count twice. A lease whose
+Requests are served in arrival order. A waiter that does not fit lets later requests that fit start before it until
+it has waited SLOTFATHER_OVERTAKE_WINDOW seconds (default 600). Past that it is the head (#643, SLOTFATHER_QUEUE=
+backfill, the default): a later request that fits still starts first if, by the run times of earlier requests of its
+kind in the history, three times its expected run ends before the head can start (when the held leases are expected
+to end) and before the head has waited SLOTFATHER_BACKFILL_LIMIT seconds (default 2700). An all-slot request
+therefore starts at most that limit plus the longest run admitted meanwhile after it queued. SLOTFATHER_QUEUE=window
+restores the earlier order, where the head holds back everyone behind it. A process that already runs under a
+lease (SLOTFATHER_LEASE, or a holder among its ancestors) runs without a second lease, so nested wrappers neither
+deadlock nor count twice. A lease whose
 holder died (its pid gone, or reused by a process with another start time) is reaped by the next queue
 operation. While memory is short (free swap under SLOTFATHER_MIN_FREE_SWAP_MB, default 512, where swap is on; or the
 kernel's memory-pressure level at warning or above), new leases wait for running ones; with nothing running they
@@ -82,6 +86,13 @@ POLICIES = ("normal", "background", "bypass")
 TIMED_OUT = 75  # EX_TEMPFAIL
 POLL_MAX = 10  # seconds between a long waiter's full looks at the queue
 OVERTAKE_WINDOW = 600  # seconds a waiter that does not fit lets later requests that fit start first
+QUEUE_ORDERS = ("backfill", "window")  # SLOTFATHER_QUEUE; the first is the default
+BACKFILL_FALLBACK = 3600  # seconds a request with no run like it in the history is expected to run
+BACKFILL_SAFETY = 3.0  # a request passes the head only if this many times its estimate ends before the head starts
+BACKFILL_OVERRUN = 0.5  # a held lease past its estimate runs on for this share of what it has run
+BACKFILL_LIMIT = 2700  # seconds after the head queued from which nothing passes it, as in the window order (0: never)
+ESTIMATE_RUNS = 20  # recent runs of a kind its estimate takes the median of
+ESTIMATE_BYTES = 1 << 20  # of the history's end (and of its rotated part) read for estimates
 HISTORY_MAX = 4 << 20  # bytes of history.jsonl; past it the file becomes history.jsonl.1, replacing the older one
 # history.jsonl lines: version 1 had no "v" field and no usage; version 2 adds "v", what a `run` used (cpu,
 # cpu_detached, wall, rss_peak_mb, rss_mean_mb, processes, samples) and the machine's cores and capacity.
@@ -720,50 +731,273 @@ def legacy_used(table: dict) -> int:
     return sum(count for _, _, count in legacy_holders(table))
 
 
+def kind(command: str | None) -> str:
+    """The kind of check a command is: its program's name and first argument; a comma list counts its items, a path
+    keeps its last part, an option keeps its name, and a short option value follows it."""
+    words = [w for w in (command or "").split()]
+    while words and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0]):
+        words.pop(0)  # VAR=value before the program
+    if not words:
+        return "?"
+    found = [os.path.basename(words[0]) or words[0]]
+    rest = words[1:]
+    if rest:
+        first = rest[0]
+        if first.startswith("-"):
+            found.append(first.split("=", 1)[0])
+            value = rest[1] if len(rest) > 1 and "=" not in first else ""
+            if value and not value.startswith("-"):
+                if "," in value:
+                    found.append(f"[{len([v for v in value.split(',') if v])}]")
+                elif len(value) <= 40 and "=" not in value:
+                    found.append(os.path.basename(value.rstrip("/")) or value)
+        elif "," in first:
+            found.append(f"[{len([v for v in first.split(',') if v])}]")
+        else:
+            found.append(os.path.basename(first.rstrip("/")) or first)
+    return " ".join(found)[:60]
+
+
 def overtakable(entry: dict, moment: float | None = None) -> bool:
     """Whether later requests that fit may still start before this waiter: it has waited less than the window."""
     queued = seconds(entry.get("since"))
     return queued is not None and (time.time() if moment is None else moment) - queued < overtake_window()
 
 
-def room(waiters: list[dict], free: int) -> int:
-    """The slots a new request gets at once behind `waiters` with `free` slots unheld, as grant() admits it."""
+# Ordering: which waiters start now (#643)
+
+def queue_order() -> str:
+    """SLOTFATHER_QUEUE: backfill (the default) or window, the order before #643; anything else is window."""
+    value = setting("QUEUE") or "backfill"
+    return value if value in QUEUE_ORDERS else "window"
+
+
+def number(name: str, default: float, low: float = 0.0) -> float:
+    """SLOTFATHER_<name> as a number of at least `low`; unset or not a number gives the default."""
+    try:
+        return max(low, float(setting(name) or default))
+    except ValueError:
+        return default
+
+
+def family(label: str | None) -> str:
+    """A label without its ticket or agent id: lane-636-measure and lane-640-smoke-skip are both lane,
+    agent-a17b708a4e705e421 is agent, sid-kit-wt-646 is sid-kit-wt."""
+    words = (label or "").split("-")
+    for at, word in enumerate(words):
+        if at and any(c.isdigit() for c in word):
+            return "-".join(words[:at])
+    return label or ""
+
+
+class Estimates:
+    """Run times of finished requests, for how long a request will run: the median of the last ESTIMATE_RUNS runs
+    of the closest kind that ran before (same label and command kind; same command kind; same label family and
+    command kind with a check list of about the same size; that kind under any label; same label; same family), or
+    None for a request like nothing before."""
+
+    def __init__(self, runs=()):
+        self.runs = {}
+        for label, command, ran in runs:
+            self.add(label, command, ran)
+
+    @staticmethod
+    def keys(label: str | None, command: str | None) -> list[tuple]:
+        found = []
+        if command:
+            what = kind(command)
+            # A list of checks keeps its size within a factor of two: 140 checks are not 4.
+            rough = re.sub(r" \[(\d+)\]$", lambda m: f" [~{int(m[1]).bit_length()}]", what)
+            found += [("label", label, what), ("kind", what), ("family", family(label), rough), ("rough", rough)]
+        return found + [("label", label), ("family", family(label))]
+
+    def add(self, label: str | None, command: str | None, ran: float) -> None:
+        for key in self.keys(label, command):
+            recent = self.runs.setdefault(key, [])
+            recent.append(float(ran))
+            del recent[:-ESTIMATE_RUNS]
+
+    def of(self, label: str | None, command: str | None) -> float | None:
+        for key in self.keys(label, command):
+            recent = self.runs.get(key)
+            if recent:
+                ordered = sorted(recent)
+                middle = len(ordered) // 2
+                return ordered[middle] if len(ordered) % 2 else (ordered[middle - 1] + ordered[middle]) / 2
+        return None
+
+
+def history_estimates(directory: Path) -> Estimates:
+    """Estimates from the end of history.jsonl (ESTIMATE_BYTES of it): every request that was granted and ran.
+    Requests whose holder ran a slotfather that records no history (before #635) are not in it."""
+    path = directory / "history.jsonl"
+    runs = []
+    for part in (path.with_name(path.name + ".1"), path):
+        try:
+            with open(part, "rb") as handle:
+                end = handle.seek(0, os.SEEK_END)
+                handle.seek(max(0, end - ESTIMATE_BYTES))
+                lines = handle.read().splitlines()
+        except FileNotFoundError:
+            continue
+        for item in objects(lines[1:] if end > ESTIMATE_BYTES else lines):
+            if isinstance(item.get("ran"), (int, float)) and item.get("granted"):
+                runs.append((item.get("label"), item.get("cmd"), item["ran"]))
+    return Estimates(runs)
+
+
+class Plan:
+    """What grant() does to the waiters: `grants` start now, in queue order; `reason` says why the first that does
+    not start waits; `head` is the waiter the others must not delay, expected to start at `start` (epoch seconds)."""
+
+    def __init__(self):
+        self.grants, self.reason, self.head, self.start = [], None, None, None
+
+
+def reserve(found: Plan, held: list[dict], slots: int, used: int, moment: float, estimate, fallback: float,
+            overrun: float) -> int:
+    """Sets the head's expected start: when, by the expected ends of what holds slots (`held` and the grants so
+    far), enough slots will be free for it. Returns the slots free then that the head will not need."""
+    ends = []
+    for entry in held + found.grants:
+        granted = seconds(entry.get("granted"))
+        ran = 0.0 if granted is None else max(0.0, moment - granted)
+        run = estimate(entry)
+        run = fallback if run is None else run
+        ends.append((moment + max(run - ran, overrun * ran), entry["count"]))
+    have, found.start = max(0, slots - used), moment
+    for end, count in sorted(ends):
+        if have >= found.head["count"]:
+            break
+        have, found.start = have + count, end
+    if have < found.head["count"]:  # slots held in an earlier queue, whose end is unknown: nothing passes
+        found.start = moment
+    return max(0, have - found.head["count"])
+
+
+def plan(waiters: list[dict], held: list[dict], slots: int, moment: float, order: str | None = None,
+         estimate=None, other: int = 0, reserve_head: bool = False) -> Plan:
+    """Which of `waiters` (queue order) start now beside `held` (entries; `other` slots more held without one) on
+    `slots` slots at epoch `moment`. `estimate(entry)` is its expected run in seconds or None (unknown).
+
+    window: in arrival order; a waiter that does not fit lets later ones that fit start first until it has waited
+    SLOTFATHER_OVERTAKE_WINDOW, then holds back everyone behind it.
+
+    backfill: the same within the window; the first waiter past it that does not fit is the head. Its start is
+    reserved: the moment enough slots will be free, from the expected ends of the held leases. A later waiter
+    that fits starts before the head only when SLOTFATHER_BACKFILL_SAFETY times its expected run ends by then
+    and the head has waited less than SLOTFATHER_BACKFILL_LIMIT, or when it takes only slots the head will not
+    need at that moment. An unknown run counts SLOTFATHER_BACKFILL_FALLBACK seconds; a held lease past its
+    expected run is expected to run on for SLOTFATHER_BACKFILL_OVERRUN times what it has run so far. The head's
+    start is worked out only when a request behind it fits, or with `reserve_head`."""
+    order = order or queue_order()
+    estimate = estimate or (lambda entry: None)
+    window = overtake_window()
+    fallback = number("BACKFILL_FALLBACK", BACKFILL_FALLBACK)
+    safety = number("BACKFILL_SAFETY", BACKFILL_SAFETY, 1.0)
+    overrun = number("BACKFILL_OVERRUN", BACKFILL_OVERRUN)
+    limit = number("BACKFILL_LIMIT", BACKFILL_LIMIT)
+    found = Plan()
+    used = sum(e["count"] for e in held) + other
+    extra = None  # slots free at the head's start that it does not need; reserved once a request behind it fits
     for entry in waiters:
+        free = max(0, slots - used)
+        if found.head is not None:
+            if entry["count"] > free:
+                continue
+            if extra is None:
+                extra = reserve(found, held, slots, used, moment, estimate, fallback, overrun)
+            deadline = (seconds(found.head.get("since")) or moment) + limit if limit else math.inf
+            run = estimate(entry)
+            run = fallback if run is None else run
+            if moment + run * safety <= min(found.start, deadline):
+                pass  # ends before the head can start, and before it has waited the limit
+            elif entry["count"] <= extra:
+                extra -= entry["count"]
+            else:
+                continue
+            found.grants.append(entry)
+            used += entry["count"]
+            continue
         if entry["count"] <= free:
-            free -= entry["count"]
-        elif not overtakable(entry):
-            return 0
-    return free
+            found.grants.append(entry)
+            used += entry["count"]
+            continue
+        queued = seconds(entry.get("since"))
+        passable = queued is not None and moment - queued < window
+        if order != "backfill":
+            if not passable:
+                found.reason = found.reason or f"{free} of {slots} slots free"
+                return found
+        elif not passable:
+            found.head = entry
+            found.reason = (f"{free} of {slots} slots free; {entry['label']} is next, and a later request that fits "
+                            f"starts first only if it ends before {entry['label']} can start")
+            if reserve_head:
+                extra = reserve(found, held, slots, used, moment, estimate, fallback, overrun)
+            continue
+        until = time.strftime("%H:%M:%S", time.localtime(queued + window))
+        found.reason = found.reason or (f"{free} of {slots} slots free; requests that fit may pass "
+                                        f"{entry['label']} until {until}")
+    return found
+
+
+def room(waiters: list[dict], free: int, held: list[dict] | None = None, estimate=None, other: int = 0) -> int:
+    """The slots a new request of unknown run gets at once behind `waiters` with `free` slots unheld, as grant()
+    admits it. Without `held` (the entries holding slots; `other` slots more held without one), the window
+    order's answer."""
+    slots = free + sum(e["count"] for e in held or ()) + other
+    moment = time.time()
+    order = queue_order() if held is not None else "window"
+    for count in range(free, 0, -1):
+        probe = {"count": count, "label": "", "cmd": "", "since": now()}
+        if any(entry is probe for entry in plan(waiters + [probe], held or [], slots, moment, order, estimate,
+                                                         other).grants):
+            return count
+    return 0
+
+
+_estimates = {}  # history files' (size, mtime) -> Estimates, so a waiter's repeated looks read the history once
+
+
+def estimator(directory: Path):
+    """estimate(entry) from the history, read only when plan() first asks (a head waits and a later request fits),
+    and again only once the history has changed."""
+    def estimate(entry: dict) -> float | None:
+        path = directory / "history.jsonl"
+        stamp = []
+        for part in (path.with_name(path.name + ".1"), path):
+            with contextlib.suppress(OSError):
+                info = part.stat()
+                stamp.append((str(part), info.st_size, info.st_mtime_ns))
+        stamp = tuple(stamp)
+        if stamp not in _estimates:
+            _estimates.clear()
+            _estimates[stamp] = history_estimates(directory)
+        return _estimates[stamp].of(entry.get("label"), entry.get("cmd"))
+    return estimate
 
 
 def grant(directory: Path, table: dict) -> str | None:
-    """Grant waiters in queue order while they fit. One that does not fit lets later ones that fit start first until
-    it has waited the overtaking window, then holds back everyone behind it. Returns why the first that does not fit
-    still waits."""
+    """Grant the waiters plan() starts, in queue order, while memory allows. Returns why the first that does not
+    start still waits."""
     live = reap(directory, table)
-    slots = total()
-    used = sum(e["count"] for _, e in live if e["state"] == "held") + legacy_used(table)
-    short = blocked = None
-    for path, entry in live:
-        if entry["state"] == "held":
-            continue
-        free = max(0, slots - used)
-        if entry["count"] > free:
-            if not overtakable(entry):
-                return blocked or f"{free} of {slots} slots free"
-            until = time.strftime("%H:%M:%S", time.localtime(seconds(entry["since"]) + overtake_window()))
-            blocked = blocked or (f"{free} of {slots} slots free; requests that fit may pass {entry['label']} "
-                                  f"until {until}")
-            continue
+    held = [e for _, e in live if e["state"] == "held"]
+    waiters = [e for _, e in live if e["state"] != "held"]
+    paths = {id(e): path for path, e in live}
+    found = plan(waiters, held, total(), time.time(), estimate=estimator(directory), other=legacy_used(table))
+    used = sum(e["count"] for e in held) + legacy_used(table)
+    short = None
+    for entry in found.grants:
         if used:
             short = short or memory_short()
             if short:
                 return short
         entry.update(state="held", granted=now())
-        write(path, entry)
+        write(paths[id(entry)], entry)
         used += entry["count"]
         log(directory, f"granted {entry['count']} to {entry['label']} (pid {entry['pid']})")
-    return blocked
+    return found.reason
 
 
 def log(directory: Path, message: str) -> None:
@@ -792,11 +1026,15 @@ def status_lines(directory: Path | None = None) -> list[str]:
 
 
 def available(directory: Path | None = None) -> int:
-    """How many slots a new request would get at once: the free ones less what waiters take first, or none while a
-    waiter that has waited past the overtaking window holds back everyone behind it."""
+    """How many slots a new request of unknown run would get at once: the free ones less what waiters take first,
+    or none while a waiter past the overtaking window holds back everyone behind it (backfill: unless the
+    request would end before that waiter can start)."""
+    directory = directory or state_dir()
     live, legacy, _ = snapshot(directory)
-    used = sum(e["count"] for e in live if e["state"] == "held") + sum(count for _, _, count in legacy)
-    return room([e for e in live if e["state"] != "held"], max(0, total() - used))
+    held = [e for e in live if e["state"] == "held"]
+    other = sum(count for _, _, count in legacy)
+    return room([e for e in live if e["state"] != "held"], max(0, total() - sum(e["count"] for e in held) - other),
+                held, estimator(directory), other)
 
 
 # Sizing
@@ -825,12 +1063,14 @@ def advise(maximum: int | None = None, exclusive: bool = False, cores_now: int |
     whether a request waits."""
     live, legacy, table = snapshot()
     mine = inherited_lease(table)
-    held = sum(e["count"] for e in live if e["state"] == "held" and not (mine and e["pid"] == mine[1]["pid"]))
-    held += sum(count for path, e, count in legacy if not (mine and path == mine[0]))
+    holders = [e for e in live if e["state"] == "held" and not (mine and e["pid"] == mine[1]["pid"])]
+    other = sum(count for path, e, count in legacy if not (mine and path == mine[0]))
+    held = sum(e["count"] for e in holders) + other
     slots = total()
     waiters = [e for e in live if e["state"] != "held"]
-    return size(maximum or slots, cores_now or cores(), slots, averages or loads(),
-                min(held, slots), bool(waiters) and room(waiters, max(0, slots - held)) == 0, exclusive)
+    waiting = bool(waiters) and room(waiters, max(0, slots - held), holders, estimator(state_dir()), other) == 0
+    return size(maximum or slots, cores_now or cores(), slots, averages or loads(), min(held, slots), waiting,
+                exclusive)
 
 
 # Leases
