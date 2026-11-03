@@ -1478,9 +1478,10 @@ def plan(waiters: list[dict], held: list[dict], slots: int, moment: float, order
     waited `limit` seconds, a later waiter that fits starts before it when `safety` times its expected run ends by
     the head's start and by that limit, or when it takes only slots the head will not need then (reserve()); past
     the limit nothing passes. An unknown run counts `fallback` seconds; a held lease past its expected run is
-    expected to run on for `overrun` times what it has run so far. `settings` are order_settings() unless given;
-    `order` overrides theirs. The head's start is worked out only when a request behind it fits, or with
-    `reserve_head`."""
+    expected to run on for `overrun` times what it has run so far. A waiter whose client gives up before its
+    reserved start (its entry's `until`, from `run --wait`) is no head: it would leave without running, so it holds
+    nobody back. `settings` are order_settings() unless given; `order` overrides theirs. The head's start is worked
+    out only when a request behind it fits, or with `reserve_head`."""
     settings = settings or order_settings()
     order = order or settings["order"]
     estimate = estimate or (lambda entry: None)
@@ -1526,6 +1527,17 @@ def plan(waiters: list[dict], held: list[dict], slots: int, moment: float, order
                 return found
         elif not passable:
             found.head = entry
+            gives_up = None if entry.get("granted") else seconds(entry.get("until"))
+            if gives_up is not None:
+                reserve(found, held, slots, used, moment, estimate, fallback, overrun)
+                if found.start > gives_up:
+                    # Its client gives up before the slots it needs are expected free: holding the others back
+                    # for it would only leave slots idle until it leaves without running.
+                    found.head = found.start = None
+                    clock = time.strftime("%H:%M:%S", time.localtime(gives_up))
+                    found.reason = found.reason or (f"{free} of {slots} slots free; {entry['label']} gives up at "
+                                                    f"{clock}, before they are expected, so requests that fit pass it")
+                    continue
             found.reason = (f"{free} of {slots} slots free; {entry['label']} is next, and a later request that fits "
                             f"starts first only if it ends before {entry['label']} can start")
             if reserve_head:
@@ -2139,6 +2151,9 @@ def acquire(count: int | str, label: str, command: str = "", out=sys.stderr, wai
             entry["meta"] = meta  # older clients read past fields they do not know
         if yieldable:
             entry["yieldable"] = True
+        if wait is not None:
+            # When this client gives up (plan(): a head that would give up before its start holds nobody back).
+            entry["until"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + wait))
         own = order_settings(directory)["yield_after"]
         if own != order_settings(directory, environment=False)["yield_after"]:
             entry["yield_after"] = own  # this client asks later or never (SLOTFATHER_YIELD_AFTER); others' looks read it

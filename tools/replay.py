@@ -7,7 +7,8 @@ Reads history.jsonl (arrival, slots, run and label of every request that left th
 releases: they also give the requests whose slotfather recorded no history, placed in arrival order by their queue
 sequence) and the live queue (holders still running count as running until --now; the runs of waiters, and of
 requests that gave up but start in a replay, are the median of their kind). Every order runs on the same requests
-in an event simulation: arrivals, ends, give-ups (a request that left the queue gives up after the wait it had)
+in an event simulation: arrivals, ends, give-ups (a request that left the queue gives up after the wait it had,
+and its entry says so as `run --wait` writes it)
 and a look every POLL seconds while anyone waits, as waiters do. The memory guard is ignored. `window` and
 `backfill` call the queue's own plan(), and yields its yield_asks(); the other orders are written here and were
 not shipped. Recorded requests carry no class, so classify() gives one from the label and command, and yieldable()
@@ -333,6 +334,10 @@ class Replay:
                                    "state": "waiting", "meta": {"class": cls},
                                    "yieldable": yieldable(request, cls, self.slots)}
                 remaining[number] = self.run_of(request)
+                if request["patience"] is not None and request["source"] == "history" and \
+                        self.policy.get("until", True):
+                    # It gave up after its client's wait (run --wait), which the queue knows from its entry.
+                    waiting[number]["until"] = stamp(request["arrival"] + request["patience"])
                 if request["patience"] is not None:
                     heapq.heappush(events, (moment + request["patience"], 1, order, "leave", number))
                     order += 1
@@ -465,6 +470,7 @@ POLICIES = {
     "window (current)": {"order": "window", "env": WINDOW},
     "fifo (window 0)": {"order": "window", "env": {"SLOTFATHER_OVERTAKE_WINDOW": "0"}},
     "backfill (shipped)": {"order": "backfill", "env": WINDOW},
+    "  heads that give up hold on": {"order": "backfill", "env": WINDOW, "until": False},
     "classes + yields (#643 shipped)": {"order": "backfill", "env": WINDOW, "settings": SHIPPED, "step": 300},
     "  classes only": {"order": "backfill", "env": WINDOW, "settings": CLASSES},
     "  yields only": {"order": "backfill", "env": WINDOW, "settings": {"yield_after": 120}, "step": 300},
@@ -484,6 +490,7 @@ POLICIES = {
     "backfill, safety 2.5": {"order": "backfill", "env": WINDOW, "settings": {"safety": 2.5}},
     "  safety 2, estimates noisy": {"order": "backfill", "env": WINDOW, "noise": 1.0, "settings": {"safety": 2}},
     "  safety 2, estimates x0.5": {"order": "backfill", "env": WINDOW, "bias": 0.5, "settings": {"safety": 2}},
+    "  safety 2, heads hold on": {"order": "backfill", "env": WINDOW, "until": False, "settings": {"safety": 2}},
     "classes + yields, safety 2": {"order": "backfill", "env": WINDOW, "settings": {**SHIPPED, "safety": 2},
                                    "step": 300},
     "  same, estimates noisy": {"order": "backfill", "env": WINDOW, "settings": {**SHIPPED, "safety": 2},

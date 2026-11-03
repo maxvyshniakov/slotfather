@@ -57,7 +57,7 @@ slotfather advise --exclusive
 slotfather order
 ```
 
-`run` waits for capacity, holds a lease while its command runs, and returns the command's exit status. The default request is one slot. `--wait SECONDS` bounds the wait and returns 75 if capacity does not arrive; a missing executable returns 127 and a signal returns 128 plus its number.
+`run` waits for capacity, holds a lease while its command runs, and returns the command's exit status. The default request is one slot. `--wait SECONDS` bounds the wait and returns 75 if capacity does not arrive (the entry says when, so a waiter that would give up before its turn holds nobody back; see Ordering); a missing executable returns 127 and a signal returns 128 plus its number.
 
 The automatic capacity is `max(1, cores // 3)`: four slots on a 12-core machine. A request larger than the machine's capacity takes every slot. Requests are served in arrival order, except that a later request that fits may start before a waiter that does not (see Ordering): freely for `SLOTFATHER_OVERTAKE_WINDOW` seconds after that waiter queued (default 600), and after that only when the history says it will be done before the waiter can start. An all-slot request starts no later than its limit (45 minutes) plus the overrun of what passed it, unless requests rank ahead of it by class: then it starts once those that came within the class offsets after it (up to an hour for a batch request) have run (see Classes). Use one slot for a suite or build, two for half this 12-core machine, and `all` for a benchmark requiring isolation; a waiting `-n all` request says so on stderr.
 
@@ -112,6 +112,7 @@ While leases run, holders also append a machine sample to `machine.jsonl` at mos
 1. Waiters are taken in arrival order, moved by their class (see Classes below); each that fits starts.
 2. A waiter that does not fit lets later requests that fit start first for `SLOTFATHER_OVERTAKE_WINDOW` seconds after it queued (600), as before.
 3. The first waiter past its window that does not fit is the **head**. Its start is reserved: the moment the held leases' expected ends free enough slots for it. A later request that fits starts before it only if three times (*safety*) its expected run ends by that moment and by the time the head will have waited its *limit* (2700 s), or if it takes only spare slots: those the head will not need at that moment even if the leases expected to run on past it are the largest ones (EASY backfill, made independent of which lease ends first). From the limit on nothing passes: the head holds everyone back as the window order did.
+4. A waiter whose client gives up before that reserved start (`run --wait`, the library's `acquire(wait=...)`, writes the moment on its entry as `until`) is no head: it would leave without running, so the next waiter past its window that does not fit is the head instead, and requests that fit pass it. It still starts if its slots come free before it gives up. A lease back in the queue after a yield keeps its head whatever its first wait said. Older clients read past `until` and hold back for such a waiter as before.
 
 Expected runs come from `history.jsonl` (its last megabyte, read only when a request fits behind a head and kept in `estimates.json` beside it until the history changes, so other processes, releases and `available` read the small file; a file another version wrote is worked out again): the median of the last 20 released runs of the closest earlier kind of request, trying in turn the same label and command kind (`stats`' kind: program and first argument, with a runner's `run` target, a shell's `-c` command and no `env VAR=…`), the same label family (the label up to its ticket or agent id: `lane`, `post-merge`) and kind, that family with a check list of about the same size (`verify.sh --checks` of 128 to 255 checks), the kind under any label, about that size under any label, the same label, and the same family. Reaped leases and requests that gave up are left out: a reaped lease's time runs to whenever a look noticed its holder had died (an orphan of a hung CI job kept its slot for 2800 s), and one that gave up never ran. A request like nothing before counts as running the *fallback* (3600 s), so with the default limit it passes a head only into spare slots. A held lease past its expected run is expected to run on for the *overrun* share (half) of what it has run so far, because a run that overran its kind tends to be a long one.
 
@@ -218,6 +219,21 @@ Rejected:
 - **A signal to the holder** (SIGUSR1, SIGTERM) instead of a file: a holder that installed no handler dies of it; a file asks only clients that look. **Stopping** a holder (SIGSTOP) or killing it: never.
 - **Batch and normal waiters asking**, and asks for `-n all`: preemption is for work someone is waiting on.
 
+#### Waiters that give up, and the safety factor (2026-11-03)
+
+The queue of 2026-11-02 14:21 to 2026-11-03 14:14 UTC (667 requests on 6 slots: 630 from the history), and the part of it from 01:41, when backfill had been installed (no client sent a class, so the rows without classes are what ran). Twice that day a Straylight lane's `-n all --wait 1800` rerun waited behind a 1-slot gate that ran on for nearly two hours; as the head it held fitting smokes back for twenty minutes each, then gave up without running. Waits in seconds.
+
+| From 01:41 UTC | total h | mean | p90 | max | ≥3 max | fit-idle |
+| --- | --- | --- | --- | --- | --- | --- |
+| backfill, heads that give up hold on (`1708378`) | 17.4 | 143 | 549 | 2427 | 2427 | 2.4 |
+| **backfill, a head that gives up first holds nobody (shipped)** | **14.5** | **119** | **439** | **2427** | **2427** | **0.6** |
+| the same, safety 2 | 16.4 | 134 | 473 | 2427 | 2427 | 0.6 |
+| the same, estimates scattered | 14.7 | 120 | 442 | 2427 | 2427 | 0.6 |
+| the same, safety 2, estimates halved | 19.1 | 156 | 521 | 2963 | 2963 | 1.9 |
+| the same, safety 3, estimates halved | 22.0 | 181 | 691 | 2963 | 2963 | 3.1 |
+
+Over the whole day the same change takes the total from 44.2 to 39.4 h and fit-idle slot-hours from 11.0 to 8.0, with the same longest waits. Safety 2 instead of 3 changes little: averaged over six scatterings of the estimates, and over estimates halved, exact and doubled, its total is within 3% of safety 3's (41.6 against 41.5 and 41.8 h over the day; 16.4 and 16.7 against 16.8 and 17.1 h from 01:41), far inside the spread between scatterings (38 to 49 h over the day), and with estimates halved it lets the longest wait of a large request grow (4187 against 3911 s over the day). The safety stays at 3.
+
 Re-run after more history: `python3 tools/replay.py` (or `--since/--until` for a period, `--json`).
 
 ## Linux
@@ -296,4 +312,4 @@ slotfather run -n 1 -- docker run --rm --user 1000:1000 -e HOME=/tmp/h -v "$PWD:
   sh -c 'mkdir -p $HOME && git config --global --add safe.directory "*" && python3 -m unittest discover -s .'
 ```
 
-Usage tests account fake process tables (reaped children, orphans that outlive their parent, launchd children carrying the lease, reused pids, memory), measure a real tree with a burning orphan under `run`, and check `stats` over old and new history lines and machine samples. Order tests decide `plan()` on fixed queues (window, reservation, fallback, overrun, limit, spare slots when leases end out of order), check the estimates, their cache and command kinds, the saved settings and what a client's environment may change, and `available`/`advise` for a given command; the replay test runs the recorded queue of 2026-11-02/03 in `tests/fixtures/replay` (commands cut to their kind) and checks that the current order reproduces the recorded waits and that backfill waits less without a longer wait for large requests, also with scattered estimates; a small trace checks that a long request does not take a slot the head needs when leases end out of order.
+Usage tests account fake process tables (reaped children, orphans that outlive their parent, launchd children carrying the lease, reused pids, memory), measure a real tree with a burning orphan under `run`, and check `stats` over old and new history lines and machine samples. Order tests decide `plan()` on fixed queues (window, reservation, fallback, overrun, limit, spare slots when leases end out of order, a head whose client gives up first), check the estimates (reaped and abandoned leases left out), their cache and command kinds, the saved settings and what a client's environment may change, and `available`/`advise` for a given command; the replay test runs the recorded queue of 2026-11-02/03 in `tests/fixtures/replay` (commands cut to their kind) and checks that the current order reproduces the recorded waits and that backfill waits less without a longer wait for large requests, also with scattered estimates; a small trace checks that a long request does not take a slot the head needs when leases end out of order.

@@ -140,6 +140,36 @@ class BackfillTests(PlanCase):
         queue = [waiter("head", 4, -700), waiter("long", 1, -10)]
         self.assertEqual([], self.started(queue, held, x=300, z=600, y=7200, long=7200))
 
+    def test_a_head_whose_client_gives_up_before_its_start_holds_nobody_back(self):
+        # Today twice: a lane's `-n all --wait 1800` rerun behind a gate that ran on for two hours held fitting
+        # smokes back for twenty minutes each, then left without running.
+        gate = dict(waiter("gate", 6, -700), until=stamp(1000))  # its client gives up in 1000 s; one ends in 3000
+        queue = [gate, waiter("smoke", 1, -10)]
+        self.assertEqual(["smoke"], self.started(queue, self.held, one=3600, smoke=1200))
+        found = sf.plan(queue, self.held, 6, M, None, runs(one=3600, smoke=99999), settings=self.settings)
+        self.assertEqual((["smoke"], None), ([e["label"] for e in found.grants], found.head))
+        self.assertIsNone(sf.plan([gate], self.held, 6, M, None, runs(one=3600), reserve_head=True,
+                                  settings=self.settings).head)
+        self.assertIn("gate gives up at", sf.plan([gate], self.held, 6, M, None, runs(one=3600),
+                                                  settings=self.settings).reason)
+        later = dict(gate, until=stamp(3000))  # it still waits when one is expected to end: it is the head
+        self.assertEqual([], self.started([later, waiter("smoke", 1, -10)], self.held, one=3600, smoke=1200))
+
+    def test_the_next_waiter_that_does_not_fit_is_the_head_then(self):
+        gate = dict(waiter("gate", 6, -800), until=stamp(1000))
+        queue = [gate, waiter("pair", 3, -700), waiter("smoke", 1, -10)]
+        held = [holder("one", 4, -600)]  # 3000 s left: pair (3) does not fit either, and it waits
+        found = sf.plan(queue, held, 6, M, None, runs(one=3600, smoke=1200), reserve_head=True,
+                        settings=self.settings)
+        self.assertEqual(("pair", M + 3000), (found.head["label"], found.start))
+        self.assertEqual(["smoke"], [e["label"] for e in found.grants], "slots pair will not need at its start")
+
+    def test_a_lease_back_in_the_queue_after_a_yield_keeps_its_head(self):
+        """Its `until` was its first wait's: it does not give up now."""
+        back = dict(holder("gate", 6, -3000), state="waiting", until=stamp(-2000), yields=1,
+                    yielded_at=stamp(-700), rank=M - 700)
+        self.assertEqual([], self.started([back, waiter("smoke", 1, -10)], self.held, one=3600, smoke=1200))
+
     def test_within_its_window_a_waiter_lets_requests_that_fit_pass_as_before(self):
         queue = [waiter("gate", 6, -100), waiter("long", 1, -10)]
         self.assertEqual(["long"], self.started(queue, self.held, one=3600, long=99999))
@@ -360,6 +390,25 @@ class OrderTests(SlotCase):
             self.finish(process)
         self.assertEqual(["start one", "start short", "end short", "end one", "start gate", "end gate",
                           "start unknown", "end unknown"], self.events())
+
+    def test_a_waiter_with_a_wait_says_when_it_gives_up_and_a_gate_that_would_give_up_first_holds_nobody(self):
+        self.seed(one=3600, short=1200)
+        one = self.request("one", 1)
+        self.started("one")
+        gate = self.request("gate", "all", options=("--wait", "600"))
+        self.wait_for(lambda: "waiting: 4 slot(s) gate" in self.status(), "the gate to queue")
+        entries = [json.loads(path.read_text()) for path in (self.state / "queue").glob("*.json")]
+        until = [sf.seconds(e.get("until")) for e in entries if e["label"] == "gate"][0]
+        self.assertAlmostEqual(time.time() + 600, until, delta=5)
+        short = self.request("short", 1)  # 3 x 1200 s would not end before one, but gate gives up first
+        self.started("short")
+        for label in ("short", "one"):
+            self.release(label)
+        for process in (short, one):
+            self.finish(process)
+        self.started("gate")
+        self.release("gate")
+        self.finish(gate)
 
     def test_available_and_advise_answer_for_the_callers_command_when_it_is_given(self):
         one, gate = self.gate_behind_one()
