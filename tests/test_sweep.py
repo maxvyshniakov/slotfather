@@ -227,6 +227,51 @@ class PlanTests(unittest.TestCase):
         self.assertIn("under live session pid 40 (claude)", found[100]["reason"])
 
 
+class SessionTests(unittest.TestCase):
+    CLAUDE = ("/Users/m/Library/Application Support/Claude/claude-code/2.1/x/claude.app/Contents/MacOS/claude "
+              "--output-format stream-json")
+
+    def test_a_live_sessions_children_are_reported_unless_their_cwd_has_been_gone_six_hours(self):
+        gone, wt = f"{HOME}/sweep-fixture-gone", f"{HOME}/sweep-fixture-wt"
+        procs = [proc(40, 1, self.CLAUDE),
+                 proc(100, 40, f"python3 -c wait {wt}/scratch/check.log", age=7 * 3600),
+                 proc(101, 40, "/bin/zsh -c until ! pgrep -f x; do sleep 20; done", age=7 * 3600),
+                 proc(102, 40, "/bin/zsh -c until ! pgrep -f y; do sleep 20; done", age=5 * 3600),
+                 proc(103, 40, "/bin/zsh -c tail -f z", tty="ttys001", age=9 * 3600),
+                 proc(110, 1, "/bin/zsh -c until ! pgrep -f w; do sleep 20; done", age=1 * 3600)]
+        cwds = {100: sweep.Cwd("/w", False), 101: sweep.Cwd(gone, True), 102: sweep.Cwd(gone, True),
+                110: sweep.Cwd(gone, True)}
+        found = plan(snap(procs, cwds, gone=(gone, f"{wt}/scratch")), live=True)
+        self.assertEqual({100: "spared", 101: "stop", 102: "spared", 110: "stop"},
+                         {pid: i["action"] for pid, i in found.items()},
+                         "a path into a removed directory under a session: reported (100); its cwd gone 7 h: "
+                         "stopped (101); 5 h: reported (102); no session above it: stopped (110)")
+        self.assertTrue(found[100]["under_session"] and found[102]["under_session"])
+        self.assertNotIn("under_session", found[101])
+        self.assertIn("under live session pid 40 (claude); report only: a live session's child", found[102]["reason"])
+        relaxed = plan(snap(procs, cwds, gone=(gone, f"{wt}/scratch")), {**SETTINGS, "session_removed_age": 0})
+        self.assertEqual("would-stop", relaxed[102]["action"])
+        self.assertEqual("spared", relaxed[100]["action"], "only a gone working directory, never a path in argv")
+
+    def test_a_pgrep_wait_that_matches_its_own_command_line(self):
+        shell = "/bin/zsh -c source snap.sh && eval 'until ! pgrep -f {} >/dev/null; do sleep 20; done; tail x'"
+        self.assertEqual("lane check 425-parity-table-1", sweep.self_matching(shell.format('"lane check 425-parity-table-1"')))
+        self.assertEqual("build-storybooks.sh", sweep.self_matching(shell.format("build-storybooks.sh")))
+        self.assertEqual("verify", sweep.self_matching("sh -c while pgrep -lf 'verify' > /dev/null; do sleep 1; done"))
+        self.assertIsNone(sweep.self_matching(shell.format('"[l]ane check 7"')), "the bracket trick matches no itself")
+        self.assertIsNone(sweep.self_matching("sh -c until ! pgrep node; do sleep 1; done"), "pgrep without -f")
+        self.assertIsNone(sweep.self_matching("pgrep -f lane"), "no loop")
+        procs = [proc(40, 1, self.CLAUDE), proc(100, 40, shell.format('"lane check 7"'), age=3600),
+                 proc(101, 100, "sleep 20"), proc(102, 1, shell.format("x"), uid=0)]
+        procs.append(proc(103, 40, shell.format('"lane check 7"'), age=60))
+        procs.append(proc(104, 103, 'pgrep -f lane check 7'))
+        waits = sweep.self_matching_waits(snap(procs))
+        self.assertEqual([(100, "lane check 7", 3600, 40, [103]), (103, "lane check 7", 60, 40, [100])],
+                         [(w["pid"], w["pattern"], w["age"], w["session"], w["matched_by"]) for w in waits],
+                         "each finds the other; not itself, its children or a pgrep run")
+        self.assertTrue(waits[0]["cmd"].startswith("until ! pgrep -f"), "the loop, not the shell's setup")
+
+
 class ReportTests(unittest.TestCase):
     def test_containers_in_a_restart_loop(self):
         def container(name, restarts, status="restarting", restarting=True, started="2027-01-15T07:55:00Z",
@@ -360,7 +405,10 @@ class SweepCase(SlotCase):
 class LiveTests(SweepCase):
     def setUp(self):
         super().setUp()
-        self.configure("removed_age", "0", "orphan_age", "0", "classes", "removed,orphan,dev-server", "grace", "2")
+        # session_removed_age 0: the test may itself run under a live session (an agent's shell), whose children
+        # would otherwise be reported only.
+        self.configure("removed_age", "0", "orphan_age", "0", "classes", "removed,orphan,dev-server", "grace", "2",
+                       "session_removed_age", "0")
 
     def test_an_orphan_from_a_double_fork_is_reported_then_stopped_with_live(self):
         pid = self.orphan("orphan")
@@ -413,6 +461,69 @@ class LiveTests(SweepCase):
         self.assertEqual([(orphan, "spared")], [(i["pid"], i["action"]) for i in found["items"]], found)
         self.assertIn("inside the live lease leased", found["items"][0]["reason"])
         self.assertTrue(self.alive(orphan))
+
+
+class SessionLiveTests(SweepCase):
+    def setUp(self):
+        super().setUp()
+        self.configure("removed_age", "0", "classes", "removed,orphan", "grace", "2", "session_removed_age", "1h")
+
+    def test_a_live_sessions_children_are_spared_until_their_cwd_has_been_gone_long_enough(self):
+        """A stand-in session: python run as `claude` (a symlink), with two children: one whose working directory
+        is removed, one in an existing directory whose command names a removed one."""
+        bin_dir, gone, kept, named = (self.tmp / n for n in ("bin", "wt-gone", "kept", "named"))
+        for d in (bin_dir, gone, kept, named):
+            d.mkdir()
+        (bin_dir / "claude").symlink_to(sys.executable)
+        pids = self.tmp / "children"
+        session = subprocess.Popen([str(bin_dir / "claude"), "-c", textwrap.dedent(f"""
+            import subprocess, sys, time
+            a = subprocess.Popen(["sleep", "120"], cwd={str(gone)!r})
+            b = subprocess.Popen([{sys.executable!r}, "-c", "import time; time.sleep(120)", {str(named / "check.log")!r}],
+                                 cwd={str(kept)!r})
+            open({str(pids)!r} + ".tmp", "w").write(f"{{a.pid}} {{b.pid}}")
+            import os; os.replace({str(pids)!r} + ".tmp", {str(pids)!r})
+            time.sleep(120)
+        """)], start_new_session=True)
+        self.processes.append(session)
+        deadline = time.monotonic() + 10
+        while not pids.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        in_gone, naming = map(int, pids.read_text().split())
+        time.sleep(0.3)
+        gone.rmdir()
+        named.rmdir()
+        found = self.report("--live", "--pid", str(in_gone), "--pid", str(naming))
+        self.assertEqual({in_gone: "spared", naming: "spared"}, {i["pid"]: i["action"] for i in found["items"]}, found)
+        self.assertTrue(all(i["under_session"] and i["session"] == session.pid for i in found["items"]))
+        self.assertEqual(2, found["under_session"])
+        text = self.sweep("--pid", str(in_gone), "--no-log").stdout
+        self.assertIn(f"under live session pid {session.pid}: 1 child(ren) reported only", text)
+        self.assertTrue(self.alive(in_gone) and self.alive(naming))
+        self.configure("session_removed_age", "0")
+        found = self.report("--live", "--pid", str(in_gone), "--pid", str(naming))
+        self.assertEqual({in_gone: "stopped", naming: "spared"}, {i["pid"]: i["action"] for i in found["items"]},
+                         found)
+        self.assertTrue(self.wait_gone(in_gone))
+        self.assertTrue(self.alive(naming), "a path in argv never lets a session's child be stopped")
+
+    def test_two_waits_for_one_pattern_never_end_and_get_a_note(self):
+        """Linux's pgrep finds each loop itself; macOS's skips its own ancestors but finds the other loop."""
+        marker = f"sweep-wait-{os.getpid()}-{time.monotonic_ns()}"
+        waits = [subprocess.Popen(["sh", "-c", f'until ! pgrep -f "{marker}" >/dev/null; do sleep 0.2; done'],
+                                  start_new_session=True) for _ in range(2)]
+        self.processes.extend(waits)
+        time.sleep(1)
+        self.assertEqual([None, None], [w.poll() for w in waits], "neither loop ends")
+        pids = [w.pid for w in waits]
+        found = self.report(*(a for pid in pids for a in ("--pid", str(pid))))
+        self.assertEqual([(pids[0], marker, [pids[1]]), (pids[1], marker, [pids[0]])],
+                         [(w["pid"], w["pattern"], w["matched_by"]) for w in found["self_matching"]])
+        text = self.sweep(*(a for pid in pids for a in ("--pid", str(pid)))).stdout
+        self.assertIn(f"note: self-matching wait: pgrep -f '{marker}' matches its own command line; 2 wait(s), "
+                      f"oldest", text)
+        self.assertIn(f"pids {pids[0]}, {pids[1]}: until ! pgrep -f", text)
+        self.assertTrue(all(self.alive(pid) for pid in pids), "a note only")
 
 
 class CommandTests(SweepCase):

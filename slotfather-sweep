@@ -17,6 +17,11 @@ Classes (the 2026-11-03 incident, straylight#661):
   container   containers in a restart loop: reported only
   memory      while swap or memory runs short, the largest resident processes with their class: reported only
 
+A live session's child (an agent's background shell, a terminal's job) is reported, never stopped, whatever its
+class, except a removed-class one whose working directory is gone and which is older than session_removed_age (6 h):
+the worktree it waited on will not come back. A `pgrep -f PATTERN` wait loop whose own command line matches
+PATTERN gets a note (Linux's pgrep finds the loop itself; macOS's finds other waits for the same pattern).
+
 Never touched: a process inside a live lease of this queue (the holder's tree, or carrying the lease's
 SLOTFATHER_LEASE, as `status --json --pid` decides), or one whose tree holds such a process or a session; other
 users' processes; processes with a terminal; agent and terminal sessions (claude, codex, tmux, sshd); system
@@ -60,9 +65,9 @@ VERSION = 1
 CLASSES = ("removed", "orphan", "dev-server", "container", "memory")
 STOPPING = ("removed", "orphan")  # what --live stops; dev-server only with --dev-servers
 DEFAULTS = {"classes": list(CLASSES), "removed_age": 600.0, "orphan_age": 7200.0, "dev_server_age": 28800.0,
-            "grace": 10.0, "container_minutes": 30.0, "container_restarts": 3.0, "swap_free_mb": 1024.0,
+            "session_removed_age": 21600.0, "grace": 10.0, "container_minutes": 30.0, "container_restarts": 3.0, "swap_free_mb": 1024.0,
             "swap_free_pct": 20.0, "memory_top": 8.0}
-DURATIONS = ("removed_age", "orphan_age", "dev_server_age", "grace", "container_minutes")
+DURATIONS = ("removed_age", "orphan_age", "dev_server_age", "session_removed_age", "grace", "container_minutes")
 LOG_MAX = 4 << 20  # bytes of sweep.jsonl before it becomes sweep.jsonl.1
 TIMEOUT = 10  # seconds a ps, lsof, launchctl or docker call may take
 LABEL = "com.slotfather.sweep"
@@ -483,7 +488,7 @@ def plan(snap: Snapshot, settings: dict, protected: dict[int, str] | None = None
         if "removed" in enabled and age >= settings["removed_age"]:
             gone = gone_paths(proc.cmd, snap.isdir, within)
             if cwd is not None and cwd.removed:
-                item = {"class": "removed", "reason": f"cwd {cwd.path} is gone"}
+                item = {"class": "removed", "reason": f"cwd {cwd.path} is gone", "cwd_gone": True}
             elif gone:
                 item = {"class": "removed", "reason": f"{gone[0]} is in a directory that is gone"}
         if item is None and "orphan" in enabled and snap.adopted(proc) and age >= settings["orphan_age"]:
@@ -531,7 +536,13 @@ def plan(snap: Snapshot, settings: dict, protected: dict[int, str] | None = None
         elif session is not None:
             item.update(action="spared", reason=f"{item['reason']}; a session (pid {session}) in its tree")
         elif item["class"] in STOPPING or (item["class"] == "dev-server" and dev_servers):
-            item["action"] = "stop" if live else "would-stop"
+            if above is not None and not (item.get("cwd_gone") and item["age"] >= settings["session_removed_age"]):
+                # A live session's child is its owner's to stop; only one whose working directory has been gone
+                # for session_removed_age waits on a worktree that will not come back.
+                item.update(action="spared", under_session=True,
+                            reason=f"{item['reason']}; report only: a live session's child")
+            else:
+                item["action"] = "stop" if live else "would-stop"
         else:
             item["action"] = "report"
     # A candidate inside another that will be stopped goes with it.
@@ -543,6 +554,68 @@ def plan(snap: Snapshot, settings: dict, protected: dict[int, str] | None = None
             continue
         kept.append(item)
     return kept
+
+
+# Waits that never end
+
+PGREP = re.compile(r"\bpgrep\s+((?:-[A-Za-z]+\s+)*)(?:\"([^\"]+)\"|'([^']+)'|([^\s;|&'\"]+))")
+
+
+def self_matching(cmd: str) -> str | None:
+    """The pattern of a `pgrep -f PATTERN` loop (until/while) whose own command line PATTERN matches, else None.
+    Linux's pgrep then finds the loop itself, which never ends; macOS's skips the loop (its ancestor) but finds every
+    other process carrying the pattern, such as another wait for the same thing, and two such waits keep each other
+    alive."""
+    if not re.search(r"\b(until|while)\b", cmd):
+        return None
+    for found in PGREP.finditer(cmd):
+        if "f" not in found[1].replace("-", ""):
+            continue
+        pattern = found[2] or found[3] or found[4]
+        try:
+            hit = re.search(pattern, cmd) is not None
+        except re.error:
+            hit = pattern in cmd
+        if hit:
+            return pattern
+    return None
+
+
+def self_matching_waits(snap: Snapshot, only: set[int] | None = None) -> list[dict]:
+    """The user's processes that wait in a self-matching pgrep loop, outermost first (report only)."""
+    found, seen = [], set()
+    for pid, proc in sorted(snap.procs.items()):
+        if proc.uid != snap.uid or (only is not None and pid not in only):
+            continue
+        pattern = self_matching(proc.cmd)
+        if pattern is None or any(a in seen for a in snap.ancestors(pid)):
+            continue
+        seen.add(pid)
+        age = snap.age(proc)
+        found.append({"pid": pid, "pattern": pattern, "age": None if age is None else round(age),
+                      "session": reaches_session(snap, pid), "cmd": loop_head(proc.cmd),
+                      "matched_by": matching(snap, pid, pattern)})
+    return found
+
+
+def matching(snap: Snapshot, pid: int, pattern: str) -> list[int]:
+    """Other processes `pgrep -f PATTERN` run by the wait `pid` finds: not the wait, its ancestors (macOS pgrep skips
+    them; procps pgrep does not, so there the wait always finds itself) or its own children, nor pgrep runs."""
+    try:
+        test = re.compile(pattern).search
+    except re.error:
+        def test(cmd):
+            return pattern in cmd
+    skip = {pid, *snap.ancestors(pid), *snap.tree(pid)}
+    return sorted(p for p, proc in snap.procs.items()
+                  if p not in skip and os.path.basename(words(proc.cmd)[0] if proc.cmd else "") != "pgrep"
+                  and test(proc.cmd))
+
+
+def loop_head(cmd: str) -> str:
+    """The command from its loop on (an agent's shell prefixes it with a long setup), cut to 160 characters."""
+    at = re.search(r"\b(until|while)\b", cmd)
+    return (cmd[at.start():] if at else cmd)[:160]
 
 
 # Containers and memory: reports
@@ -793,6 +866,7 @@ def sweep(directory: Path, live: bool = False, dev_servers: bool = False, only: 
     docker = containers(found_settings) if "container" in enabled and only is None else \
         {"available": None, "items": []}
     memory = memory_report(memory_facts(), snap, found_settings, items, protected) if "memory" in enabled else {}
+    waits = self_matching_waits(snap, only)
     counts = {c: sum(i["class"] == c for i in items) for c in ("removed", "orphan", "dev-server")}
     counts["container"] = len(docker["items"])
     report = {"v": VERSION, "at": round(snap.moment, 3), "live": live, "dev_servers": dev_servers,
@@ -804,6 +878,8 @@ def sweep(directory: Path, live: bool = False, dev_servers: bool = False, only: 
                           for c in ("removed", "orphan", "dev-server")},
               "would_stop": sum(i["action"] == "would-stop" for i in items),
               "spared": sum(i["action"] == "spared" for i in items),
+              "under_session": sum(bool(i.get("under_session")) for i in items),
+              "self_matching": waits,
               "failed": sum(i["action"] == "failed" for i in items),
               "freed_mb": round(sum(i["rss_mb"] for i in items if i["action"] in ("stopped", "killed")), 1)}
     if logged and sf.foreign_owner(directory) is None:
@@ -830,6 +906,8 @@ def text(report: dict, quiet: bool = False) -> str:
                  f"dev servers {found['dev-server']}, looping containers {found['container']}"
                  + (f" · only pids {','.join(map(str, report['only']))}" if report["only"] else ""))
     for item in items:
+        if item.get("under_session"):
+            continue
         lines.append(f"  {item['class']:<10} {ACTIONS[item['action']]:<10} pid {item['pid']:<6} "
                      f"{sf.duration(item['age']):>7} {item['rss_mb']:>7.0f} MB  {item['kind']:<14} "
                      f"{item['cmd'][:110]}")
@@ -837,6 +915,25 @@ def text(report: dict, quiet: bool = False) -> str:
         lines.append(f"  {'':<10} {'':<10} {detail}")
     if not items:
         lines.append("  no removed-directory processes, orphans or stale dev servers")
+    sessions = {}
+    for item in items:
+        if item.get("under_session"):
+            sessions.setdefault(item.get("session"), []).append(item)
+    for session, group in sessions.items():
+        lines.append(f"  under live session pid {session}: {len(group)} child(ren) reported only "
+                     f"(stopped only when their cwd has been gone {sf.duration(report['settings']['session_removed_age'])})")
+        for item in group:
+            lines.append(f"    {item['class']:<10} pid {item['pid']:<6} {sf.duration(item['age']):>7}  "
+                         f"{loop_head(item['cmd'])[:110]}")
+    patterns = {}
+    for wait in report.get("self_matching") or []:
+        patterns.setdefault(wait["pattern"], []).append(wait)
+    for pattern, group in patterns.items():
+        oldest = max((w["age"] or 0) for w in group)
+        pids = [w["pid"] for w in group]
+        lines.append(f"  note: self-matching wait: pgrep -f {pattern!r} matches its own command line; "
+                     f"{len(group)} wait(s), oldest {sf.duration(oldest)}, pids {', '.join(map(str, pids[:8]))}"
+                     + ("…" if len(pids) > 8 else "") + f": {group[0]['cmd'][:80]}")
     docker = report["containers"]
     if docker.get("available") is False:
         lines.append(f"  containers: not checked ({docker.get('note')})")
@@ -858,12 +955,12 @@ def text(report: dict, quiet: bool = False) -> str:
         lines.append(f"  note: {note}")
     if report["live"]:
         stopped = sum(report["stopped"].values())
-        lines.append(f"stopped {stopped} tree(s), {report['freed_mb']:.0f} MB resident; spared {report['spared']}, "
-                     f"failed {report['failed']}")
+        lines.append(f"stopped {stopped} tree(s), {report['freed_mb']:.0f} MB resident; spared {report['spared']} "
+                     f"({report.get('under_session', 0)} under a live session), failed {report['failed']}")
     else:
         lines.append(f"dry run: nothing was signalled; {report['would_stop']} would be stopped with --live"
                      + ("" if report["dev_servers"] else " (dev servers only with --live --dev-servers)")
-                     + f"; spared {report['spared']}")
+                     + f"; spared {report['spared']} ({report.get('under_session', 0)} under a live session)")
     return "\n".join(lines)
 
 
