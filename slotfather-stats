@@ -11,7 +11,7 @@ or by one key of the lease metadata (`--by meta.ticket`; requests without that k
 per group the median and 90th percentile of wait and run, and the cores used per slot held, CPU seconds over wall
 seconds times slots. The machine part gives the share of sampled time the one-minute load stood over the cores
 (more runnable threads than cores) and under them, the CPU busy share, and how often a slot's worth of cores sat
-idle. It only reads; it lives apart from the queue like the dashboard and loads the slotfather beside it.
+idle. The sweeps (sweep.jsonl, `slotfather sweep`) add what was found and stopped. It only reads; it lives apart from the queue like the dashboard and loads the slotfather beside it.
 """
 from __future__ import annotations
 
@@ -205,6 +205,20 @@ def machine(samples: list[dict], cores: int, capacity: int) -> dict:
     }
 
 
+SWEPT = ("removed", "orphan", "dev-server")
+
+
+def sweeps(items: list[dict]) -> dict:
+    """What `slotfather sweep` found and stopped (sweep.jsonl, #662): runs, live runs, processes stopped per class,
+    stops that failed, resident memory freed, and what the latest run found."""
+    stopped = {c: sum((i.get("stopped") or {}).get(c, 0) for i in items) for c in SWEPT}
+    last = items[-1] if items else {}
+    return {"runs": len(items), "live": sum(bool(i.get("live")) for i in items), "stopped": stopped,
+            "failed": sum(i.get("failed") or 0 for i in items),
+            "freed_mb": round(sum(i.get("freed_mb") or 0 for i in items), 1),
+            "last_at": last.get("at"), "last_found": last.get("found"), "last_live": last.get("live")}
+
+
 def summarize(directory: Path | None = None, since: float | None = None, label: str | None = None,
               by: str = "both", moment: float | None = None) -> dict:
     directory = directory or sf.state_dir()
@@ -239,6 +253,8 @@ def summarize(directory: Path | None = None, since: float | None = None, label: 
                if since is None or (isinstance(s.get("at"), (int, float)) and s["at"] >= since)]
     overall = usage_of(items)
     per_slot = overall["cores_per_slot"]
+    swept = [i for i in sf.journal(directory / "sweep.jsonl")
+             if since is None or (isinstance(i.get("at"), (int, float)) and i["at"] >= since)]
     return {
         "since": since, "label": label, "by": by, "cores": cores, "capacity": capacity, "saved": saved,
         "automatic": sf.automatic_capacity(),
@@ -248,6 +264,7 @@ def summarize(directory: Path | None = None, since: float | None = None, label: 
         "overall": overall, "held": held_time(items, since, moment, recorded_capacity(items, capacity)),
         "machine": machine(samples, cores, capacity),
         "fill_slots": round(cores / per_slot, 1) if per_slot else None,
+        "sweeps": sweeps(swept),
         "groups": rows,
     }
 
@@ -334,6 +351,15 @@ def report(summary: dict, top: int = 25) -> str:
                         else f"; least available memory {m['memory_available_mb_min']} MB"))
     else:
         lines.append("no machine samples in range")
+    w = summary.get("sweeps") or {}
+    if w.get("runs"):
+        found = w.get("last_found") or {}
+        lines.append(f"sweeps: {w['runs']} ({w['live']} live); stopped "
+                     + ", ".join(f"{w['stopped'][c]} {c}" for c in SWEPT)
+                     + f", {w['failed']} failed, {w['freed_mb']:.0f} MB resident freed; the last "
+                     + ("live " if w.get("last_live") else "dry ") + f"run at "
+                     + time.strftime("%m-%d %H:%M", time.localtime(w["last_at"] or 0)) + " found "
+                     + ", ".join(f"{found.get(c, 0)} {c}" for c in (*SWEPT, "container")))
     return "\n".join(lines)
 
 

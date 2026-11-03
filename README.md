@@ -2,7 +2,7 @@
 
 A machine-wide queue for expensive builds, test suites, and agent work. Projects sharing a computer use one capacity budget instead of starting independent worker pools.
 
-The executable is a standalone Python 3.9+ script using only the standard library; the optional live view (`slotfather-dashboard`) and the statistics (`slotfather-stats`) are separate scripts, kept apart so the queue code stays small. It requires POSIX process and file-lock facilities; it is exercised on macOS and Linux (procps-ng `ps`; the suite runs in a `python:3.12` container). macOS supplies its memory-pressure level and swap; Linux supplies `MemAvailable`, swap and PSI from `/proc` (see Linux). Other hosts continue without observations their OS does not expose.
+The executable is a standalone Python 3.9+ script using only the standard library; the optional live view (`slotfather-dashboard`), the statistics (`slotfather-stats`) and the sweep (`slotfather-sweep`) are separate scripts, kept apart so the queue code stays small. It requires POSIX process and file-lock facilities; it is exercised on macOS and Linux (procps-ng `ps`; the suite runs in a `python:3.12` container). macOS supplies its memory-pressure level and swap; Linux supplies `MemAvailable`, swap and PSI from `/proc` (see Linux). Other hosts continue without observations their OS does not expose.
 
 ## Install
 
@@ -55,6 +55,7 @@ slotfather available --label tests -- python3 -m unittest discover
 slotfather advise --max 4
 slotfather advise --exclusive
 slotfather order
+slotfather sweep                      # what was left behind on the machine (dry run)
 ```
 
 `run` waits for capacity, holds a lease while its command runs, and returns the command's exit status. The default request is one slot. `--wait SECONDS` bounds the wait and returns 75 if capacity does not arrive (the entry says when, so a waiter that would give up before its turn holds nobody back; see Ordering); a missing executable returns 127 and a signal returns 128 plus its number.
@@ -104,6 +105,49 @@ While leases run, holders also append a machine sample to `machine.jsonl` at mos
 `stats` groups requests by label and by command kind (or, with `--by meta.KEY`, by that metadata key; requests without it group under `-`) (program and first argument: `bun run-browser-checks.mjs`, `verify.sh --checks [95]` for a list of 95 checks) and gives, per group, the median and 90th-percentile wait and run, typical slots, mean cores used (CPU seconds over wall seconds), **cores used per slot held** (CPU seconds over wall seconds times slots) and the peak resident memory. Below it: the same over every measured lease, and the slots at which that use would fill the cores; the mean slots held while any lease ran and how often all were held; and from the machine samples, the share of time the one-minute load stood over the cores (more runnable threads than cores) and under them, the mean CPU busy share, how often a slot's worth of cores sat idle, busy cores per held slot (includes work without a lease), memory pressure and the least free swap. `--json` prints all of it; `--top N` limits the table.
 
 **Choosing capacity.** `slotfather slots N` should make the slots' use fill the cores without holding the load over them: with *c* cores used per slot held, *cores / c* slots fill the machine. Check the machine part too: much time over the cores with all slots held means fewer slots; a slot's cores often idle while requests wait means more.
+
+## Sweep
+
+```sh
+slotfather sweep                        # dry run: what would be stopped, reported and spared
+slotfather sweep --json                 # the same for programs
+slotfather sweep --live                 # stop the safe classes (removed, orphan)
+slotfather sweep --live --dev-servers   # and stale dev servers
+slotfather sweep --live --pid 4242      # only this process (and its tree)
+slotfather sweep config                 # show the settings; config KEY VALUE ... saves; config reset
+slotfather sweep --plist --live > ~/Library/LaunchAgents/com.slotfather.sweep.plist
+```
+
+Agents and sessions leave processes behind: a verify run in the background of an agent that finished, a `tail -f` of a task's output, a Storybook started for a review, a browser daemon of a removed worktree, containers of a frozen project in a restart loop (straylight#661: swap full at 6.7 of 7.2 GB). `slotfather sweep` (`slotfather-sweep` beside the queue, like the statistics) finds them in five classes:
+
+| Class | What | Default age | `--live` |
+| --- | --- | --- | --- |
+| `removed` | a process whose working directory is gone (no directory at its path, or another one there now), or whose command names a path under home or a temporary directory whose directory is gone (a removed worktree) | `removed_age` 10 min | stops |
+| `orphan` | a process adopted by launchd or init (ppid 1; on Linux also a user's `systemd`) of a known dev kind: vitest, jest, Storybook tests, Playwright, agent-browser, headless Chromium, Puppeteer, `cargo test` and test binaries, rustc, `swift test`/`build`, pytest, an esbuild service, `tail -f`/`-F`, and node/bun/deno/npm/python/make/shell runs of a `verify`, `test`, `smoke`, `e2e` or `*.test.*` script | `orphan_age` 2 h | stops |
+| `dev-server` | `storybook dev`, vite, `next dev`, `astro dev`, webpack serve whose parent chain reaches no live session (a process with a terminal, an agent CLI, tmux, sshd, a CI runner, or a GUI app other than the Claude and ChatGPT/Codex desktop apps, whose previews outlive their conversation) and in whose checkout (the nearest directory with `.git`) no session works | `dev_server_age` 8 h | stops only with `--dev-servers` |
+| `container` | a container with a restart policy, at least `container_restarts` (3) restarts, created at least `container_minutes` (30) ago, and restarting now or started again within them | | reports only (a frozen project is the owner's call) |
+| `memory` | while free swap is under `swap_free_mb` (1024) or `swap_free_pct` (20%) of the swap, or the memory guard holds new leases: the `memory_top` (8) largest resident processes, each with its class or its lease | | reports only |
+
+A browser daemon (agent-browser, Chromium, Playwright, Puppeteer) is adopted by launchd by design and a live session may still drive it: it is spared while a session works in its checkout. Each item says when it runs under a live session (`under live session pid N (claude)`): a background shell of an agent's session whose worktree was removed is still `removed`.
+
+**Never touched.** A process inside a live lease of this queue or an earlier one: in its holder's tree, or carrying the lease's `SLOTFATHER_LEASE` after it left the tree (the rule of `status --json --pid` and the lease guard), and every process whose tree holds one; such an item is listed as `spared` with the lease's label. Also never: other users' processes, processes with a terminal, sessions (claude, codex, tmux, screen, sshd, a CI runner), a tree with a session in it, system processes (`/System`, `/usr/libexec`, `/usr/sbin`, systemd), app bundles that are no dev kind, launchd jobs of the user (`launchctl list`) and systemd services' main processes (`systemctl show -p MainPID`; without systemctl, every process in a service is taken as the service's), and the sweep and its ancestors.
+
+**Stopping** sends SIGTERM to the process and its descendants (the user's own), waits up to `grace` seconds (10), then SIGKILL to what is left; before each signal it checks that the pid still has the start time the sweep saw, so a reused pid is never signalled. A candidate inside another that stops goes with it. Results: `stopped` (TERM sufficed), `killed`, `gone` (ended or reused before the stop), `failed` (exit status 1). Without `--live` nothing is signalled; `--dev-servers` in a dry run shows what `--live --dev-servers` would stop. `--pid PID` (repeatable) limits the candidates to those processes; it also skips the containers.
+
+**Log.** Every sweep appends one JSON line to `sweep.jsonl` beside the queue (`{"v": 1, "at", "live", "dev_servers", "settings", "items": [...], "containers", "memory", "found", "stopped", "would_stop", "spared", "failed", "freed_mb"}`, each item with its class, kind, pid, start, age, command, working directory, tree, resident MB, reason and action), rotated at 4 MB like the history; a stop is also written to `queue.log` (`sweep stopped orphan pid ...`), so the dashboard's EVENTS show it. `--no-log` leaves a dry run out. `slotfather stats` adds a `sweeps` line (`--json`: `"sweeps"`): runs, live runs, processes stopped per class, failures, resident memory freed, and what the last run found. A second sweep while one runs exits at once (`sweep.lock`).
+
+**Settings** live in `sweep.json` beside the queue, like `capacity.json` and `order.json`: `slotfather sweep config` shows them, `slotfather sweep config orphan_age 3h grace 5 classes removed,orphan,container` saves (ages take seconds or `90s`, `30m`, `2h`, `1d`; `classes` is a comma list of the enabled classes, `none` for none), `config reset` restores the defaults. A file that cannot be read gives the defaults and says so. In another user's queue the sweep reads only: `--live` and settings changes are refused (run them as that user), and a dry run writes no log.
+
+**Hourly.** `slotfather sweep --plist [--live [--dev-servers]] [--interval S]` prints a launchd agent (`com.slotfather.sweep`, every 3600 s and at load, background priority) that runs `slotfather sweep --quiet` with the PATH (so `docker` is found) and `SLOTFATHER_DIR` of the shell that printed it; `--quiet` prints only stops and failures, into `sweep.out` beside the queue. Without `--live` the agent only logs dry runs. Install on the Mac (after `python3 install.py`):
+
+```sh
+slotfather sweep --plist --live > ~/Library/LaunchAgents/com.slotfather.sweep.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.slotfather.sweep.plist
+launchctl kickstart gui/$(id -u)/com.slotfather.sweep     # once now; then `slotfather stats` shows it
+# to remove: launchctl bootout gui/$(id -u)/com.slotfather.sweep
+```
+
+**Linux** (VM110, as `runner`): working directories come from `/proc/PID/cwd` (`(deleted)` marks a removed one), services from systemd, swap and the guard from `/proc` as for the queue; there is no launchd, so run it from cron or a systemd timer, e.g. `17 * * * * /usr/local/bin/slotfather sweep --quiet --live` in `runner`'s crontab. Without Docker (or without access to its socket) the container class says `not checked` and the rest runs; Docker is only asked, never started.
 
 ## Ordering
 
@@ -312,4 +356,4 @@ slotfather run -n 1 -- docker run --rm --user 1000:1000 -e HOME=/tmp/h -v "$PWD:
   sh -c 'mkdir -p $HOME && git config --global --add safe.directory "*" && python3 -m unittest discover -s .'
 ```
 
-Usage tests account fake process tables (reaped children, orphans that outlive their parent, launchd children carrying the lease, reused pids, memory), measure a real tree with a burning orphan under `run`, and check `stats` over old and new history lines and machine samples. Order tests decide `plan()` on fixed queues (window, reservation, fallback, overrun, limit, spare slots when leases end out of order, a head whose client gives up first), check the estimates (reaped and abandoned leases left out), their cache and command kinds, the saved settings and what a client's environment may change, and `available`/`advise` for a given command; the replay test runs the recorded queue of 2026-11-02/03 in `tests/fixtures/replay` (commands cut to their kind) and checks that the current order reproduces the recorded waits and that backfill waits less without a longer wait for large requests, also with scattered estimates; a small trace checks that a long request does not take a slot the head needs when leases end out of order.
+Sweep tests (#662) decide the classes on fake process tables (the incident's commands and their kinds, removed directories and paths, orphans past and under their age, every exemption, leases by tree and by environment, sessions above and beside dev servers, browser daemons in a session's checkout, nested candidates, enabled classes and `--pid`), containers in a restart loop and the memory report from fake facts, the text report, settings, the launchd agent and the stats line; and through real processes the tests start themselves, always limited with `--pid`: an orphan by a double fork reported and then stopped, a process in a removed directory stopped and one that ignores SIGTERM killed, a leased process, its holder and a leased orphan spared, and a dry run over the whole machine that signals nothing. Usage tests account fake process tables (reaped children, orphans that outlive their parent, launchd children carrying the lease, reused pids, memory), measure a real tree with a burning orphan under `run`, and check `stats` over old and new history lines and machine samples. Order tests decide `plan()` on fixed queues (window, reservation, fallback, overrun, limit, spare slots when leases end out of order, a head whose client gives up first), check the estimates (reaped and abandoned leases left out), their cache and command kinds, the saved settings and what a client's environment may change, and `available`/`advise` for a given command; the replay test runs the recorded queue of 2026-11-02/03 in `tests/fixtures/replay` (commands cut to their kind) and checks that the current order reproduces the recorded waits and that backfill waits less without a longer wait for large requests, also with scattered estimates; a small trace checks that a long request does not take a slot the head needs when leases end out of order.

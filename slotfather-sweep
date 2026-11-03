@@ -1,0 +1,953 @@
+#!/usr/bin/env python3
+"""slotfather-sweep: find, and with --live stop, processes left behind on the machine (#662); `slotfather sweep`
+runs it.
+
+  slotfather sweep [--live [--dev-servers]] [--json] [--quiet] [--pid PID]... [--no-log]
+  slotfather sweep config [KEY VALUE]... | config reset
+  slotfather sweep --plist [--live [--dev-servers]] [--interval SECONDS]
+
+Classes (the 2026-11-03 incident, straylight#661):
+  removed     a process whose working directory, or a path in its command, is in a directory that no longer
+              exists (a removed worktree or temporary directory), older than removed_age: --live stops it
+  orphan      a process adopted by launchd/init (ppid 1) of a known dev kind (verify and test runners, vitest,
+              Playwright, agent-browser, headless Chromium, cargo/swift test, `tail -f`), older than orphan_age:
+              --live stops it
+  dev-server  storybook/vite/next dev servers older than dev_server_age whose parent chain reaches no live
+              session and in whose project no session works: reported; --live --dev-servers stops them
+  container   containers in a restart loop: reported only
+  memory      while swap or memory runs short, the largest resident processes with their class: reported only
+
+Never touched: a process inside a live lease of this queue (the holder's tree, or carrying the lease's
+SLOTFATHER_LEASE, as `status --json --pid` decides), or one whose tree holds such a process or a session; other
+users' processes; processes with a terminal; agent and terminal sessions (claude, codex, tmux, sshd); system
+and app bundle processes; launchd jobs and systemd services' main processes; the sweep and its ancestors. A stop
+sends SIGTERM to the process and its descendants and SIGKILL to those still there after `grace` seconds, each
+time only to a pid whose start time is unchanged. Without --live nothing is signalled. Every sweep appends a line
+to sweep.jsonl beside the queue (`slotfather stats` counts them); stops are also written to queue.log. Settings
+(ages, grace, the enabled classes) live in sweep.json beside the queue: `slotfather sweep config`.
+"""
+from __future__ import annotations
+
+import contextlib
+import datetime
+import fcntl
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import plistlib
+import re
+import signal
+import subprocess
+import sys
+import time
+from typing import NamedTuple
+
+
+def load_core():
+    path = Path(__file__).resolve().with_name("slotfather")
+    loader = importlib.machinery.SourceFileLoader("slotfather_core", str(path))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    loader.exec_module(module)
+    return module
+
+
+sf = load_core()
+
+LINUX = sys.platform.startswith("linux")
+VERSION = 1
+CLASSES = ("removed", "orphan", "dev-server", "container", "memory")
+STOPPING = ("removed", "orphan")  # what --live stops; dev-server only with --dev-servers
+DEFAULTS = {"classes": list(CLASSES), "removed_age": 600.0, "orphan_age": 7200.0, "dev_server_age": 28800.0,
+            "grace": 10.0, "container_minutes": 30.0, "container_restarts": 3.0, "swap_free_mb": 1024.0,
+            "swap_free_pct": 20.0, "memory_top": 8.0}
+DURATIONS = ("removed_age", "orphan_age", "dev_server_age", "grace", "container_minutes")
+LOG_MAX = 4 << 20  # bytes of sweep.jsonl before it becomes sweep.jsonl.1
+TIMEOUT = 10  # seconds a ps, lsof, launchctl or docker call may take
+LABEL = "com.slotfather.sweep"
+USAGE = ("usage: slotfather sweep [--live [--dev-servers]] [--json] [--quiet] [--pid PID]... [--no-log]\n"
+         "       slotfather sweep config [KEY VALUE]... | config reset\n"
+         "       slotfather sweep --plist [--live [--dev-servers]] [--interval SECONDS]")
+
+
+class SweepError(Exception):
+    pass
+
+
+# What a process is
+
+class Proc(NamedTuple):
+    pid: int
+    ppid: int
+    uid: int
+    rss: int  # KB
+    tty: str  # "" without a controlling terminal
+    start: str  # ps lstart in the C locale: with the pid, the process's identity
+    started: float | None  # epoch seconds
+    cmd: str
+
+
+# (kind, pattern on the command line) for the orphan class; the first that matches names it.
+ORPHAN_KINDS = (
+    ("vitest", re.compile(r"(^|[\s/])vitest(\.m?js)?(\s|$)")),
+    ("jest", re.compile(r"(^|[\s/])jest(\.js)?(\s|$)")),
+    ("storybook-test", re.compile(r"(^|[\s/])(test-storybook|storybook\s+test)(\s|$)")),
+    ("agent-browser", re.compile(r"agent-browser")),
+    ("playwright", re.compile(r"playwright")),
+    ("chromium", re.compile(r"(?i)(chrom(e|ium)[^/]*|headless_shell)(\s.*)?\s--(headless|remote-debugging-p\w+)")),
+    ("puppeteer", re.compile(r"puppeteer")),
+    ("cargo-test", re.compile(r"(^|[\s/])cargo\s+(test|nextest)(\s|$)|/target/(debug|release)/deps/[\w-]+-[0-9a-f]{16}(\s|$)")),
+    ("rustc", re.compile(r"(^|/)rustc(\s|$)")),
+    ("swift-test", re.compile(r"(^|[\s/])swift[\s-](test|build)(\s|$)|swiftpm-testing-helper|(^|/)xctest(\s|$)")),
+    ("pytest", re.compile(r"(^|[\s/])pytest(\s|$)|\s-m\s+(pytest|unittest)(\s|$)")),
+    ("esbuild", re.compile(r"(^|/)esbuild\s.*--service")),
+)
+SHELLS = ("sh", "bash", "zsh", "dash")
+RUNNERS = ("node", "bun", "deno", "npm", "npx", "pnpm", "yarn", "tsx", "python", "uv", "make") + SHELLS
+RUNNER_WORD = re.compile(r"^(verify|test|tests|run-tests|smoke|e2e|heavy|run-browser-checks|browser-checks)$")
+DEV_SERVERS = (
+    ("storybook-dev", re.compile(r"(^|[\s/])(storybook\s+dev|start-storybook)(\s|$)")),
+    ("vite-dev", re.compile(r"(^|[\s/])vite(\.m?js)?(\s+(dev|serve|preview))?(\s|$)")),
+    ("next-dev", re.compile(r"(^|[\s/])next\s+dev(\s|$)")),
+    ("astro-dev", re.compile(r"(^|[\s/])astro\s+dev(\s|$)")),
+    ("webpack-serve", re.compile(r"webpack-dev-server|(^|[\s/])webpack\s+serve(\s|$)")),
+)
+BROWSERS = ("agent-browser", "chromium", "playwright", "puppeteer")  # daemons a live session may still drive
+SESSION = re.compile(r"(^|/)(claude|codex|CodexCLI|tmux|screen|zellij|mosh-server|sshd|sshd-session|login|"
+                     r"Runner\.Listener|Runner\.Worker)$|/claude/versions/[^/]+$")
+# GUI apps whose children outlive the conversation that started them: they are not a live session (#661's preview
+# server ran 27 h under the desktop app).
+AGENT_APPS = re.compile(r"/(Claude|ChatGPT|Codex)\.app/")
+SYSTEM = ("/System/", "/usr/libexec/", "/usr/sbin/", "/sbin/", "/Library/Apple/", "/usr/lib/systemd/",
+          "/lib/systemd/")
+
+
+def program(cmd: str) -> str:
+    """The command's executable as ps shows it: its first word, or for an app bundle the path through its
+    .app/Contents/ part, spaces and all."""
+    found = re.match(r"(/(?:[^ ]| (?![-/]))*?\.app/Contents/\S*)", cmd)
+    return found[1] if found else (cmd.split() or [""])[0]
+
+
+def words(cmd: str) -> list[str]:
+    return cmd.split()
+
+
+def orphan_kind(cmd: str) -> str | None:
+    for name, pattern in ORPHAN_KINDS:
+        if pattern.search(cmd):
+            return name
+    parts = words(cmd)
+    if not parts:
+        return None
+    base = os.path.basename(parts[0])
+    if base == "tail" and any(re.fullmatch(r"-[A-Za-z0-9+]*[fF][A-Za-z0-9]*", w) for w in parts[1:]):
+        return "tail-f"
+    base = re.sub(r"[\d.]+$", "", base) or base
+    if base in RUNNERS:
+        for word in parts[1:]:
+            word = word.strip("'\";")
+            if base in SHELLS and "/" not in word and "." not in word:
+                continue  # a shell's `test` or `[` is no test runner; its script (./verify.sh) is
+            stem = os.path.basename(word).split(".")[0]
+            if RUNNER_WORD.match(stem) or re.search(r"\.(test|spec)\.[cm]?[jt]sx?$", word) or word == "--test":
+                return "runner"
+    return None
+
+
+def dev_server_kind(cmd: str) -> str | None:
+    if re.search(r"(^|[\s/])vitest", cmd):
+        return None
+    for name, pattern in DEV_SERVERS:
+        if pattern.search(cmd):
+            return name
+    return None
+
+
+def is_session(proc: Proc) -> bool:
+    return bool(proc.tty) or bool(SESSION.search(program(proc.cmd)))
+
+
+def is_app(proc: Proc) -> bool:
+    return ".app/Contents/" in program(proc.cmd)
+
+
+# Snapshots of the machine
+
+class Cwd(NamedTuple):
+    path: str
+    removed: bool | None  # None: unknown
+
+
+class Snapshot:
+    """The process table and what the sweep needs to know about it. Tests build one from fake tables."""
+
+    def __init__(self, procs: dict[int, Proc], cwds: dict[int, Cwd] | None = None, managed=(),
+                 moment: float | None = None, uid: int | None = None, me=(), isdir=None, notes=()):
+        self.procs, self.cwds, self.managed = procs, cwds or {}, set(managed)
+        self.moment = time.time() if moment is None else moment
+        self.uid = os.geteuid() if uid is None else uid
+        self.me = set(me)
+        self.isdir = isdir or os.path.isdir
+        self.notes = list(notes)
+        self.children: dict[int, list[int]] = {}
+        for proc in procs.values():
+            self.children.setdefault(proc.ppid, []).append(proc.pid)
+
+    def age(self, proc: Proc) -> float | None:
+        return None if proc.started is None else max(0.0, self.moment - proc.started)
+
+    def ancestors(self, pid: int) -> list[int]:
+        found, seen = [], {pid}
+        here = self.procs[pid].ppid if pid in self.procs else 0
+        while here in self.procs and here not in seen and here > 1:
+            found.append(here)
+            seen.add(here)
+            here = self.procs[here].ppid
+        return found
+
+    def tree(self, pid: int) -> list[int]:
+        found, stack = [], [pid]
+        while stack:
+            here = stack.pop()
+            if here in self.procs and here not in found:
+                found.append(here)
+                stack.extend(self.children.get(here, ()))
+        return found
+
+    def adopted(self, proc: Proc) -> bool:
+        """Whether launchd or init (or, on Linux, a user's systemd manager) adopted it: an orphan."""
+        if proc.ppid == 1:
+            return True
+        parent = self.procs.get(proc.ppid)
+        return LINUX and parent is not None and os.path.basename(words(parent.cmd)[0] if parent.cmd else "") == \
+            "systemd"
+
+
+def table() -> dict[int, Proc]:
+    """Every process: one ps over the machine in the C locale (lstart in the words every client writes)."""
+    try:
+        result = subprocess.run(["ps", "-ax", "-ww", "-o", "pid=,ppid=,uid=,rss=,tty=,lstart=,command="],
+                                capture_output=True, text=True, env={**os.environ, "LC_ALL": "C"}, timeout=TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise SweepError(f"ps: {error}") from None
+    return parse_table(result.stdout)
+
+
+def parse_table(text: str) -> dict[int, Proc]:
+    found = {}
+    for line in text.splitlines():
+        parts = line.split(None, 10)
+        if len(parts) < 10 or not all(p.isdigit() for p in parts[:4]):
+            continue
+        start = " ".join(parts[5:10])
+        tty = "" if parts[4] in ("??", "?", "-") else parts[4]
+        found[int(parts[0])] = Proc(int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3]), tty, start,
+                                    sf.started_at(start), parts[10].strip() if len(parts) > 10 else "")
+    return found
+
+
+def removed_dir(path: str, inode: int | None, isdir=os.path.isdir) -> bool:
+    """Whether a working directory is gone: nothing at its path, or another directory there now."""
+    if not path.startswith("/"):
+        return False
+    if not isdir(path):
+        return True
+    if inode is not None:
+        with contextlib.suppress(OSError):
+            return os.stat(path).st_ino != inode
+    return False
+
+
+def working_dirs(procs: dict[int, Proc], uid: int) -> tuple[dict[int, Cwd], list[str]]:
+    """The working directory of each of the user's processes, and notes on what could not be read. macOS: one
+    lsof; Linux: /proc/PID/cwd, which says " (deleted)" for a removed one."""
+    found, notes = {}, []
+    if LINUX:
+        for pid, proc in procs.items():
+            if proc.uid != uid:
+                continue
+            with contextlib.suppress(OSError):
+                link = os.readlink(sf.proc_path(str(pid), "cwd"))
+                if link.endswith(" (deleted)"):
+                    found[pid] = Cwd(link[:-len(" (deleted)")], True)
+                    continue
+                inode = os.stat(sf.proc_path(str(pid), "cwd")).st_ino
+                found[pid] = Cwd(link, removed_dir(link, inode))
+        return found, notes
+    try:
+        result = subprocess.run(["lsof", "-a", "-d", "cwd", "-u", str(uid), "-w", "-Fpin"], capture_output=True,
+                                text=True, timeout=TIMEOUT * 3)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return found, [f"working directories unknown (lsof: {error})"]
+    pid = inode = None
+    for line in result.stdout.splitlines():
+        tag, value = line[:1], line[1:]
+        if tag == "p":
+            pid, inode = (int(value) if value.isdigit() else None), None
+        elif tag == "i":
+            inode = int(value) if value.isdigit() else None
+        elif tag == "n" and pid is not None:
+            found[pid] = Cwd(value, removed_dir(value, inode))
+    return found, notes
+
+
+def managed_jobs(procs: dict[int, Proc], uid: int) -> set[int]:
+    """Processes a service manager runs on purpose: launchd jobs of this user (macOS), systemd services' main
+    processes (Linux). They have ppid 1 like an orphan; a service is not one."""
+    found = set()
+    if not LINUX:
+        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+            result = subprocess.run(["launchctl", "list"], capture_output=True, text=True, timeout=TIMEOUT)
+            for line in result.stdout.splitlines()[1:]:
+                first = line.split("\t", 1)[0].strip()
+                if first.isdigit():
+                    found.add(int(first))
+        return found
+    units: dict[str, int | None] = {}
+    for pid, proc in procs.items():
+        if proc.uid != uid or proc.ppid != 1:
+            continue
+        try:
+            lines = sf.proc_path(str(pid), "cgroup").read_text().splitlines()
+        except OSError:
+            continue
+        path = next((line.split(":", 2)[2] for line in lines if line.startswith("0::")), "")
+        unit = path.rstrip("/").rsplit("/", 1)[-1]
+        if not unit.endswith(".service"):
+            continue
+        if unit not in units:
+            units[unit] = None
+            with contextlib.suppress(OSError, subprocess.TimeoutExpired, ValueError):
+                result = subprocess.run(["systemctl", "show", "--property", "MainPID", "--value", unit],
+                                        capture_output=True, text=True, timeout=TIMEOUT)
+                if result.returncode == 0:
+                    units[unit] = int(result.stdout.strip() or 0)
+            if units[unit] is None:  # no systemctl here: a process in a service is taken as the service's
+                units[unit] = -1
+        if units[unit] in (pid, -1):
+            found.add(pid)
+    return found
+
+
+def snapshot() -> Snapshot:
+    procs = table()
+    uid = os.geteuid()
+    cwds, notes = working_dirs(procs, uid)
+    me, here = set(), os.getpid()
+    while here in procs and here not in me and here > 1:
+        me.add(here)
+        here = procs[here].ppid
+    me.add(os.getpid())
+    return Snapshot(procs, cwds, managed_jobs(procs, uid), uid=uid, me=me, notes=notes)
+
+
+# Leases: never touch what runs inside one
+
+def leases(directory: Path, snap: Snapshot) -> tuple[dict[int, str], list[tuple[str, str]]]:
+    """pid -> the label of the live lease whose holder's tree it is in, and (lease path, label) of every live lease
+    (for the SLOTFATHER_LEASE check of processes that left the tree), from the queue (reaped as `status` does) and
+    the earlier queues. The same rule as `status --json --pid` and the lease guard."""
+    processes = sf.processes()
+    with sf.locked(directory):
+        live = sf.reap(directory, processes)
+    protected, paths = {}, []
+    for path, entry in live:
+        label = str(entry.get("label") or path.stem)
+        paths.append((str(path), label))
+        for pid in sf.descendants(processes, entry.get("pid")):
+            protected[pid] = label
+    for path, entry, _ in sf.legacy_holders(processes):
+        label = str(entry.get("label") or path.stem)
+        paths.append((str(path), label))
+        for pid in sf.descendants(processes, entry.get("pid")):
+            protected[pid] = label
+    return protected, paths
+
+
+def carried(pids: list[int], paths: list[tuple[str, str]], carrying=None) -> dict[int, str]:
+    """Those of `pids` whose environment carries a live lease's SLOTFATHER_LEASE: pid -> label."""
+    carrying = carrying or sf.carrying
+    found = {}
+    rest = list(pids)
+    for path, label in paths:
+        if not rest:
+            break
+        for pid in carrying(rest, path):
+            found[pid] = label
+        rest = [p for p in rest if p not in found]
+    return found
+
+
+# Deciding
+
+def exempt(proc: Proc, snap: Snapshot) -> str | None:
+    """Why a process is never a candidate, or None."""
+    if proc.pid <= 1 or proc.pid in snap.me:
+        return "the sweep itself" if proc.pid in snap.me else "init"
+    if proc.uid != snap.uid:
+        return "another user's"
+    if proc.tty:
+        return "has a terminal"
+    if is_session(proc):
+        return "a session"
+    exe = program(proc.cmd)
+    if exe.startswith(SYSTEM):
+        return "a system process"
+    if is_app(proc) and not orphan_kind(proc.cmd):
+        return "an app"
+    if proc.pid in snap.managed:
+        return "a launchd or systemd job"
+    return None
+
+
+def roots() -> tuple[str, ...]:
+    """Where a path in a command must lie to count as a removed directory: home and the temporary directories."""
+    found = [os.path.expanduser("~"), "/tmp", "/private/tmp", "/var/folders", "/private/var/folders", "/var/tmp"]
+    temp = os.environ.get("TMPDIR")
+    if temp:
+        found.append(temp.rstrip("/"))
+    return tuple(p.rstrip("/") + "/" for p in found if p and p != "/")
+
+
+def gone_paths(cmd: str, isdir, within: tuple[str, ...]) -> list[str]:
+    """Absolute paths in a command (also an option's =value) under `within` whose directory no longer exists; words
+    with a glob or a shell variable are no paths."""
+    found = []
+    for word in words(cmd):
+        for part in (word, word.partition("=")[2]):
+            path = part.strip("'\";,()[]")
+            if not path.startswith("/") or len(path) < 2 or not path.startswith(within) or \
+                    re.search(r"[*?\[\]{}$`]", path):
+                continue  # a glob or a variable is no path the process is in
+            parent = os.path.dirname(path.rstrip("/"))
+            if parent and parent != "/" and parent.rstrip("/") + "/" not in within and not isdir(parent) \
+                    and path not in found:
+                found.append(path)
+    return found
+
+
+def project_root(path: str, isdir=os.path.isdir) -> str:
+    """The checkout a directory belongs to (the nearest one with .git), else the directory itself."""
+    here = path.rstrip("/") or "/"
+    home = os.path.expanduser("~")
+    while here not in ("/", home) and here:
+        if os.path.lexists(os.path.join(here, ".git")):
+            return here
+        here = os.path.dirname(here)
+    return path.rstrip("/") or "/"
+
+
+def session_roots(snap: Snapshot) -> set[str]:
+    """The checkouts live sessions (a terminal, an agent) work in."""
+    found = set()
+    for pid, proc in snap.procs.items():
+        if proc.uid == snap.uid and is_session(proc) and pid in snap.cwds and not snap.cwds[pid].removed:
+            path = snap.cwds[pid].path
+            if path not in ("/", os.path.expanduser("~")):
+                found.add(project_root(path))
+    return found
+
+
+def reaches_session(snap: Snapshot, pid: int) -> int | None:
+    """The first ancestor that is a live session (a terminal, an agent CLI, a GUI app other than the agents'),
+    or None."""
+    for here in snap.ancestors(pid):
+        proc = snap.procs[here]
+        if is_session(proc) or (is_app(proc) and not AGENT_APPS.search(program(proc.cmd))):
+            return here
+    return None
+
+
+def plan(snap: Snapshot, settings: dict, protected: dict[int, str] | None = None, carriers=None,
+         only: set[int] | None = None, live: bool = False, dev_servers: bool = False) -> list[dict]:
+    """The sweep's items: each candidate process with its class, kind, tree and action (would-stop or stop, report,
+    spared). `protected` maps pids in a live lease's tree to its label; `carriers(pids)` gives those of pids that
+    carry a lease (pid -> label). `only` limits the candidates to those pids."""
+    protected = protected or {}
+    enabled = set(settings["classes"])
+    within = roots()
+    session_dirs = None
+    found = []
+    for pid, proc in sorted(snap.procs.items()):
+        if only is not None and pid not in only:
+            continue
+        if exempt(proc, snap):
+            continue
+        age = snap.age(proc)
+        if age is None:
+            continue
+        item = None
+        cwd = snap.cwds.get(pid)
+        if "removed" in enabled and age >= settings["removed_age"]:
+            gone = gone_paths(proc.cmd, snap.isdir, within)
+            if cwd is not None and cwd.removed:
+                item = {"class": "removed", "reason": f"cwd {cwd.path} is gone"}
+            elif gone:
+                item = {"class": "removed", "reason": f"{gone[0]} is in a directory that is gone"}
+        if item is None and "orphan" in enabled and snap.adopted(proc) and age >= settings["orphan_age"]:
+            kind = orphan_kind(proc.cmd)
+            if kind and not dev_server_kind(proc.cmd):
+                item = {"class": "orphan", "kind": kind, "reason": f"{kind} adopted by pid {proc.ppid}"}
+                if kind in BROWSERS and cwd and not cwd.removed:
+                    session_dirs = session_roots(snap) if session_dirs is None else session_dirs
+                    if project_root(cwd.path) in session_dirs:  # its browser may be in use
+                        item.update(spare=f"a session works in its checkout {project_root(cwd.path)}")
+        if item is None and "dev-server" in enabled and age >= settings["dev_server_age"]:
+            kind = dev_server_kind(proc.cmd)
+            if kind and not any(dev_server_kind(snap.procs[a].cmd) for a in snap.ancestors(pid)
+                                if snap.procs[a].uid == snap.uid):
+                if reaches_session(snap, pid) is None:
+                    session_dirs = session_roots(snap) if session_dirs is None else session_dirs
+                    if cwd is None or cwd.removed or project_root(cwd.path) not in session_dirs:
+                        item = {"class": "dev-server", "kind": kind,
+                                "reason": "no live session above it or in its checkout"}
+        if item is None:
+            continue
+        item.setdefault("kind", orphan_kind(proc.cmd) or dev_server_kind(proc.cmd) or
+                        os.path.basename(words(proc.cmd)[0]) if proc.cmd else "?")
+        tree = [p for p in snap.tree(pid) if snap.procs[p].uid == snap.uid]
+        item.update(pid=pid, ppid=proc.ppid, start=proc.start, age=round(age), cmd=proc.cmd[:300],
+                    cwd=cwd.path if cwd else None, tree=sorted(tree),
+                    rss_mb=round(sum(snap.procs[p].rss for p in tree) / 1024, 1))
+        found.append(item)
+    # Leases and sessions in the tree spare the whole tree.
+    pending = sorted({p for item in found for p in item["tree"] if p not in protected})
+    lease_env = carriers(pending) if carriers and pending else {}
+    for item in found:
+        held = next((protected.get(p) or lease_env.get(p) for p in item["tree"]
+                     if p in protected or p in lease_env), None)
+        session = next((p for p in item["tree"] if p != item["pid"] and (
+            is_session(snap.procs[p]) or p in snap.me)), None)
+        above = reaches_session(snap, item["pid"])
+        if above is not None:
+            item["session"] = above
+            item["reason"] += f"; under live session pid {above} ({os.path.basename(program(snap.procs[above].cmd))})"
+        if held is not None:
+            item.update(action="spared", reason=f"{item['reason']}; inside the live lease {held}")
+        elif item.get("spare"):
+            item.update(action="spared", reason=f"{item['reason']}; {item.pop('spare')}")
+        elif session is not None:
+            item.update(action="spared", reason=f"{item['reason']}; a session (pid {session}) in its tree")
+        elif item["class"] in STOPPING or (item["class"] == "dev-server" and dev_servers):
+            item["action"] = "stop" if live else "would-stop"
+        else:
+            item["action"] = "report"
+    # A candidate inside another that will be stopped goes with it.
+    stopping = {item["pid"] for item in found if item["action"] in ("stop", "would-stop")}
+    kept = []
+    for item in found:
+        above = next((a for a in snap.ancestors(item["pid"]) if a in stopping), None)
+        if above is not None and item["action"] != "spared":
+            continue
+        kept.append(item)
+    return kept
+
+
+# Containers and memory: reports
+
+def docker_time(text) -> float | None:
+    try:
+        return datetime.datetime.strptime(str(text)[:19], "%Y-%m-%dT%H:%M:%S").replace(
+            tzinfo=datetime.timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+def restart_loops(inspected: list[dict], settings: dict, moment: float | None = None) -> list[dict]:
+    """Containers that keep restarting: a restart policy, at least container_restarts restarts, created at least
+    container_minutes ago, and restarting now or started again within that time."""
+    moment = time.time() if moment is None else moment
+    window = settings["container_minutes"] * 60
+    found = []
+    for item in inspected:
+        state = item.get("State") or {}
+        policy = ((item.get("HostConfig") or {}).get("RestartPolicy") or {}).get("Name") or "no"
+        restarts = int(item.get("RestartCount") or 0)
+        created, started = docker_time(item.get("Created")), docker_time(state.get("StartedAt"))
+        if policy == "no" or restarts < settings["container_restarts"] or created is None or \
+                moment - created < window:
+            continue
+        if not (state.get("Restarting") or (started is not None and moment - started < window)):
+            continue
+        labels = (item.get("Config") or {}).get("Labels") or {}
+        found.append({"class": "container", "action": "report", "name": str(item.get("Name") or "").lstrip("/"),
+                      "id": str(item.get("Id") or "")[:12], "project": labels.get("com.docker.compose.project"),
+                      "status": state.get("Status"), "restarts": restarts, "policy": policy,
+                      "exit_code": state.get("ExitCode"), "started": state.get("StartedAt"),
+                      "since_created": round(moment - created)})
+    return found
+
+
+def containers(settings: dict) -> dict:
+    """{"available": bool, "items": [...], "note"}: Docker is asked, never started."""
+    try:
+        listed = subprocess.run(["docker", "ps", "-aq", "--no-trunc"], capture_output=True, text=True,
+                                timeout=TIMEOUT)
+        if listed.returncode != 0:
+            return {"available": False, "items": [], "note": (listed.stderr.strip().splitlines() or ["docker failed"])[0]}
+        ids = listed.stdout.split()
+        if not ids:
+            return {"available": True, "items": []}
+        inspected = subprocess.run(["docker", "inspect", *ids], capture_output=True, text=True, timeout=TIMEOUT)
+        data = json.loads(inspected.stdout or "[]")
+    except FileNotFoundError:
+        return {"available": False, "items": [], "note": "no docker command"}
+    except (OSError, subprocess.TimeoutExpired, ValueError) as error:
+        return {"available": False, "items": [], "note": f"docker: {error}"}
+    return {"available": True, "items": restart_loops(data if isinstance(data, list) else [], settings)}
+
+
+def memory_facts() -> dict:
+    """Swap and memory now: total and free swap in MB, and why memory is short (None: it is not)."""
+    usage = None
+    with contextlib.suppress(sf.SlotError, OSError):
+        usage = sf.swap_usage()
+    found = {"swap_total_mb": None if usage is None else round(usage[0]),
+             "swap_free_mb": None if usage is None else round(usage[1]), "short": None}
+    with contextlib.suppress(sf.SlotError, OSError):
+        found["short"] = sf.memory_short()
+    return found
+
+
+def memory_report(facts: dict, snap: Snapshot, settings: dict, items: list[dict],
+                  protected: dict[int, str]) -> dict:
+    """The largest resident processes with their class while memory is short (`short`), else just the facts."""
+    total, free = facts.get("swap_total_mb"), facts.get("swap_free_mb")
+    short = facts.get("short")
+    floor = max(settings["swap_free_mb"], (total or 0) * settings["swap_free_pct"] / 100)
+    if short is None and total and free is not None and free < floor:
+        short = f"free swap {free} of {total} MB is under {floor:.0f} MB ({settings['swap_free_mb']:g} MB or " \
+                f"{settings['swap_free_pct']:g}%)"
+    found = {**facts, "short": short, "top": []}
+    if short is None:
+        return found
+    classed = {}
+    for item in items:
+        for pid in item.get("tree", ()):
+            classed.setdefault(pid, item["class"])
+    top = sorted(snap.procs.values(), key=lambda p: -p.rss)[:int(settings["memory_top"])]
+    for proc in top:
+        label = protected.get(proc.pid)
+        entry = {"pid": proc.pid, "rss_mb": round(proc.rss / 1024), "cmd": proc.cmd[:200],
+                 "class": f"lease {label}" if label else classed.get(proc.pid, "-"),
+                 "age": None if snap.age(proc) is None else round(snap.age(proc))}
+        if LINUX and proc.uid == snap.uid:
+            with contextlib.suppress(OSError, ValueError):
+                for line in sf.proc_path(str(proc.pid), "status").read_text().splitlines():
+                    if line.startswith("VmSwap:"):
+                        entry["swap_mb"] = round(int(line.split()[1]) / 1024)
+        found["top"].append(entry)
+    return found
+
+
+# Acting
+
+def identities(pids: list[int]) -> dict[int, tuple[str, bool]]:
+    """pid -> (lstart in the C locale, a zombie) for those of `pids` still in the process table."""
+    if not pids:
+        return {}
+    try:
+        result = subprocess.run(["ps", "-o", "pid=,stat=,lstart=", "-p", ",".join(map(str, pids))],
+                                capture_output=True, text=True, env={**os.environ, "LC_ALL": "C"}, timeout=TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    found = {}
+    for line in result.stdout.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit():
+            found[int(parts[0])] = (" ".join(parts[2].split()), parts[1].startswith("Z"))
+    return found
+
+
+def stop(item: dict, snap: Snapshot, grace: float, now=time.monotonic, pause=time.sleep) -> dict:
+    """SIGTERM to the item's tree, SIGKILL to what is left after `grace` seconds; only to pids whose start time is
+    the one the sweep saw. Returns {"result": stopped|killed|gone|failed, "signalled": [...], "left": [...]}."""
+    expected = {p: " ".join(snap.procs[p].start.split()) for p in item["tree"] if p in snap.procs}
+    seen = identities(list(expected))
+    targets = [p for p, start in expected.items() if p in seen and seen[p][0] == start and not seen[p][1]]
+    if not targets:
+        return {"result": "gone", "signalled": [], "left": []}
+    signalled = []
+    for pid in targets:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.kill(pid, signal.SIGTERM)
+            signalled.append(pid)
+
+    def remaining() -> list[int]:
+        here = identities(targets)
+        return [p for p in targets if p in here and here[p][0] == expected[p] and not here[p][1]]
+    deadline = now() + grace
+    left = remaining()
+    while left and now() < deadline:
+        pause(0.2)
+        left = remaining()
+    if not left:
+        return {"result": "stopped", "signalled": signalled, "left": []}
+    for pid in left:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.kill(pid, signal.SIGKILL)
+    deadline = now() + 2
+    while left and now() < deadline:
+        pause(0.1)
+        left = remaining()
+    return {"result": "failed" if left else "killed", "signalled": signalled, "left": left}
+
+
+# Settings
+
+def settings(directory: Path | None = None) -> dict:
+    """sweep.json beside the queue over DEFAULTS; a file that cannot be read gives the defaults with "error"."""
+    found = dict(DEFAULTS, classes=list(DEFAULTS["classes"]), saved=False)
+    try:
+        found.update(checked(json.loads(((directory or sf.state_dir()) / "sweep.json").read_text())), saved=True)
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, TypeError) as error:
+        found["error"] = f"sweep.json ignored: {error}"
+    return found
+
+
+def seconds_of(text: str) -> float:
+    found = re.fullmatch(r"(\d+(?:\.\d+)?)([smhd]?)", text.strip())
+    if not found:
+        raise ValueError(f"not a duration: {text!r} (seconds, or 90s, 30m, 2h, 1d)")
+    return float(found[1]) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[found[2]]
+
+
+def checked(data) -> dict:
+    if not isinstance(data, dict) or set(data) - set(DEFAULTS):
+        raise ValueError(f"not sweep settings: {data!r}")
+    found = {}
+    for key, value in data.items():
+        if key == "classes":
+            if not isinstance(value, list) or set(value) - set(CLASSES):
+                raise ValueError(f"classes are some of {', '.join(CLASSES)}, not {value!r}")
+            found[key] = [c for c in CLASSES if c in value]
+        elif type(value) not in (int, float) or value < 0 or (key == "memory_top" and value < 1):
+            raise ValueError(f"{key} must be a number of at least {1 if key == 'memory_top' else 0}, not {value!r}")
+        else:
+            found[key] = float(value)
+    return found
+
+
+def config_command(argv: list[str], directory: Path) -> int:
+    if argv == ["reset"]:
+        sf.require_own(directory, "a sweep settings change")
+        with sf.locked(directory):
+            (directory / "sweep.json").unlink(missing_ok=True)
+    elif argv:
+        if len(argv) % 2:
+            raise SweepError("config takes KEY VALUE pairs, or reset")
+        changes = {}
+        for key, value in zip(argv[::2], argv[1::2]):
+            key = key.replace("-", "_")
+            if key not in DEFAULTS:
+                raise SweepError(f"unknown setting {key}; settings: {', '.join(DEFAULTS)}")
+            try:
+                if key == "classes":
+                    changes[key] = [] if value in ("none", "") else [c.strip() for c in value.split(",") if c.strip()]
+                else:
+                    changes[key] = seconds_of(value) if key in DURATIONS else float(value)
+            except ValueError as error:
+                raise SweepError(str(error)) from None
+        sf.require_own(directory, "a sweep settings change")
+        with sf.locked(directory):
+            saved = {k: v for k, v in settings(directory).items() if k in DEFAULTS}
+            try:
+                values = checked({**saved, **changes})
+            except ValueError as error:
+                raise SweepError(str(error)) from None
+            sf.write(directory / "sweep.json", values)
+    found = settings(directory)
+    if "error" in found:
+        print(f"slotfather sweep: {found['error']}", file=sys.stderr)
+    print(f"sweep settings ({'saved in ' + str(directory / 'sweep.json') if found['saved'] else 'defaults'}):")
+    for key in DEFAULTS:
+        value = found[key]
+        text = ",".join(value) or "none" if key == "classes" else (
+            sf.duration(value) if key in DURATIONS and key != "container_minutes" else f"{value:g}")
+        print(f"  {key:<18} {text}")
+    return 0
+
+
+# The sweep
+
+def sweep(directory: Path, live: bool = False, dev_servers: bool = False, only: set[int] | None = None,
+          logged: bool = True) -> dict:
+    found_settings = settings(directory)
+    snap = snapshot()
+    protected, paths = leases(directory, snap)
+    carriers = (lambda pids: carried(pids, paths)) if paths else None
+    items = plan(snap, found_settings, protected, carriers, only, live, dev_servers)
+    if live:
+        for item in items:
+            if item["action"] == "stop":
+                item.update(stop(item, snap, found_settings["grace"]))
+                item["action"] = item.pop("result")
+                sf.log(directory, f"sweep {item['action']} {item['class']} pid {item['pid']} ({item['kind']}, "
+                                  f"age {sf.duration(item['age'])}, {len(item['tree'])} process(es)): "
+                                  f"{item['cmd'][:120]}")
+    enabled = set(found_settings["classes"])
+    docker = containers(found_settings) if "container" in enabled and only is None else \
+        {"available": None, "items": []}
+    memory = memory_report(memory_facts(), snap, found_settings, items, protected) if "memory" in enabled else {}
+    counts = {c: sum(i["class"] == c for i in items) for c in ("removed", "orphan", "dev-server")}
+    counts["container"] = len(docker["items"])
+    report = {"v": VERSION, "at": round(snap.moment, 3), "live": live, "dev_servers": dev_servers,
+              "only": sorted(only) if only is not None else None,
+              "settings": {k: found_settings[k] for k in DEFAULTS}, "notes": snap.notes + (
+                  [found_settings["error"]] if "error" in found_settings else []),
+              "items": items, "containers": docker, "memory": memory, "found": counts,
+              "stopped": {c: sum(i["class"] == c and i["action"] in ("stopped", "killed") for i in items)
+                          for c in ("removed", "orphan", "dev-server")},
+              "would_stop": sum(i["action"] == "would-stop" for i in items),
+              "spared": sum(i["action"] == "spared" for i in items),
+              "failed": sum(i["action"] == "failed" for i in items),
+              "freed_mb": round(sum(i["rss_mb"] for i in items if i["action"] in ("stopped", "killed")), 1)}
+    if logged and sf.foreign_owner(directory) is None:
+        with contextlib.suppress(OSError):
+            directory.mkdir(parents=True, exist_ok=True)
+            sf.append_bounded(directory / "sweep.jsonl", json.dumps(report, sort_keys=True) + "\n", LOG_MAX)
+    return report
+
+
+ACTIONS = {"would-stop": "would stop", "stop": "stop", "stopped": "stopped", "killed": "killed", "gone": "gone",
+           "failed": "FAILED", "spared": "spared", "report": "report"}
+
+
+def text(report: dict, quiet: bool = False) -> str:
+    lines = []
+    items = report["items"]
+    if quiet:
+        return "\n".join(f"slotfather sweep: {ACTIONS[i['action']]} {i['class']} pid {i['pid']} {i['kind']}: "
+                         f"{i['cmd'][:120]}" for i in items if i["action"] in ("stopped", "killed", "failed"))
+    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(report["at"]))
+    mode = "live" + (" with dev servers" if report["dev_servers"] else "") if report["live"] else "dry run"
+    found = report["found"]
+    lines.append(f"slotfather sweep · {mode} · {when} · removed {found['removed']}, orphans {found['orphan']}, "
+                 f"dev servers {found['dev-server']}, looping containers {found['container']}"
+                 + (f" · only pids {','.join(map(str, report['only']))}" if report["only"] else ""))
+    for item in items:
+        lines.append(f"  {item['class']:<10} {ACTIONS[item['action']]:<10} pid {item['pid']:<6} "
+                     f"{sf.duration(item['age']):>7} {item['rss_mb']:>7.0f} MB  {item['kind']:<14} "
+                     f"{item['cmd'][:110]}")
+        detail = item["reason"] + (f"; {len(item['tree'])} process(es)" if len(item["tree"]) > 1 else "")
+        lines.append(f"  {'':<10} {'':<10} {detail}")
+    if not items:
+        lines.append("  no removed-directory processes, orphans or stale dev servers")
+    docker = report["containers"]
+    if docker.get("available") is False:
+        lines.append(f"  containers: not checked ({docker.get('note')})")
+    for item in docker["items"]:
+        lines.append(f"  container  report     {item['name']} ({item['project'] or '-'}): {item['status']}, "
+                     f"{item['restarts']} restarts, policy {item['policy']}, exit {item['exit_code']}")
+    memory = report["memory"]
+    if memory:
+        swap = "" if memory.get("swap_total_mb") is None else \
+            f"swap {memory['swap_total_mb'] - memory['swap_free_mb']} of {memory['swap_total_mb']} MB used"
+        if memory.get("short"):
+            lines.append(f"  memory short: {memory['short']}" + (f"; {swap}" if swap else "") + "; largest:")
+            for entry in memory["top"]:
+                lines.append(f"    pid {entry['pid']:<6} {entry['rss_mb']:>6} MB  {entry['class']:<14} "
+                             f"{entry['cmd'][:100]}")
+        elif swap:
+            lines.append(f"  memory: {swap}, not short")
+    for note in report["notes"]:
+        lines.append(f"  note: {note}")
+    if report["live"]:
+        stopped = sum(report["stopped"].values())
+        lines.append(f"stopped {stopped} tree(s), {report['freed_mb']:.0f} MB resident; spared {report['spared']}, "
+                     f"failed {report['failed']}")
+    else:
+        lines.append(f"dry run: nothing was signalled; {report['would_stop']} would be stopped with --live"
+                     + ("" if report["dev_servers"] else " (dev servers only with --live --dev-servers)")
+                     + f"; spared {report['spared']}")
+    return "\n".join(lines)
+
+
+def plist(live: bool, dev_servers: bool, interval: int, directory: Path) -> str:
+    """A launchd agent that runs the sweep every `interval` seconds, dry-run unless `live`."""
+    command = [sys.executable, str(Path(__file__).resolve().with_name("slotfather")), "sweep", "--quiet"]
+    if live:
+        command.append("--live")
+    if dev_servers:
+        command.append("--dev-servers")
+    environment = {"PATH": os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")}
+    if os.environ.get("SLOTFATHER_DIR"):
+        environment["SLOTFATHER_DIR"] = os.environ["SLOTFATHER_DIR"]
+    data = {"Label": LABEL, "ProgramArguments": command, "StartInterval": interval, "RunAtLoad": True,
+            "ProcessType": "Background", "LowPriorityIO": True, "Nice": 10, "EnvironmentVariables": environment,
+            "StandardOutPath": str(directory / "sweep.out"), "StandardErrorPath": str(directory / "sweep.out")}
+    return plistlib.dumps(data).decode()
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    directory = sf.state_dir()
+    try:
+        if argv[:1] == ["config"]:
+            return config_command(argv[1:], directory)
+        live = dev = as_json = quiet = as_plist = False
+        logged = True
+        only, interval = None, 3600
+        while argv:
+            option = argv.pop(0)
+            if option == "--live":
+                live = True
+            elif option == "--dev-servers":
+                dev = True
+            elif option == "--json":
+                as_json = True
+            elif option == "--quiet":
+                quiet = True
+            elif option == "--no-log":
+                logged = False
+            elif option == "--plist":
+                as_plist = True
+            elif option == "--interval" and argv and argv[0].isdigit() and int(argv[0]) >= 60:
+                interval = int(argv.pop(0))
+            elif option == "--pid" and argv and argv[0].isdigit():
+                only = (only or set()) | {int(argv.pop(0))}
+            elif option in ("-h", "--help"):
+                print(__doc__)
+                return 0
+            else:
+                raise SweepError(f"unknown or incomplete option {option}")
+        if as_plist:
+            print(plist(live, dev, interval, directory), end="")
+            return 0
+        if live:
+            sf.require_own(directory, "a live sweep")
+        lock_path = directory / "sweep.lock"
+        handle = None
+        if sf.foreign_owner(directory) is None:
+            directory.mkdir(parents=True, exist_ok=True)
+            handle = open(lock_path, "a")
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print("slotfather sweep: another sweep is running", file=sys.stderr)
+                return 0
+        try:
+            if live and not logged:
+                raise SweepError("a live sweep is always logged")
+            report = sweep(directory, live, dev, only, logged)
+        finally:
+            if handle is not None:
+                handle.close()
+    except (SweepError, sf.SlotError) as error:
+        print(f"slotfather sweep: {error}\n{USAGE}", file=sys.stderr)
+        return 2
+    if as_json:
+        print(json.dumps(report, sort_keys=True))
+    else:
+        output = text(report, quiet)
+        if output:
+            print(output)
+    return 1 if report["failed"] else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

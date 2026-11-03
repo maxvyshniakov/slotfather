@@ -33,7 +33,7 @@ import uuid
 
 MIN_PYTHON = (3, 9)
 ENV_SHEBANG = b"#!/usr/bin/env python3\n"
-COMMANDS = ("slotfather", "slotfather-dashboard", "slotfather-stats")
+COMMANDS = ("slotfather", "slotfather-dashboard", "slotfather-stats", "slotfather-sweep")
 USAGE = "usage: python3 install.py [--python /path/to/python3] [--user NAME] [--bin DIR] [--cgroup /A.slice/B.slice]"
 STATE_LINE = b'DEFAULT_DIR = "~/.local/state/slotfather"\n'  # in slotfather; --user replaces it
 CGROUP_LINE = b"DEFAULT_CGROUP = None  "  # in slotfather; --cgroup replaces the None
@@ -242,14 +242,14 @@ def install(home, source, python, bin_dir=None, pinned=False, cgroup=None):
                 changing = True
                 empty.unlink()  # This is now the temporary guard, never queue data.
             changing = True
-            # The companions (dashboard, stats) first: an executable that names a missing one is the shorter-lived
+            # The companions (dashboard, stats, sweep) first: an executable that names a missing one is the shorter-lived
             # mismatch.
             for name in reversed(COMMANDS):
                 main_command = name == "slotfather"
                 install_binary(source.with_name(name), bin_dir / name, python,
                                destination if pinned and main_command else None, cgroup if main_command else None)
             old_command.unlink(missing_ok=True)
-            print(f"Installed {bin_dir / 'slotfather'}, slotfather-dashboard and slotfather-stats for "
+            print(f"Installed {bin_dir / 'slotfather'}, slotfather-dashboard, slotfather-stats and slotfather-sweep for "
                   f"{python}; old queue paths are file guards" + (f"; queue {destination}" if pinned else "")
                   + (f"; cgroup {cgroup}" if cgroup else ""))
         finally:

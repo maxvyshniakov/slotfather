@@ -1,0 +1,486 @@
+#!/usr/bin/env python3
+"""`slotfather sweep` (#662): the classes decided on fake process tables, containers and memory from fake facts,
+the settings, the launchd agent and the stats; and through real short-lived processes the tests start themselves
+(an orphan by a double fork, a process whose working directory was removed, one that ignores SIGTERM, and leased
+processes that must be spared). Every live sweep here is limited to the test's own pids with --pid."""
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+import plistlib
+import signal
+import subprocess
+import sys
+import textwrap
+import time
+import unittest
+
+from test_slotfather import TOOL, SlotCase
+from test_usage import load
+
+sweep = load(TOOL + "-sweep", "slotfather_sweep_under_test")
+sf = sweep.sf
+
+NOW = 1_800_000_000.0
+UID = 501
+HOME = os.path.expanduser("~")
+SETTINGS = {**sweep.DEFAULTS, "classes": list(sweep.CLASSES)}
+
+
+def proc(pid, ppid, cmd, age=36000.0, uid=UID, tty="", rss=10240):
+    return sweep.Proc(pid, ppid, uid, rss, tty, f"start-{pid}", NOW - age, cmd)
+
+
+def snap(procs, cwds=None, managed=(), gone=(), me=(999,)):
+    """A snapshot of `procs`; directories listed in `gone` (and below them) do not exist."""
+    def isdir(path):
+        return not any(path == g or path.startswith(g.rstrip("/") + "/") for g in gone)
+    return sweep.Snapshot({p.pid: p for p in procs}, cwds or {}, managed, moment=NOW, uid=UID, me=me, isdir=isdir)
+
+
+def plan(s, settings=None, **options):
+    return {i["pid"]: i for i in sweep.plan(s, settings or SETTINGS, **options)}
+
+
+SHELL = proc(50, 1, "/usr/bin/some-daemon")  # a live parent that is no session
+
+
+class KindTests(unittest.TestCase):
+    def test_commands_of_the_incident_and_the_kinds_they_get(self):
+        cases = {
+            "node /w/repo-kit-wt-656/src/cli.mjs verify": ("runner", None),
+            "tail -n +1 -f /Users/m/.claude/tasks/abc.output": ("tail-f", None),
+            "tail -F /var/log/x": ("tail-f", None),
+            "tail -n 20 /var/log/x": (None, None),
+            "bun run --cwd apps/storybook storybook dev --port 6012 --no-open": (None, "storybook-dev"),
+            "node /w/node_modules/.bin/vite --port 5173": (None, "vite-dev"),
+            "node /w/node_modules/vitest/vitest.mjs run": ("vitest", None),
+            "/Users/m/.agent-browser/bin/agent-browser daemon": ("agent-browser", None),
+            "/Users/m/Library/Caches/ms-playwright/chromium-1248/chrome-mac-arm64/Google Chrome for Testing.app/"
+            "Contents/MacOS/Google Chrome for Testing --headless": ("playwright", None),
+            "/usr/lib/chromium/chromium --headless=new --remote-debugging-pipe": ("chromium", None),
+            "cargo test -p core": ("cargo-test", None),
+            "/w/target/debug/deps/core-0123456789abcdef --test-threads 4": ("cargo-test", None),
+            "swift test --parallel": ("swift-test", None),
+            "python3 -m pytest tests": ("pytest", None),
+            "bun test": ("runner", None),
+            "sh ./verify.sh --checks a,b": ("runner", None),
+            "sh -c while test -e /x; do sleep 1; done": (None, None),
+            "npm exec agentation-mcp server --port 4747": (None, None),
+            "node server.js": (None, None),
+        }
+        for cmd, (orphan, dev) in cases.items():
+            with self.subTest(cmd=cmd):
+                self.assertEqual(orphan, sweep.orphan_kind(cmd))
+                self.assertEqual(dev, sweep.dev_server_kind(cmd))
+
+    def test_sessions_and_programs(self):
+        self.assertTrue(sweep.is_session(proc(1, 1, "/Users/m/.local/share/claude/versions/2.1.293 --resume")))
+        self.assertTrue(sweep.is_session(proc(1, 1, "/Users/m/Library/Application Support/Claude/claude-code/2.1/"
+                                                      "x/claude.app/Contents/MacOS/claude --output-format x")))
+        self.assertTrue(sweep.is_session(proc(1, 1, "tmux new -s work")))
+        self.assertTrue(sweep.is_session(proc(1, 1, "vim notes.md", tty="ttys003")))
+        self.assertFalse(sweep.is_session(proc(1, 1, "node /w/claude/index.js")))
+        self.assertEqual("/Applications/Google Chrome.app/Contents/MacOS/Google",
+                         sweep.program("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --x"))
+        self.assertEqual("node", sweep.program("node /x/Foo.app/Contents/a.js"))
+
+    def test_ps_lines_of_macos_and_procps(self):
+        found = sweep.parse_table(
+            "  100     1   501  20480 ??       Wed Nov  4 01:00:00 2026     tail -f /x/a.output\n"
+            "  101   100     0   1024 pts/0    Wed Nov  4 01:00:01 2026 /bin/bash\n"
+            "  102   100  1000   1024 ?        Wed Nov  4 01:00:02 2026 \n"
+            "garbage\n")
+        self.assertEqual(sweep.Proc(100, 1, 501, 20480, "", "Wed Nov 4 01:00:00 2026",
+                                    sf.started_at("Wed Nov 4 01:00:00 2026"), "tail -f /x/a.output"), found[100])
+        self.assertEqual(("pts/0", "/bin/bash"), (found[101].tty, found[101].cmd))
+        self.assertEqual(("", ""), (found[102].tty, found[102].cmd))
+        self.assertEqual({100, 101, 102}, set(found))
+
+
+class PlanTests(unittest.TestCase):
+    def test_a_removed_working_directory_or_a_path_into_a_removed_directory_is_stopped_once_old_enough(self):
+        gone = f"{HOME}/sweep-fixture-wt-656"
+        s = snap([SHELL,
+                  proc(100, 50, "node cli.mjs verify", age=700),
+                  proc(101, 50, "sleep 300", age=60),
+                  proc(102, 50, f"node {gone}/src/cli.mjs verify", age=700),
+                  proc(103, 50, f"node {HOME}/sweep-fixture-new/out.json", age=700),
+                  proc(104, 50, "node /opt/gone/x.js", age=700),
+                  proc(105, 50, f"sh -c ls {HOME}/*-wt-shoot/static $HOME/x {gone}/$name/y", age=700)],
+                 cwds={100: sweep.Cwd(f"{gone}", True), 101: sweep.Cwd(f"{gone}", True),
+                       103: sweep.Cwd("/w", False)},
+                 gone=(gone, "/opt/gone"))
+        found = plan(s)
+        self.assertEqual({100, 102}, set(found), "young (101), an existing parent (103), a path outside home and "
+                                                 "the temporary directories (104), globs and variables (105) are left")
+        self.assertEqual(("removed", "would-stop"), (found[100]["class"], found[100]["action"]))
+        self.assertIn(f"cwd {gone} is gone", found[100]["reason"])
+        self.assertIn(f"{gone}/src/cli.mjs is in a directory that is gone", found[102]["reason"])
+        self.assertEqual("stop", plan(s, live=True)[100]["action"])
+
+    def test_orphans_of_dev_kinds_past_the_age_and_nothing_else(self):
+        s = snap([SHELL,
+                  proc(100, 1, "node /w/node_modules/vitest/vitest.mjs run", age=3 * 3600),
+                  proc(101, 1, "tail -n +1 -f /Users/m/.claude/tasks/a.output", age=16 * 3600),
+                  proc(102, 1, "node server.js", age=99 * 3600),
+                  proc(103, 1, "node /w/node_modules/vitest/vitest.mjs run", age=1800),
+                  proc(104, 50, "node /w/node_modules/vitest/vitest.mjs run", age=99 * 3600),
+                  proc(105, 1, "bun run storybook dev --port 6012", age=3 * 3600),
+                  proc(106, 100, "/w/node_modules/@esbuild/darwin-arm64/bin/esbuild --service=0.25 --ping")])
+        found = plan(s)
+        self.assertEqual({100, 101}, set(found))
+        self.assertEqual([("orphan", "vitest", "would-stop", [100, 106]), ("orphan", "tail-f", "would-stop", [101])],
+                         [(i["class"], i["kind"], i["action"], i["tree"]) for i in found.values()])
+        self.assertIn("vitest adopted by pid 1", found[100]["reason"])
+
+    def test_never_a_terminal_a_session_a_service_another_user_the_system_an_app_or_the_sweep(self):
+        gone = f"{HOME}/sweep-fixture-gone"
+        procs = [proc(100, 1, "vim notes.md", tty="ttys001"),
+                 proc(101, 1, "/Users/m/.local/share/claude/versions/2.1.293"),
+                 proc(102, 1, "node /w/node_modules/vitest/vitest.mjs run"),
+                 proc(103, 1, "node /w/node_modules/vitest/vitest.mjs run", uid=0),
+                 proc(104, 1, "/usr/libexec/trustd"),
+                 proc(105, 1, "/Applications/Notes.app/Contents/MacOS/Notes"),
+                 proc(999, 1, "python3 slotfather-sweep")]
+        s = snap(procs, cwds={p.pid: sweep.Cwd(gone, True) for p in procs}, managed={102}, gone=(gone,))
+        self.assertEqual({}, plan(s))
+        self.assertEqual("a launchd or systemd job", sweep.exempt(s.procs[102], s))
+        self.assertEqual("another user's", sweep.exempt(s.procs[103], s))
+
+    def test_a_live_lease_spares_its_tree_its_carriers_and_trees_holding_them(self):
+        gone = f"{HOME}/sweep-fixture-gone"
+        procs = [SHELL, proc(100, 50, "sleep 300"), proc(101, 50, "sh -c x"), proc(102, 101, "sleep 300"),
+                 proc(103, 1, "node /w/verify.mjs"), proc(104, 50, "sleep 1"),
+                 proc(105, 50, "sh -c y"), proc(106, 105, "tmux new -s z")]
+        s = snap(procs, cwds={p.pid: sweep.Cwd(gone, True) for p in procs}, gone=(gone,))
+        asked = []
+
+        def carriers(pids):
+            asked.append(pids)
+            return {103: "lane-650"} if 103 in pids else {}
+        found = plan(s, protected={100: "gate", 102: "lane-7"}, carriers=carriers, live=True)
+        self.assertEqual("spared", found[100]["action"])
+        self.assertIn("inside the live lease gate", found[100]["reason"])
+        self.assertIn("inside the live lease lane-7", found[101]["reason"], "a leased child spares its parent")
+        self.assertEqual("spared", found[102]["action"])
+        self.assertIn("inside the live lease lane-650", found[103]["reason"], "an orphan carrying the lease")
+        self.assertEqual("stop", found[104]["action"])
+        self.assertIn("a session (pid 106) in its tree", found[105]["reason"])
+        self.assertNotIn(100, asked[0], "the tree's members need no environment check")
+
+    def test_a_dev_server_without_a_live_session_is_reported_and_stopped_only_with_dev_servers(self):
+        procs = [proc(100, 1, "bun run storybook dev --port 6012", age=27 * 3600),
+                 proc(101, 100, "node /w/node_modules/.bin/storybook dev --port 6012", age=27 * 3600),
+                 proc(110, 1, "/bin/zsh", tty="ttys002"),
+                 proc(111, 110, "node /w2/node_modules/.bin/vite", age=27 * 3600),
+                 proc(120, 1, "/Applications/Claude.app/Contents/MacOS/Claude"),
+                 proc(121, 120, "node /w3/node_modules/.bin/vite", age=27 * 3600),
+                 proc(130, 1, "/Applications/WebStorm.app/Contents/MacOS/webstorm"),
+                 proc(131, 130, "node /w4/node_modules/.bin/vite", age=27 * 3600),
+                 proc(140, 1, "node /w5/node_modules/.bin/vite", age=27 * 3600),
+                 proc(141, 1, "/Users/m/.local/share/claude/versions/2.1.293"),
+                 proc(150, 1, "node /w6/node_modules/.bin/vite", age=3600)]
+        cwds = {100: sweep.Cwd("/w", False), 121: sweep.Cwd("/w3", False), 140: sweep.Cwd("/w5", False),
+                141: sweep.Cwd("/w5", False)}
+        found = plan(snap(procs, cwds))
+        self.assertEqual({100, 121}, set(found), "a terminal (111) or an IDE (131) above, a session in its checkout "
+                                                 "(140) and a young server (150) are left")
+        self.assertEqual(("dev-server", "storybook-dev", "report", [100, 101]),
+                         (found[100]["class"], found[100]["kind"], found[100]["action"], found[100]["tree"]))
+        self.assertEqual("report", plan(snap(procs, cwds), live=True)[121]["action"],
+                         "the agents' desktop apps are no live session for the servers they started")
+        self.assertEqual("stop", plan(snap(procs, cwds), live=True, dev_servers=True)[100]["action"])
+        self.assertEqual("would-stop", plan(snap(procs, cwds), dev_servers=True)[100]["action"])
+
+    def test_a_browser_daemon_is_spared_while_a_session_works_in_its_checkout(self):
+        procs = [proc(100, 1, "/Users/m/.agent-browser/bin/agent-browser daemon"),
+                 proc(101, 1, "/Users/m/.local/share/claude/versions/2.1.293"),
+                 proc(102, 1, "/Users/m/.agent-browser/bin/agent-browser daemon")]
+        cwds = {100: sweep.Cwd("/kit/wt-a", False), 101: sweep.Cwd("/kit/wt-a", False),
+                102: sweep.Cwd("/kit/wt-b", False)}
+        found = plan(snap(procs, cwds), live=True)
+        self.assertEqual("spared", found[100]["action"])
+        self.assertIn("a session works in its checkout /kit/wt-a", found[100]["reason"])
+        self.assertEqual("stop", found[102]["action"])
+
+    def test_a_candidate_inside_one_that_stops_goes_with_it_and_settings_limit_the_classes(self):
+        gone = f"{HOME}/sweep-fixture-gone"
+        procs = [SHELL, proc(100, 50, "sh -c verify"), proc(101, 100, "node x.js"),
+                 proc(102, 1, "tail -f /x/a.output")]
+        s = snap(procs, cwds={100: sweep.Cwd(gone, True), 101: sweep.Cwd(gone, True)}, gone=(gone,))
+        found = plan(s)
+        self.assertEqual({100, 102}, set(found))
+        self.assertEqual([100, 101], found[100]["tree"])
+        self.assertEqual({102}, set(plan(s, {**SETTINGS, "classes": ["orphan"]})))
+        self.assertEqual({101}, set(plan(s, only={101})))
+        self.assertEqual({}, plan(s, {**SETTINGS, "orphan_age": 99 * 3600, "removed_age": 99 * 3600}))
+
+    def test_under_a_live_session_is_said(self):
+        gone = f"{HOME}/sweep-fixture-gone"
+        procs = [proc(40, 1, "/Users/m/Library/Application Support/Claude/claude-code/2.1/x/claude.app/Contents/"
+                                "MacOS/claude --output-format stream-json"),
+                 proc(100, 40, "/bin/zsh -c source snapshot.sh && eval 'while :; do sleep 20; done'")]
+        found = plan(snap(procs, cwds={100: sweep.Cwd(gone, True)}, gone=(gone,)))
+        self.assertEqual(40, found[100]["session"])
+        self.assertIn("under live session pid 40 (claude)", found[100]["reason"])
+
+
+class ReportTests(unittest.TestCase):
+    def test_containers_in_a_restart_loop(self):
+        def container(name, restarts, status="restarting", restarting=True, started="2027-01-15T07:55:00Z",
+                      policy="unless-stopped", created="2027-01-10T00:00:00Z"):
+            return {"Id": "abcdef0123456789", "Name": "/" + name, "RestartCount": restarts, "Created": created,
+                    "State": {"Status": status, "Restarting": restarting, "StartedAt": started, "ExitCode": 1},
+                    "HostConfig": {"RestartPolicy": {"Name": policy}},
+                    "Config": {"Labels": {"com.docker.compose.project": "sirv-demo"}}}
+        moment = sweep.docker_time("2027-01-15T08:00:00Z")
+        found = sweep.restart_loops([
+            container("sirv-demo-app-1", 412),
+            container("steady", 5, "running", False, started="2027-01-14T00:00:00Z"),
+            container("few", 2),
+            container("no-policy", 50, policy="no"),
+            container("new", 50, created="2027-01-15T07:50:00Z"),
+            container("again", 9, "running", False, started="2027-01-15T07:59:00Z"),
+        ], SETTINGS, moment)
+        self.assertEqual(["sirv-demo-app-1", "again"], [c["name"] for c in found])
+        self.assertEqual(("report", "sirv-demo", 412, "unless-stopped"),
+                         (found[0]["action"], found[0]["project"], found[0]["restarts"], found[0]["policy"]))
+
+    def test_memory_holders_only_while_memory_is_short_with_their_class(self):
+        s = snap([proc(100, 1, "tail -f x", rss=900 * 1024), proc(101, 50, "node gate.mjs", rss=2000 * 1024),
+                  proc(102, 1, "Finder", rss=10 * 1024, uid=0)])
+        items = [{"class": "orphan", "tree": [100]}]
+        calm = sweep.memory_report({"swap_total_mb": 8192, "swap_free_mb": 4000, "short": None}, s, SETTINGS, items,
+                                   {101: "lane-7"})
+        self.assertEqual((None, []), (calm["short"], calm["top"]))
+        short = sweep.memory_report({"swap_total_mb": 8192, "swap_free_mb": 1030, "short": None}, s,
+                                    {**SETTINGS, "memory_top": 2}, items, {101: "lane-7"})
+        self.assertIn("free swap 1030 of 8192 MB is under 1638 MB", short["short"], "20% of 8 GB")
+        self.assertEqual([(101, 2000, "lease lane-7"), (100, 900, "orphan")],
+                         [(t["pid"], t["rss_mb"], t["class"]) for t in short["top"]])
+        guard = sweep.memory_report({"swap_total_mb": None, "swap_free_mb": None, "short": "memory pressure level 4"},
+                                    s, SETTINGS, [], {})
+        self.assertEqual(3, len(guard["top"]))
+
+    def test_the_text_report(self):
+        report = {"at": NOW, "live": False, "dev_servers": False, "only": None, "notes": ["lsof failed"],
+                  "found": {"removed": 1, "orphan": 0, "dev-server": 0, "container": 1},
+                  "items": [{"class": "removed", "action": "would-stop", "pid": 100, "age": 3600, "rss_mb": 12.0,
+                             "kind": "runner", "cmd": "node cli.mjs verify", "reason": "cwd /w is gone",
+                             "tree": [100, 101]}],
+                  "containers": {"available": True, "items": [{"name": "app-1", "project": "demo",
+                                                               "status": "restarting", "restarts": 9,
+                                                               "policy": "always", "exit_code": 1}]},
+                  "memory": {"swap_total_mb": 8192, "swap_free_mb": 1000, "short": "free swap low",
+                             "top": [{"pid": 100, "rss_mb": 12, "class": "removed", "cmd": "node cli.mjs verify"}]},
+                  "would_stop": 1, "spared": 0, "stopped": {}, "failed": 0, "freed_mb": 0}
+        text = sweep.text(report)
+        self.assertRegex(text, r"removed +would stop pid 100 +1h00m +12 MB  runner +node cli\.mjs verify")
+        self.assertIn("cwd /w is gone; 2 process(es)", text)
+        self.assertIn("container  report     app-1 (demo): restarting, 9 restarts", text)
+        self.assertIn("memory short: free swap low; swap 7192 of 8192 MB used; largest:", text)
+        self.assertIn("note: lsof failed", text)
+        self.assertIn("dry run: nothing was signalled; 1 would be stopped with --live", text)
+        self.assertEqual("", sweep.text(report, quiet=True), "quiet prints only what was stopped")
+
+
+class SweepCase(SlotCase):
+    def sweep(self, *args, ok=True):
+        result = self.tool("sweep", *args)
+        if ok:
+            self.assertIn(result.returncode, (0, 1), result.stdout + result.stderr)
+        return result
+
+    def configure(self, *pairs):
+        result = self.tool("sweep", "config", *pairs)
+        self.assertEqual(0, result.returncode, result.stderr)
+        return result.stdout
+
+    def report(self, *args):
+        result = self.sweep("--json", *args)
+        return json.loads(result.stdout)
+
+    def alive(self, pid):
+        """Running (not a zombie) by ps."""
+        found = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+        return bool(found) and not found.startswith("Z")
+
+    def wait_gone(self, pid, timeout=10):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and self.alive(pid):
+            time.sleep(0.05)
+        return not self.alive(pid)
+
+    def pid_file(self, path, timeout=10):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if path.exists() and path.read_text().strip().isdigit():
+                return int(path.read_text().strip())
+            time.sleep(0.05)
+        self.fail(f"no pid in {path}")
+
+    def orphan(self, name, extra_env=None, wrap=()):
+        """A python `verify.py` that sleeps, double-forked so that launchd/init adopts it; returns its pid."""
+        work = self.tmp / name
+        work.mkdir()
+        (work / "verify.py").write_text("import time\ntime.sleep(120)\n")
+        pid_path = work / "pid"
+        launcher = textwrap.dedent(f"""
+            import os, sys
+            if os.fork() == 0:
+                os.setsid()
+                if os.fork() == 0:
+                    with open({str(pid_path)!r} + ".tmp", "w") as f:
+                        f.write(str(os.getpid()))
+                    os.replace({str(pid_path)!r} + ".tmp", {str(pid_path)!r})
+                    os.execv(sys.executable, [sys.executable, {str(work / 'verify.py')!r}])
+                os._exit(0)
+            os.wait()
+        """)
+        subprocess.run([*wrap, sys.executable, "-c", launcher], cwd=work, env={**self.env, **(extra_env or {})},
+                       check=True, timeout=20, start_new_session=True, stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)  # the orphan keeps no pipe open
+        pid = self.pid_file(pid_path)
+        self.addCleanup(lambda: os.kill(pid, signal.SIGKILL) if self.alive(pid) else None)
+        return pid
+
+    def in_removed_directory(self, name, script="exec sleep 120"):
+        """A process (its own session, no terminal) whose working directory the test then removes."""
+        work = self.tmp / name
+        work.mkdir()
+        process = subprocess.Popen(["sh", "-c", script], cwd=work, start_new_session=True)
+        self.processes.append(process)
+        time.sleep(0.3)
+        work.rmdir()
+        return process
+
+
+class LiveTests(SweepCase):
+    def setUp(self):
+        super().setUp()
+        self.configure("removed_age", "0", "orphan_age", "0", "classes", "removed,orphan,dev-server", "grace", "2")
+
+    def test_an_orphan_from_a_double_fork_is_reported_then_stopped_with_live(self):
+        pid = self.orphan("orphan")
+        dry = self.report("--pid", str(pid))
+        self.assertEqual([(pid, "orphan", "runner", "would-stop")],
+                         [(i["pid"], i["class"], i["kind"], i["action"]) for i in dry["items"]], dry)
+        self.assertTrue(self.alive(pid), "a dry run signals nothing")
+        live = self.report("--live", "--pid", str(pid))
+        self.assertEqual("stopped", live["items"][0]["action"], live)
+        self.assertTrue(self.wait_gone(pid))
+        self.assertEqual({"removed": 0, "orphan": 1, "dev-server": 0}, live["stopped"])
+        log = (self.state / "queue.log").read_text()
+        self.assertRegex(log, rf"sweep stopped orphan pid {pid} \(runner, age \d+s, 1 process\(es\)\)")
+        lines = [json.loads(line) for line in (self.state / "sweep.jsonl").read_text().splitlines()]
+        self.assertEqual([False, True], [line["live"] for line in lines])
+
+    def test_a_process_in_a_removed_directory_is_stopped_and_one_ignoring_term_is_killed(self):
+        plain = self.in_removed_directory("wt-656")
+        stubborn = self.in_removed_directory("wt-657", 'trap "" TERM; while :; do sleep 0.1; done')
+        dry = self.report("--pid", str(plain.pid), "--pid", str(stubborn.pid))
+        self.assertEqual({plain.pid: "would-stop", stubborn.pid: "would-stop"},
+                         {i["pid"]: i["action"] for i in dry["items"]}, dry)
+        self.assertRegex(dry["items"][0]["reason"], r"cwd .*wt-656 is gone")
+        live = self.report("--live", "--pid", str(plain.pid), "--pid", str(stubborn.pid))
+        results = {i["pid"]: i["action"] for i in live["items"]}
+        self.assertEqual({plain.pid: "stopped", stubborn.pid: "killed"}, results, live)
+        self.assertEqual(-signal.SIGTERM, plain.wait(timeout=5))
+        self.assertEqual(-signal.SIGKILL, stubborn.wait(timeout=5))
+
+    def test_a_leased_process_and_a_leased_orphan_are_spared(self):
+        work = self.tmp / "leased"
+        work.mkdir()
+        pid_path = self.tmp / "leased.pid"
+        holder = subprocess.Popen([TOOL, "run", "-n", "1", "--label", "leased", "--", "sh", "-c",
+                                   f'echo $$ > "{pid_path}"; exec sleep 120'], cwd=work, env=self.env,
+                                  start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.processes.append(holder)
+        pid = self.pid_file(pid_path)
+        work.rmdir()
+        found = self.report("--live", "--pid", str(pid), "--pid", str(holder.pid))
+        self.assertEqual({pid: "spared", holder.pid: "spared"}, {i["pid"]: i["action"] for i in found["items"]},
+                         found)
+        self.assertIn("inside the live lease leased", found["items"][0]["reason"])
+        self.assertTrue(self.alive(pid) and self.alive(holder.pid))
+        lease = json.loads(self.tool("status", "--json").stdout)["entries"][0]["lease"]
+        orphan = self.orphan("leased-orphan", {"SLOTFATHER_LEASE": lease})
+        if not sf.carrying([orphan], lease):
+            self.skipTest("this host does not show the orphan's environment (an Apple platform python)")
+        found = self.report("--live", "--pid", str(orphan))
+        self.assertEqual([(orphan, "spared")], [(i["pid"], i["action"]) for i in found["items"]], found)
+        self.assertIn("inside the live lease leased", found["items"][0]["reason"])
+        self.assertTrue(self.alive(orphan))
+
+
+class CommandTests(SweepCase):
+    def test_settings_are_shown_saved_checked_and_reset(self):
+        self.assertIn("orphan_age         2h00m", self.configure())
+        self.assertIn("(defaults)", self.configure())
+        shown = self.configure("orphan_age", "3h", "classes", "removed,container", "grace", "5")
+        self.assertIn("orphan_age         3h00m", shown)
+        self.assertIn("classes            removed,container", shown)
+        saved = json.loads((self.state / "sweep.json").read_text())
+        self.assertEqual((10800.0, ["removed", "container"], 5.0),
+                         (saved["orphan_age"], saved["classes"], saved["grace"]))
+        for bad in (("orphan_age", "soon"), ("classes", "everything"), ("nope", "1"), ("grace",)):
+            result = self.tool("sweep", "config", *bad)
+            self.assertEqual(2, result.returncode, bad)
+        self.assertEqual(10800.0, json.loads((self.state / "sweep.json").read_text())["orphan_age"])
+        self.assertIn("(defaults)", self.configure("reset"))
+        self.assertFalse((self.state / "sweep.json").exists())
+        (self.state / "sweep.json").write_text("{not json")
+        result = self.tool("sweep", "config")
+        self.assertIn("sweep.json ignored", result.stderr)
+
+    def test_a_dry_run_over_the_whole_machine_signals_nothing_and_logs_one_line(self):
+        self.configure("classes", "removed,orphan,dev-server,memory")
+        before = self.processes_now()
+        result = self.sweep()
+        self.assertIn("dry run: nothing was signalled", result.stdout)
+        self.assertEqual(1, len((self.state / "sweep.jsonl").read_text().splitlines()))
+        self.assertLessEqual(before - self.processes_now(), set(), "no process of the test's was stopped")
+        found = self.report("--no-log")
+        self.assertFalse(found["live"])
+        self.assertTrue(all(i["action"] in ("would-stop", "report", "spared") for i in found["items"]))
+        self.assertEqual(1, len((self.state / "sweep.jsonl").read_text().splitlines()), "--no-log")
+        self.assertEqual(2, self.tool("sweep", "--live", "--no-log").returncode)
+        self.assertEqual(2, self.tool("sweep", "--bogus").returncode)
+
+    def processes_now(self):
+        return {p.pid for p in self.processes if p.poll() is None}
+
+    def test_the_launchd_agent(self):
+        found = plistlib.loads(self.tool("sweep", "--plist").stdout.encode())
+        self.assertEqual(("com.slotfather.sweep", 3600, True), (found["Label"], found["StartInterval"],
+                                                                found["RunAtLoad"]))
+        self.assertEqual(["sweep", "--quiet"], found["ProgramArguments"][2:])
+        self.assertTrue(found["ProgramArguments"][1].endswith("slotfather"))
+        self.assertEqual(str(self.state), found["EnvironmentVariables"]["SLOTFATHER_DIR"])
+        live = plistlib.loads(self.tool("sweep", "--plist", "--live", "--dev-servers", "--interval", "1800")
+                              .stdout.encode())
+        self.assertEqual((["sweep", "--quiet", "--live", "--dev-servers"], 1800),
+                         (live["ProgramArguments"][2:], live["StartInterval"]))
+
+    def test_stats_count_the_sweeps(self):
+        self.state.mkdir(parents=True, exist_ok=True)
+        lines = [{"v": 1, "at": NOW, "live": False, "found": {"removed": 2, "orphan": 1}, "stopped": {},
+                  "failed": 0, "freed_mb": 0},
+                 {"v": 1, "at": NOW + 3600, "live": True, "found": {"removed": 2, "orphan": 1, "container": 1},
+                  "stopped": {"removed": 2, "orphan": 1}, "failed": 1, "freed_mb": 1200.5}]
+        (self.state / "sweep.jsonl").write_text("".join(json.dumps(line) + "\n" for line in lines) + "torn")
+        result = self.tool("stats", "--json")
+        self.assertEqual(0, result.returncode, result.stderr)
+        found = json.loads(result.stdout)["sweeps"]
+        self.assertEqual((2, 1, {"removed": 2, "orphan": 1, "dev-server": 0}, 1, 1200.5),
+                         (found["runs"], found["live"], found["stopped"], found["failed"], found["freed_mb"]))
+        text = self.tool("stats").stdout
+        self.assertIn("sweeps: 2 (1 live); stopped 2 removed, 1 orphan, 0 dev-server, 1 failed, 1200 MB resident "
+                      "freed; the last live run at", text)
+        self.assertIn("found 2 removed, 1 orphan, 0 dev-server, 1 container", text)
+
+
+if __name__ == "__main__":
+    unittest.main()

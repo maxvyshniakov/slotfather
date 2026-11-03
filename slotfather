@@ -11,6 +11,7 @@
   slotfather available [--label L] [-- COMMAND...]                   slots a new request gets at once
   slotfather advise [--max N] [--exclusive] [--label L] [-- CMD...]  a job count for the load, as JSON
   slotfather order [backfill|window] [--safety X] [--limit S] ...    show, save or reset the queue's order
+  slotfather sweep [--live [--dev-servers]] [--json] | config | --plist  find (and stop) processes left behind
   slotfather [dashboard [--interval S | --once]]                     live view of capacity, leases and queue
 
 Run heavy builds and tests through `slotfather run -n <k> -- ...`: a test suite or build that keeps the
@@ -2321,6 +2322,8 @@ USAGE = ("usage: slotfather                     (in a terminal: the live dashboa
          "                        [--interactive S] [--batch S] [--yield-after S] | reset\n"
          "       slotfather stats [--since WHEN] [--label GLOB] [--by both|label|kind] [--top N] [--json]\n"
          "       slotfather slots [N|memory GIB|lower GIB|reset]\n"
+         "       slotfather sweep [--live [--dev-servers]] [--json] [--quiet] [--pid PID]... | sweep config [KEY VALUE]...\n"
+         "                        | sweep --plist [--live [--dev-servers]] [--interval SECONDS]\n"
          "       slotfather dashboard [--interval SECONDS] | dashboard --once [--width N] [--height N] [--color]")
 
 
@@ -2559,6 +2562,8 @@ def main(argv: list[str] | None = None) -> int:
             return dashboard(rest)
         if command == "stats":
             return companion("stats", rest, "slotfather-stats")
+        if command == "sweep":
+            return companion("sweep", rest, "slotfather-sweep")
         if command in ("-h", "--help", "help"):
             print(__doc__)
             return 0

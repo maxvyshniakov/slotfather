@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parent.parent
 PAYLOAD = b"#!/bin/sh\nprintf slotfather-fixture\n"
 DASHBOARD = b"#!/usr/bin/env python3\nprint('dashboard fixture')\n"
 STATS = b"#!/usr/bin/env python3\nprint('stats fixture')\n"
+SWEEP = b"#!/usr/bin/env python3\nprint('sweep fixture')\n"
 
 
 class InstallTests(unittest.TestCase):
@@ -37,6 +38,7 @@ class InstallTests(unittest.TestCase):
         (self.source / "slotfather").write_bytes(PAYLOAD)
         (self.source / "slotfather-dashboard").write_bytes(DASHBOARD)
         (self.source / "slotfather-stats").write_bytes(STATS)
+        (self.source / "slotfather-sweep").write_bytes(SWEEP)
         self.env = {**os.environ, "HOME": str(self.home)}
 
     def run_install(self, *options):
@@ -82,6 +84,7 @@ class InstallTests(unittest.TestCase):
         self.assertTrue(os.access(self.bin / "slotfather", os.X_OK))
         self.assertTrue(os.access(self.bin / "slotfather-dashboard", os.X_OK))
         self.assertTrue(os.access(self.bin / "slotfather-stats", os.X_OK))
+        self.assertTrue(os.access(self.bin / "slotfather-sweep", os.X_OK))
 
     def test_installed_commands_name_the_installing_interpreter_instead_of_env(self):
         result = self.run_install("--python", sys.executable)
