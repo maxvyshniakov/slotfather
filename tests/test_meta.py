@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import unittest
 
 from test_slotfather import ROOT, TOOL, WORK, SlotCase
@@ -57,6 +58,33 @@ class MetaTests(SlotCase):
         self.assertEqual(meta, line["meta"])
         self.assertIn("meta=ticket=650,", self.tool("history").stdout)
 
+    def test_a_process_that_left_the_tree_is_found_by_the_lease_in_its_environment(self):
+        # review P2-3: a double fork reparents the process to launchd; by the tree alone it is in no lease.
+        # The orphan is python (not an Apple platform binary), whose environment ps shows.
+        orphan = (f'sh -c \'"{sys.executable}" -c "import time; time.sleep(60)" >/dev/null 2>&1 </dev/null & echo $! > "$RELEASE/orphan.pid"\'; '
+                  + WORK)
+        process = self.request("lane", 1, "sh", "-c", orphan, "work", "lane")
+        self.started("lane")
+        path = self.release_dir / "orphan.pid"
+        self.wait_for(lambda: path.exists() and path.read_text().strip(), "the orphan to start")
+        pid = int(path.read_text())
+        self.addCleanup(lambda: subprocess.run(["kill", str(pid)], capture_output=True))
+        self.wait_for(lambda: subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True,
+                                             text=True).stdout.strip() == "1", "launchd to adopt the orphan")
+        found = json.loads(self.tool("status", "--json", "--pid", str(pid)).stdout)
+        [entry] = found["entries"]
+        self.assertEqual(("lane", "env"), (entry["label"], entry["via"]))
+        self.assertNotIn(pid, entry["tree"])
+        start = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
+                               env=self.env).stdout.strip()
+        self.assertEqual({"pid": pid, "start": start}, found["query"], "the start time, to re-check before acting")
+        holder = json.loads(self.tool("status", "--json", "--pid", str(process.pid)).stdout)
+        self.assertEqual(["tree"], [e["via"] for e in holder["entries"]])
+        gone = json.loads(self.tool("status", "--json", "--pid", "99999999").stdout)
+        self.assertEqual(([], {"pid": 99999999, "start": None}), (gone["entries"], gone["query"]))
+        self.release("lane")
+        self.finish(process)
+
     def test_a_nested_run_inherits_the_lease_and_adds_no_meta(self):
         nested = f'{TOOL} run --meta ticket=999 --meta lane=other -- sh -c "$WORK" work "$1"'
         self.env["WORK"] = WORK
@@ -94,6 +122,8 @@ class MetaTests(SlotCase):
         self.assertRegex(self.status(), r"held: 1 slot\(s\) old pid=\d+ since=- cmd=fake\n")
         self.assertEqual([{}], [e["meta"] for e in json.loads(self.tool("status", "--json").stdout)["entries"]])
         self.assertEqual({}, sf.meta_of({"meta": ["not", "a", "mapping"]}))
+        self.assertEqual({"ticket": "1"}, sf.meta_of({"meta": {"ticket": "1", "Bad Key\x1b": "x", "": "y"}}),
+                         "keys a foreign writer left that --meta would refuse are dropped")
 
     def test_the_dashboard_shows_the_selected_lease_meta(self):
         process = self.request("lane-650", 1, options=("--meta", "ticket=650"))

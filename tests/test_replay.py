@@ -101,6 +101,31 @@ class YieldTraceTests(unittest.TestCase):
                                msg="without yields it waits for the first holder to end")
 
 
+class AllSlotTraceTests(unittest.TestCase):
+    """Review P2-2: a batch `-n all` measurement under a steady stream of interactive checks (one a minute, five
+    minutes each, for four hours). Requests that rank ahead of it start first, so it is not bound by its limit;
+    it starts once those that came within both class offsets after it have run."""
+
+    def test_an_all_slot_batch_request_starts_after_the_class_offsets_and_the_runs_ahead_of_it(self):
+        start = sf.seconds("2026-11-02T10:00:00Z")
+        found = [{"label": "lane-1", "cmd": "make", "count": 1, "arrival": 0.0, "run": 600.0},
+                 {"label": "lane-2-measure", "cmd": "measure.sh", "count": 6, "arrival": 10.0, "run": 600.0}]
+        found += [{"label": "sid-kit-wt-1", "cmd": "node scripts/pre-push.mjs origin", "count": 1,
+                   "arrival": 20.0 + 60 * n, "run": 300.0} for n in range(240)]
+        for number, request in enumerate(found):
+            request.update(id=number, patience=None, waited=None, source="history",
+                           arrival=start + request["arrival"])
+        self.assertEqual("batch", replay.classify(found[1], 6))
+        seed = [("sid-kit-wt-1", found[2]["cmd"], 300.0), ("lane-1", "make", 600.0)]
+        offsets = replay.CLASSES["interactive"] + replay.CLASSES["batch"]
+        head = replay.Replay(found, 6, replay.POLICIES[CLASSES], seed).simulate()[1]
+        waited = head["granted"] - found[1]["arrival"]
+        self.assertGreater(waited, sf.ORDER_DEFAULTS["limit"], "the limit alone no longer bounds it")
+        self.assertLessEqual(waited, offsets + 300 + 2 * replay.POLL, "the offsets and the runs ahead of it do")
+        before = replay.Replay(found, 6, replay.POLICIES[SHIPPED], seed).simulate()[1]
+        self.assertLessEqual(before["granted"] - found[1]["arrival"], sf.ORDER_DEFAULTS["limit"] + 600 + replay.POLL)
+
+
 class TraceTests(unittest.TestCase):
     """Requests a slotfather without history left only in queue.log are recovered by their queue sequence."""
 

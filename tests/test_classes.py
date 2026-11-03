@@ -64,6 +64,24 @@ class RankTests(PlanCase):
         back = classed(waiter("gate", 1, -3000), "batch", rank=sf.rank_time(test, self.settings) + sf.YIELD_BEHIND)
         self.assertEqual(["test"], self.started([back, test], self.held))
 
+    def test_a_pinned_rank_wins_alone_so_later_arrivals_queue_behind_the_yielded_lease(self):
+        # review P2-1: a batch lease granted at once and asked soon after would otherwise rank at since + 1800,
+        # behind every normal request of the next half hour, while its job sits half done.
+        test = classed(waiter("test", 1, -150), "interactive")
+        back = classed(waiter("gate", 1, -200), "batch", rank=sf.rank_time(test, self.settings) + sf.YIELD_BEHIND)
+        later = waiter("later", 1, -10)
+        self.assertEqual(["gate"], self.started([back, later], self.held))
+        self.assertLess(sf.rank_time(back, self.settings), sf.rank_time(later, self.settings))
+
+    def test_a_yielded_head_counts_its_limit_from_when_it_yielded(self):
+        # review P3-5: by its first arrival the limit is long past, and nothing could pass it at all.
+        held = [holder("one", 1, -600)]
+        head = classed(waiter("gate", 6, -4000), "normal", yielded_at=M - 100, yields=1)
+        queue = [head, waiter("short", 1, -10)]
+        self.assertEqual(["short"], self.started(queue, held, one=3600, short=60))
+        self.assertEqual([], self.started([{k: v for k, v in head.items() if k != "yielded_at"}, queue[1]], held,
+                                          one=3600, short=60))
+
     def test_an_unknown_class_is_normal(self):
         self.assertEqual("normal", sf.class_of({"meta": {"class": "urgent"}}))
         self.assertEqual("normal", sf.class_of({}))
@@ -121,6 +139,16 @@ class YieldAskTests(PlanCase):
         three = classed(waiter("test", 3, -300), "interactive")
         self.assertEqual({("a", "test"), ("b", "test")}, set(self.asks([three], held, a=1800, b=7200, c=3600)))
 
+    def test_a_waiter_that_asks_later_or_never_says_so_on_its_entry(self):
+        # review P3: every client's look asks with the saved yield_after; a client's tighter environment rides on
+        # its own entry, so looks of differently configured clients agree.
+        never = classed(waiter("test", 1, -300), "interactive", yield_after=0)
+        self.assertEqual([], self.asks([never], [self.gate, self.other]))
+        later = classed(waiter("test", 1, -300), "interactive", yield_after=600)
+        self.assertEqual([], self.asks([later], [self.gate, self.other]))
+        sooner = classed(waiter("test", 1, -300), "interactive", yield_after=30)  # never looser than saved
+        self.assertEqual([("gate", "test")], self.asks([sooner], [self.gate, self.other]))
+
     def test_a_holder_already_asked_is_asked_again_before_another(self):
         a, b = (classed(holder(n, 3, -600), "batch", yieldable=True) for n in ("a", "b"))
         found = sf.yield_asks([self.test], [a, b], 6, M, runs(a=1800, b=7200), settings=self.settings, asked=[a])
@@ -153,6 +181,12 @@ class SettingsTests(unittest.TestCase):
         sf.save_order({**sf.ORDER_DEFAULTS, "yield_after": 0})
         with mock.patch.dict(os.environ, {"SLOTFATHER_YIELD_AFTER": "60"}):
             self.assertEqual(0, sf.order_settings()["yield_after"], "nothing asks earlier than never")
+
+    def test_the_saved_settings_alone_are_every_clients_view_for_asking(self):
+        with mock.patch.dict(os.environ, {"SLOTFATHER_YIELD_AFTER": "0", "SLOTFATHER_QUEUE": "window"}):
+            self.assertEqual((0, "window"), (sf.order_settings()["yield_after"], sf.order_settings()["order"]))
+            saved = sf.order_settings(environment=False)
+        self.assertEqual((120, "backfill"), (saved["yield_after"], saved["order"]))
 
     def test_class_knobs_are_saved_only_when_they_differ_from_their_defaults(self):
         sf.save_order(dict(sf.ORDER_DEFAULTS))
@@ -236,6 +270,46 @@ class ProtocolTests(SlotCase):
         self.assertIn("withdrew the yield request to gate", (self.state / "queue.log").read_text())
         self.release("gate")
         self.finish(gate)
+
+    def test_a_client_that_asks_later_says_so_on_its_entry(self):
+        self.env["SLOTFATHER_YIELD_AFTER"] = "0"
+        process = self.request("quick", 1, options=("--class", "interactive"))
+        self.started("quick")
+        [entry] = [json.loads(p.read_text()) for p in (self.state / "queue").glob("*.json")]
+        self.assertEqual(0, entry["yield_after"])
+        self.release("quick")
+        self.finish(process)
+
+    def test_the_order_warns_that_a_class_knob_makes_older_clients_use_the_window_order(self):
+        quiet = self.tool("order", "--yield-after", "120")
+        self.assertNotIn("3e3a621", quiet.stderr)
+        loud = self.tool("order", "--batch", "600")
+        self.assertEqual(0, loud.returncode)
+        self.assertIn("3e3a621", loud.stderr)
+        self.assertIn("window order", loud.stderr)
+
+    def test_a_holder_does_not_yield_when_the_asker_would_still_not_start(self):
+        # review P3-6: `gate` holds 2 of 4, `other` 2; the asker wants all 4, so the gate's 2 would idle.
+        (gate_pid, gate_start), (other_pid, other_start), (asker_pid, asker_start) = (self.holder() for _ in "abc")
+        queue = self.state / "queue"
+        queue.mkdir(parents=True, exist_ok=True)
+        base = {"cmd": "fake", "since": "2026-11-03T00:00:00Z", "granted": "2026-11-03T00:00:00Z", "state": "held"}
+        gate = queue / f"{1:010d}-{gate_pid}.json"
+        gate.write_text(json.dumps({**base, "pid": gate_pid, "start": gate_start, "count": 2, "label": "gate",
+                                    "yieldable": True, "meta": {"class": "batch"}}))
+        (queue / f"{2:010d}-{other_pid}.json").write_text(json.dumps(
+            {**base, "pid": other_pid, "start": other_start, "count": 2, "label": "other"}))
+        asker = queue / f"{3:010d}-{asker_pid}.json"
+        asker.write_text(json.dumps({"pid": asker_pid, "start": asker_start, "count": 4, "label": "quick",
+                                     "cmd": "fake", "since": "2026-11-03T00:10:00Z", "state": "waiting",
+                                     "meta": {"class": "interactive"}}))
+        sf.write(sf.marker(gate), {"by": asker.stem, "label": "quick", "class": "interactive", "count": 4,
+                                   "at": "2026-11-03T00:12:00Z"})
+        with mock.patch.dict(os.environ, {"SLOTFATHER_DIR": str(self.state), "SLOTFATHER_LEGACY_DIRS": "",
+                                          "SLOTFATHER_CORES": "12", "SLOTFATHER_MEMORY_FILE": str(self.memory)}):
+            self.assertFalse(sf.yield_lease(gate))
+        self.assertEqual("held", json.loads(gate.read_text())["state"])
+        self.assertFalse(sf.marker(gate).exists(), "the request is withdrawn")
 
     def test_yield_returns_at_once_when_nothing_asked_and_needs_a_lease(self):
         result = self.tool("run", "--yieldable", "--", TOOL, "yield")
