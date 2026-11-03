@@ -367,9 +367,9 @@ def verdict(model: dict) -> tuple[str, str, str]:
             fifo = f" · {behind} smaller request{'s' * (behind != 1)} that would fit wait behind it" if behind else ""
             start = model.get("start")
             if model.get("order") == "backfill" and start is not None and head["since"] is not None:
-                limit = head["since"] + datetime.timedelta(seconds=sf.number("BACKFILL_LIMIT", sf.BACKFILL_LIMIT))
-                fifo += (f" · it should start by {clock(start)}; one that ends by then starts first until "
-                         f"{clock(limit)}")
+                limit = model.get("limit") or 0
+                until = f" until {clock(head['since'] + datetime.timedelta(seconds=limit))}" if limit else ""
+                fifo += f" · it should start by {clock(start)}; one that ends by then starts first{until}"
             return ("QUEUED", "badge-warn", f"next is {head['label']}, which needs {head['count']} slot"
                     f"{'s' * (head['count'] != 1)} with {free} free{fifo}")
         if used and guard:
@@ -403,11 +403,13 @@ def dashboard_model() -> dict:
     live_waiters = [e for e in live if e["state"] != "held"]
     waiters = [item(e, "waiting", e["count"]) for e in live_waiters]
     used = sum(h["count"] for h in holders)
-    order, start = sf.queue_order(), None
+    settings, start = sf.order_settings(directory), None
+    order = settings["order"]
     if order == "backfill" and live_waiters:
         with contextlib.suppress(Exception):  # an estimate that cannot be read leaves the sentence without a time
             found = sf.plan(live_waiters, [e for e in live if e["state"] == "held"], slots, time.time(), order,
-                            sf.estimator(directory), sum(count for _, _, count in legacy), reserve_head=True)
+                            sf.estimator(directory), sum(count for _, _, count in legacy), reserve_head=True,
+                            settings=settings)
             if found.head is not None and found.start is not None:
                 start = datetime.datetime.fromtimestamp(found.start, datetime.timezone.utc)
     guard, machine, averages = sf.memory_short(), sf.cores(), sf.loads()
@@ -418,7 +420,7 @@ def dashboard_model() -> dict:
             "advice": sf.size(slots, machine, slots, averages, min(used, slots),
                               bool(waiters) and sf.room(live_waiters, max(0, slots - used)) == 0),
             "holders": holders, "waiters": waiters, "used": used, "free": max(0, slots - used), "guard": guard,
-            "order": order, "start": start,
+            "order": order, "start": start, "limit": settings["limit"],
             "memory": memory_facts(), "history": held_history(events, own_held, moment), "events": events[-60:],
             "updated": moment}
 

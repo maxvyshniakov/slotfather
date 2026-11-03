@@ -93,6 +93,30 @@ class TraceTests(unittest.TestCase):
         replayed = replay.Replay(found, 6, replay.POLICIES[CURRENT]).simulate()
         self.assertEqual([0, 0, 900, 900], [r["granted"] - q["arrival"] for r, q in zip(replayed, found)])
 
+    def test_a_long_request_does_not_take_a_slot_the_head_needs_when_leases_end_out_of_order(self):
+        # #643 review: x and z were expected to end within ten minutes and y in two hours, so by the expected order
+        # one slot was spare for `long`; y ends early and z overruns, and the head would have waited for z.
+        (self.dir / "queue.log").write_text("".join(
+            f"2026-11-02T{start}Z granted {count} to {label} (pid {pid})\n"
+            f"2026-11-02T{end}Z released {count} ({pid:010d}-{pid}.json)\n"
+            for pid, (label, count, start, end) in enumerate((("x", 2, "06:00:00", "06:05:00"),
+                                                             ("z", 2, "06:00:00", "06:10:00"),
+                                                             ("y", 1, "06:00:00", "08:00:00"),
+                                                             ("long", 1, "08:00:00", "10:00:00")), start=1)))
+        items = [self.history("x", 2, "10:00:00", "10:00:00", "10:05:00", 11),
+                 self.history("z", 2, "10:00:00", "10:00:00", "10:50:00", 12),
+                 self.history("y", 1, "10:00:00", "10:00:00", "10:15:00", 13),
+                 self.history("head", 4, "10:00:30", "10:50:00", "10:51:00", 14),
+                 self.history("long", 1, "10:11:00", "10:51:00", "12:51:00", 15)]
+        for item in items:
+            item["cmd"] = None  # known by label, as the seed runs
+        (self.dir / "history.jsonl").write_text("".join(json.dumps(i) + "\n" for i in items))
+        found = replay.requests(self.dir, sf.seconds("2026-11-02T13:00:00Z"))
+        replayed = {q["label"]: r for q, r in zip(found, replay.Replay(
+            found, 6, replay.POLICIES[SHIPPED], replay.seed_runs(self.dir, found[0]["arrival"])).simulate())}
+        self.assertEqual(sf.seconds("2026-11-02T10:15:00Z"), replayed["head"]["granted"], "it starts when y ends")
+        self.assertGreaterEqual(replayed["long"]["granted"], replayed["head"]["granted"])
+
 
 if __name__ == "__main__":
     unittest.main()

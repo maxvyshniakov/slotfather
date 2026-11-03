@@ -170,12 +170,12 @@ def short_first(limit: float, bonus: float):
     return order
 
 
-def plan_all_only(waiters, held, slots, moment, estimate):
+def plan_all_only(waiters, held, slots, moment, estimate, settings):
     """Backfill around an all-slot waiter only; any other waiter that does not fit keeps the window order."""
-    first = sf.plan(waiters, held, slots, moment, "window")
+    first = sf.plan(waiters, held, slots, moment, "window", settings=settings)
     if not any(e["count"] >= slots for e in waiters):
         return first
-    backfill = sf.plan(waiters, held, slots, moment, "backfill", estimate)
+    backfill = sf.plan(waiters, held, slots, moment, "backfill", estimate, settings=settings)
     if backfill.head is not None and backfill.head["count"] >= slots:
         return backfill
     return first
@@ -209,14 +209,16 @@ class Replay:
         return None if found is None else found * bias
 
     def decide(self, waiting: list[dict], held: list[dict], moment: float) -> list[dict]:
+        """The grants of the policy's order with its settings (the queue's defaults, and what it changes)."""
         name = self.policy["order"]
+        settings = {**sf.ORDER_DEFAULTS, **self.policy.get("settings", {})}
         if name == "all-only":
-            return plan_all_only(waiting, held, self.slots, moment, self.estimate).grants
+            return plan_all_only(waiting, held, self.slots, moment, self.estimate, settings).grants
         if name.startswith("short"):
             ordered = self.policy["reorder"](waiting, self.estimate)
             inner = "backfill" if name == "short+backfill" else "window"
-            return sf.plan(ordered, held, self.slots, moment, inner, self.estimate).grants
-        return sf.plan(waiting, held, self.slots, moment, name, self.estimate).grants
+            return sf.plan(ordered, held, self.slots, moment, inner, self.estimate, settings=settings).grants
+        return sf.plan(waiting, held, self.slots, moment, name, self.estimate, settings=settings).grants
 
     def simulate(self) -> list[dict]:
         environment = {k: os.environ.get(k) for k in self.policy.get("env", {})}
@@ -328,8 +330,8 @@ POLICIES = {
     "fifo (window 0)": {"order": "window", "env": {"SLOTFATHER_OVERTAKE_WINDOW": "0"}},
     "backfill (shipped)": {"order": "backfill", "env": WINDOW},
     "backfill, no window": {"order": "backfill", "env": {"SLOTFATHER_OVERTAKE_WINDOW": "0"}},
-    "backfill, safety 1.5": {"order": "backfill", "env": {**WINDOW, "SLOTFATHER_BACKFILL_SAFETY": "1.5"}},
-    "backfill, no head limit": {"order": "backfill", "env": {**WINDOW, "SLOTFATHER_BACKFILL_LIMIT": "0"}},
+    "backfill, safety 1.5": {"order": "backfill", "env": WINDOW, "settings": {"safety": 1.5}},
+    "backfill, no head limit": {"order": "backfill", "env": WINDOW, "settings": {"limit": 0}},
     "backfill, -n all only": {"order": "all-only", "env": WINDOW},
     "short class + window": {"order": "short", "reorder": short_first(300, 1800), "env": WINDOW},
     "short class + backfill": {"order": "short+backfill", "reorder": short_first(300, 1800), "env": WINDOW},
@@ -337,7 +339,7 @@ POLICIES = {
     "backfill, estimates x0.5": {"order": "backfill", "bias": 0.5, "env": WINDOW},
     "backfill, estimates x2": {"order": "backfill", "bias": 2.0, "env": WINDOW},
     "backfill, estimates noisy": {"order": "backfill", "noise": 1.0, "env": WINDOW},
-    "  same, no head limit": {"order": "backfill", "noise": 1.0, "env": {**WINDOW, "SLOTFATHER_BACKFILL_LIMIT": "0"}},
+    "  same, no head limit": {"order": "backfill", "noise": 1.0, "env": WINDOW, "settings": {"limit": 0}},
 }
 
 

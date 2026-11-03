@@ -6,8 +6,9 @@
   slotfather history [N]                                             the last N requests that left the queue
   slotfather stats [--since W] [--label L] [--by B] [--json]         what leases used and how full the machine was
   slotfather slots [N|reset]                                           show, save or reset shared capacity
-  slotfather available                                               slots a new request gets at once
-  slotfather advise [--max N] [--exclusive]                          a job count for the load, as JSON
+  slotfather available [--label L] [-- COMMAND...]                   slots a new request gets at once
+  slotfather advise [--max N] [--exclusive] [--label L] [-- CMD...]  a job count for the load, as JSON
+  slotfather order [backfill|window] [--safety X] [--limit S] ...    show, save or reset the queue's order
   slotfather [dashboard [--interval S | --once]]                     live view of capacity, leases and queue
 
 Run heavy builds and tests through `slotfather run -n <k> -- ...`: a test suite or build that keeps the
@@ -18,16 +19,16 @@ Slots: one per three cores, at least one, so `total = max(1, cores // 3)`: 4 on 
 SLOTFATHER_CORES replaces the core count. A request above the total takes every slot.
 
 Requests are served in arrival order. A waiter that does not fit lets later requests that fit start before it until
-it has waited SLOTFATHER_OVERTAKE_WINDOW seconds (default 600). Past that it is the head (#643, SLOTFATHER_QUEUE=
-backfill, the default): a later request that fits still starts first if, by the run times of earlier requests of its
-kind in the history, three times its expected run ends before the head can start (when the held leases are expected
-to end) and before the head has waited SLOTFATHER_BACKFILL_LIMIT seconds (default 2700). An all-slot request
-therefore starts at most that limit plus the longest run admitted meanwhile after it queued. SLOTFATHER_QUEUE=window
-restores the earlier order, where the head holds back everyone behind it. A process that already runs under a
-lease (SLOTFATHER_LEASE, or a holder among its ancestors) runs without a second lease, so nested wrappers neither
-deadlock nor count twice. A lease whose
-holder died (its pid gone, or reused by a process with another start time) is reaped by the next queue
-operation. While memory is short (free swap under SLOTFATHER_MIN_FREE_SWAP_MB, default 512, where swap is on; or the
+it has waited SLOTFATHER_OVERTAKE_WINDOW seconds (default 600). Past that it is the head (#643, the backfill order):
+a later request that fits still starts first if, by the run times of earlier requests of its kind in the history,
+three times its expected run ends before the head can start (when the held leases are expected to end) and before
+the head has waited 2700 s, its limit; past the limit nothing passes it. An all-slot request therefore starts at
+most the limit plus the overrun of what passed it. `slotfather order` shows and saves the order and these numbers
+for every client (order.json beside the queue); a client's environment can only tighten them, and
+SLOTFATHER_QUEUE=window falls back to the earlier order, where the head holds back everyone behind it. A process
+that already runs under a lease (SLOTFATHER_LEASE, or a holder among its ancestors) runs without a second lease, so
+nested wrappers neither deadlock nor count twice. A lease whose holder died (its pid gone, or reused by a process
+with another start time) is reaped by the next queue operation. While memory is short (free swap under SLOTFATHER_MIN_FREE_SWAP_MB, default 512, where swap is on; or the
 kernel's memory-pressure level at warning or above), new leases wait for running ones; with nothing running they
 start. A waiter checks its own entry every SLOTFATHER_POLL seconds (default 2) but looks over the queue, which runs
 ps, less often the longer nothing changes, up to SLOTFATHER_POLL_MAX (default 10); a release hands its slots on at
@@ -86,11 +87,16 @@ POLICIES = ("normal", "background", "bypass")
 TIMED_OUT = 75  # EX_TEMPFAIL
 POLL_MAX = 10  # seconds between a long waiter's full looks at the queue
 OVERTAKE_WINDOW = 600  # seconds a waiter that does not fit lets later requests that fit start first
-QUEUE_ORDERS = ("backfill", "window")  # SLOTFATHER_QUEUE; the first is the default
-BACKFILL_FALLBACK = 3600  # seconds a request with no run like it in the history is expected to run
-BACKFILL_SAFETY = 3.0  # a request passes the head only if this many times its estimate ends before the head starts
-BACKFILL_OVERRUN = 0.5  # a held lease past its estimate runs on for this share of what it has run
-BACKFILL_LIMIT = 2700  # seconds after the head queued from which nothing passes it, as in the window order (0: never)
+QUEUE_ORDERS = ("backfill", "window")  # `slotfather order`; the first is the default
+# The queue's order (order.json beside the queue, `slotfather order`; a client's environment may only tighten it):
+# safety: a request passes the head only if this many times its estimate ends before the head can start;
+# limit: seconds after the head queued from which nothing passes it, as in the window order (0: never);
+# fallback: seconds a request with no run like it in the history is expected to run;
+# overrun: a held lease past its estimate is expected to run on for this share of what it has run.
+ORDER_DEFAULTS = {"order": "backfill", "safety": 3.0, "limit": 2700.0, "fallback": 3600.0, "overrun": 0.5}
+ORDER_KNOBS = {"safety": ("BACKFILL_SAFETY", 1.0), "limit": ("BACKFILL_LIMIT", 0.0),
+               "fallback": ("BACKFILL_FALLBACK", 0.0), "overrun": ("BACKFILL_OVERRUN", 0.0)}  # variable, least
+SHELLS = ("sh", "bash", "zsh", "dash", "fish")
 ESTIMATE_RUNS = 20  # recent runs of a kind its estimate takes the median of
 ESTIMATE_BYTES = 1 << 20  # of the history's end (and of its rotated part) read for estimates
 HISTORY_MAX = 4 << 20  # bytes of history.jsonl; past it the file becomes history.jsonl.1, replacing the older one
@@ -733,14 +739,20 @@ def legacy_used(table: dict) -> int:
 
 def kind(command: str | None) -> str:
     """The kind of check a command is: its program's name and first argument; a comma list counts its items, a path
-    keeps its last part, an option keeps its name, and a short option value follows it."""
+    keeps its last part, an option keeps its name, and a short option value follows it. `env` and VAR=value before
+    the program go; a runner's `run` keeps what it runs (`bun run build`, `uv run pytest`), and a shell's `-c`
+    script is the kind of the script's command (`sh -c bun run build`)."""
     words = [w for w in (command or "").split()]
-    while words and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0]):
-        words.pop(0)  # VAR=value before the program
+    while words and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0]) or os.path.basename(words[0]) == "env"):
+        words.pop(0)  # env and VAR=value before the program
     if not words:
         return "?"
     found = [os.path.basename(words[0]) or words[0]]
     rest = words[1:]
+    if rest and found[0] in SHELLS and re.fullmatch(r"-[a-z]*c", rest[0]) and len(rest) > 1:
+        return f"{found[0]} {rest[0]} {kind(' '.join(rest[1:]))}"[:60]
+    if len(rest) > 1 and rest[0] == "run" and not rest[1].startswith("-"):
+        return f"{found[0]} run {os.path.basename(rest[1].rstrip('/')) or rest[1]}"[:60]
     if rest:
         first = rest[0]
         if first.startswith("-"):
@@ -766,18 +778,68 @@ def overtakable(entry: dict, moment: float | None = None) -> bool:
 
 # Ordering: which waiters start now (#643)
 
-def queue_order() -> str:
-    """SLOTFATHER_QUEUE: backfill (the default) or window, the order before #643; anything else is window."""
-    value = setting("QUEUE") or "backfill"
-    return value if value in QUEUE_ORDERS else "window"
-
-
-def number(name: str, default: float, low: float = 0.0) -> float:
-    """SLOTFATHER_<name> as a number of at least `low`; unset or not a number gives the default."""
+def order_settings(directory: Path | None = None) -> dict:
+    """The queue's order and backfill settings: order.json beside the queue (`slotfather order`), else
+    ORDER_DEFAULTS, with "saved" saying which. A client's environment only tightens them: SLOTFATHER_QUEUE=window
+    falls back to the window order, a higher SLOTFATHER_BACKFILL_SAFETY or _FALLBACK, a lower _OVERRUN and a lower
+    (nonzero) _LIMIT count; looser values are ignored, since every client's look grants for the whole queue. A file
+    that cannot be read gives the window order."""
+    found = dict(ORDER_DEFAULTS, saved=False)
     try:
-        return max(low, float(setting(name) or default))
-    except ValueError:
-        return default
+        data = json.loads(((directory or state_dir()) / "order.json").read_text())
+        found.update(checked_order(data), saved=True)
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, TypeError, AttributeError):
+        found.update(order="window", saved=True)
+    if setting("QUEUE") == "window":
+        found["order"] = "window"
+    for key, (name, least) in ORDER_KNOBS.items():
+        try:
+            value = float(setting(name) or "nan")
+        except ValueError:
+            continue
+        if not math.isfinite(value) or value < least:
+            continue
+        if key in ("safety", "fallback"):
+            found[key] = max(found[key], value)
+        elif key == "overrun":
+            found[key] = min(found[key], value)
+        elif value > 0:  # limit: 0 is no limit, the loosest
+            found[key] = value if not found[key] else min(found[key], value)
+    return found
+
+
+def checked_order(data) -> dict:
+    """Saved order settings, validated: raises ValueError for anything `slotfather order` would refuse."""
+    if not isinstance(data, dict) or set(data) - set(ORDER_DEFAULTS) or data.get("order", "backfill") not in \
+            QUEUE_ORDERS:
+        raise ValueError(f"not order settings: {data!r}")
+    found = {}
+    for key, value in data.items():
+        if key != "order":
+            least = ORDER_KNOBS[key][1]
+            if type(value) not in (int, float) or not math.isfinite(value) or value < least:
+                raise ValueError(f"{key} must be a number of at least {least:g}, not {value!r}")
+        found[key] = value
+    return found
+
+
+def save_order(values: dict | None, directory: Path | None = None) -> None:
+    """Publishes order settings for every client (None: back to the defaults); callers hold the queue lock."""
+    path = (directory or state_dir()) / "order.json"
+    if values is None:
+        path.unlink(missing_ok=True)
+        return
+    values = checked_order({k: v for k, v in values.items() if k in ORDER_DEFAULTS})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write(path, {k: values.get(k, ORDER_DEFAULTS[k]) if k == "order" else float(values.get(k, ORDER_DEFAULTS[k]))
+                 for k in ORDER_DEFAULTS})
+
+
+def queue_order() -> str:
+    """backfill (the default) or window, the order before #643."""
+    return order_settings()["order"]
 
 
 def family(label: str | None) -> str:
@@ -792,9 +854,9 @@ def family(label: str | None) -> str:
 
 class Estimates:
     """Run times of finished requests, for how long a request will run: the median of the last ESTIMATE_RUNS runs
-    of the closest kind that ran before (same label and command kind; same command kind; same label family and
-    command kind with a check list of about the same size; that kind under any label; same label; same family), or
-    None for a request like nothing before."""
+    of the closest kind that ran before (same label and command kind; same label family and command kind; the same
+    family with a check list of about the same size; the command kind under any label; about the same size under
+    any label; same label; same family), or None for a request like nothing before."""
 
     def __init__(self, runs=()):
         self.runs = {}
@@ -808,7 +870,8 @@ class Estimates:
             what = kind(command)
             # A list of checks keeps its size within a factor of two: 140 checks are not 4.
             rough = re.sub(r" \[(\d+)\]$", lambda m: f" [~{int(m[1]).bit_length()}]", what)
-            found += [("label", label, what), ("kind", what), ("family", family(label), rough), ("rough", rough)]
+            found += [("label", label, what), ("family", family(label), what), ("family", family(label), rough),
+                      ("kind", what), ("rough", rough)]
         return found + [("label", label), ("family", family(label))]
 
     def add(self, label: str | None, command: str | None, ran: float) -> None:
@@ -816,6 +879,15 @@ class Estimates:
             recent = self.runs.setdefault(key, [])
             recent.append(float(ran))
             del recent[:-ESTIMATE_RUNS]
+
+    def save(self) -> dict:
+        return {json.dumps(key): runs for key, runs in self.runs.items()}
+
+    @classmethod
+    def load(cls, saved: dict) -> "Estimates":
+        found = cls()
+        found.runs = {tuple(json.loads(key)): [float(v) for v in runs] for key, runs in saved.items()}
+        return found
 
     def of(self, label: str | None, command: str | None) -> float | None:
         for key in self.keys(label, command):
@@ -857,7 +929,9 @@ class Plan:
 def reserve(found: Plan, held: list[dict], slots: int, used: int, moment: float, estimate, fallback: float,
             overrun: float) -> int:
     """Sets the head's expected start: when, by the expected ends of what holds slots (`held` and the grants so
-    far), enough slots will be free for it. Returns the slots free then that the head will not need."""
+    far), enough slots will be free for it. Returns the slots spare then, those the head will not need even if the
+    leases expected to run on past its start are the largest ones (estimates are rough, and which lease ends first
+    is too)."""
     ends = []
     for entry in held + found.grants:
         granted = seconds(entry.get("granted"))
@@ -872,11 +946,15 @@ def reserve(found: Plan, held: list[dict], slots: int, used: int, moment: float,
         have, found.start = have + count, end
     if have < found.head["count"]:  # slots held in an earlier queue, whose end is unknown: nothing passes
         found.start = moment
-    return max(0, have - found.head["count"])
+        return 0
+    staying = sum(1 for end, _ in ends if end > found.start)
+    largest = sum(sorted((count for _, count in ends), reverse=True)[:staying])
+    other = used - sum(count for _, count in ends)  # held in an earlier queue
+    return max(0, min(have, slots - other - largest) - found.head["count"])
 
 
 def plan(waiters: list[dict], held: list[dict], slots: int, moment: float, order: str | None = None,
-         estimate=None, other: int = 0, reserve_head: bool = False) -> Plan:
+         estimate=None, other: int = 0, reserve_head: bool = False, settings: dict | None = None) -> Plan:
     """Which of `waiters` (queue order) start now beside `held` (entries; `other` slots more held without one) on
     `slots` slots at epoch `moment`. `estimate(entry)` is its expected run in seconds or None (unknown).
 
@@ -884,19 +962,18 @@ def plan(waiters: list[dict], held: list[dict], slots: int, moment: float, order
     SLOTFATHER_OVERTAKE_WINDOW, then holds back everyone behind it.
 
     backfill: the same within the window; the first waiter past it that does not fit is the head. Its start is
-    reserved: the moment enough slots will be free, from the expected ends of the held leases. A later waiter
-    that fits starts before the head only when SLOTFATHER_BACKFILL_SAFETY times its expected run ends by then
-    and the head has waited less than SLOTFATHER_BACKFILL_LIMIT, or when it takes only slots the head will not
-    need at that moment. An unknown run counts SLOTFATHER_BACKFILL_FALLBACK seconds; a held lease past its
-    expected run is expected to run on for SLOTFATHER_BACKFILL_OVERRUN times what it has run so far. The head's
-    start is worked out only when a request behind it fits, or with `reserve_head`."""
-    order = order or queue_order()
+    reserved: the moment enough slots will be free, from the expected ends of the held leases. Until the head has
+    waited `limit` seconds, a later waiter that fits starts before it when `safety` times its expected run ends by
+    the head's start and by that limit, or when it takes only slots the head will not need then (reserve()); past
+    the limit nothing passes. An unknown run counts `fallback` seconds; a held lease past its expected run is
+    expected to run on for `overrun` times what it has run so far. `settings` are order_settings() unless given;
+    `order` overrides theirs. The head's start is worked out only when a request behind it fits, or with
+    `reserve_head`."""
+    settings = settings or order_settings()
+    order = order or settings["order"]
     estimate = estimate or (lambda entry: None)
     window = overtake_window()
-    fallback = number("BACKFILL_FALLBACK", BACKFILL_FALLBACK)
-    safety = number("BACKFILL_SAFETY", BACKFILL_SAFETY, 1.0)
-    overrun = number("BACKFILL_OVERRUN", BACKFILL_OVERRUN)
-    limit = number("BACKFILL_LIMIT", BACKFILL_LIMIT)
+    fallback, safety, overrun, limit = (settings[key] for key in ("fallback", "safety", "overrun", "limit"))
     found = Plan()
     used = sum(e["count"] for e in held) + other
     extra = None  # slots free at the head's start that it does not need; reserved once a request behind it fits
@@ -908,6 +985,8 @@ def plan(waiters: list[dict], held: list[dict], slots: int, moment: float, order
             if extra is None:
                 extra = reserve(found, held, slots, used, moment, estimate, fallback, overrun)
             deadline = (seconds(found.head.get("since")) or moment) + limit if limit else math.inf
+            if moment >= deadline:
+                continue  # the head has waited the limit: it holds back everyone behind it
             run = estimate(entry)
             run = fallback if run is None else run
             if moment + run * safety <= min(found.start, deadline):
@@ -942,17 +1021,19 @@ def plan(waiters: list[dict], held: list[dict], slots: int, moment: float, order
     return found
 
 
-def room(waiters: list[dict], free: int, held: list[dict] | None = None, estimate=None, other: int = 0) -> int:
-    """The slots a new request of unknown run gets at once behind `waiters` with `free` slots unheld, as grant()
-    admits it. Without `held` (the entries holding slots; `other` slots more held without one), the window
-    order's answer."""
+def room(waiters: list[dict], free: int, held: list[dict] | None = None, estimate=None, other: int = 0,
+         settings: dict | None = None, label: str = "", command: str = "") -> int:
+    """The slots a new request gets at once behind `waiters` with `free` slots unheld, as grant() admits it: one
+    for `command` under `label`, whose run the estimates know, or else one of unknown run (the fallback). Without
+    `held` (the entries holding slots; `other` slots more held without one), the window order's answer."""
     slots = free + sum(e["count"] for e in held or ()) + other
     moment = time.time()
-    order = queue_order() if held is not None else "window"
+    settings = settings or order_settings()
+    order = settings["order"] if held is not None else "window"
     for count in range(free, 0, -1):
-        probe = {"count": count, "label": "", "cmd": "", "since": now()}
+        probe = {"count": count, "label": label, "cmd": command, "since": now()}
         if any(entry is probe for entry in plan(waiters + [probe], held or [], slots, moment, order, estimate,
-                                                         other).grants):
+                                                         other, settings=settings).grants):
             return count
     return 0
 
@@ -960,21 +1041,39 @@ def room(waiters: list[dict], free: int, held: list[dict] | None = None, estimat
 _estimates = {}  # history files' (size, mtime) -> Estimates, so a waiter's repeated looks read the history once
 
 
+def cached_estimates(directory: Path) -> Estimates:
+    """history_estimates(), kept in this process and in estimates.json beside the history, both keyed by the
+    history files' size and modification time: a new process, a release or `available` reads the small file
+    instead of the history until the history changes."""
+    path = directory / "history.jsonl"
+    stamp = []
+    for part in (path.with_name(path.name + ".1"), path):
+        with contextlib.suppress(OSError):
+            info = part.stat()
+            stamp.append([part.name, info.st_size, info.st_mtime_ns])
+    key = json.dumps(stamp)
+    if key in _estimates:
+        return _estimates[key]
+    cache = directory / "estimates.json"
+    found = None
+    with contextlib.suppress(OSError, ValueError, TypeError, AttributeError, KeyError):
+        saved = json.loads(cache.read_text())
+        if saved["stamp"] == stamp:
+            found = Estimates.load(saved["runs"])
+    if found is None:
+        found = history_estimates(directory)
+        with contextlib.suppress(OSError):
+            write(cache, {"stamp": stamp, "runs": found.save()})
+    _estimates.clear()
+    _estimates[key] = found
+    return found
+
+
 def estimator(directory: Path):
-    """estimate(entry) from the history, read only when plan() first asks (a head waits and a later request fits),
-    and again only once the history has changed."""
+    """estimate(entry) from cached_estimates(), read only when plan() first asks (a head waits and a later
+    request fits)."""
     def estimate(entry: dict) -> float | None:
-        path = directory / "history.jsonl"
-        stamp = []
-        for part in (path.with_name(path.name + ".1"), path):
-            with contextlib.suppress(OSError):
-                info = part.stat()
-                stamp.append((str(part), info.st_size, info.st_mtime_ns))
-        stamp = tuple(stamp)
-        if stamp not in _estimates:
-            _estimates.clear()
-            _estimates[stamp] = history_estimates(directory)
-        return _estimates[stamp].of(entry.get("label"), entry.get("cmd"))
+        return cached_estimates(directory).of(entry.get("label"), entry.get("cmd"))
     return estimate
 
 
@@ -1025,16 +1124,16 @@ def status_lines(directory: Path | None = None) -> list[str]:
     return lines + [f"{used} of {total()} slots held"]
 
 
-def available(directory: Path | None = None) -> int:
-    """How many slots a new request of unknown run would get at once: the free ones less what waiters take first,
-    or none while a waiter past the overtaking window holds back everyone behind it (backfill: unless the
-    request would end before that waiter can start)."""
+def available(directory: Path | None = None, label: str = "", command: str = "") -> int:
+    """How many slots a new request would get at once: the free ones less what waiters take first, or none while a
+    waiter past the overtaking window holds back everyone behind it, unless (backfill) the request is expected to
+    end before that waiter can start. Without `command` its run counts as unknown (the fallback)."""
     directory = directory or state_dir()
     live, legacy, _ = snapshot(directory)
     held = [e for e in live if e["state"] == "held"]
     other = sum(count for _, _, count in legacy)
     return room([e for e in live if e["state"] != "held"], max(0, total() - sum(e["count"] for e in held) - other),
-                held, estimator(directory), other)
+                held, estimator(directory), other, label=label, command=command)
 
 
 # Sizing
@@ -1058,9 +1157,10 @@ def size(maximum: int, cores: int, total: int, averages: tuple[float, float, flo
 
 
 def advise(maximum: int | None = None, exclusive: bool = False, cores_now: int | None = None,
-           averages: tuple[float, float, float] | None = None) -> dict:
+           averages: tuple[float, float, float] | None = None, label: str = "", command: str = "") -> dict:
     """size() for the queue as it is now: slots held by others (the caller's own lease is not one) and
-    whether a request waits."""
+    whether a request waits, a request for `command` under `label` when given (else one of unknown run), with
+    "run_estimate", the run the history expects of it (None: unknown, counted as the fallback)."""
     live, legacy, table = snapshot()
     mine = inherited_lease(table)
     holders = [e for e in live if e["state"] == "held" and not (mine and e["pid"] == mine[1]["pid"])]
@@ -1068,9 +1168,13 @@ def advise(maximum: int | None = None, exclusive: bool = False, cores_now: int |
     held = sum(e["count"] for e in holders) + other
     slots = total()
     waiters = [e for e in live if e["state"] != "held"]
-    waiting = bool(waiters) and room(waiters, max(0, slots - held), holders, estimator(state_dir()), other) == 0
-    return size(maximum or slots, cores_now or cores(), slots, averages or loads(), min(held, slots), waiting,
-                exclusive)
+    estimate = estimator(state_dir())
+    waiting = bool(waiters) and room(waiters, max(0, slots - held), holders, estimate, other, label=label,
+                                     command=command) == 0
+    found = size(maximum or slots, cores_now or cores(), slots, averages or loads(), min(held, slots), waiting,
+                 exclusive)
+    found["run_estimate"] = estimate({"label": label, "cmd": command}) if command else None
+    return found
 
 
 # Leases
@@ -1302,7 +1406,9 @@ def dashboard(argv: list[str]) -> int:
 
 USAGE = ("usage: slotfather                     (in a terminal: the live dashboard)\n"
          "       slotfather run [-n N|all] [--label L] [--wait SECONDS] [--] COMMAND...\n"
-         "       slotfather status | available | history [N] | advise [--max N] [--exclusive]\n"
+         "       slotfather status | history [N] | available [--label L] [-- COMMAND...]\n"
+         "       slotfather advise [--max N] [--exclusive] [--label L] [-- COMMAND...]\n"
+         "       slotfather order [backfill|window] [--safety X] [--limit S] [--fallback S] [--overrun X] | reset\n"
          "       slotfather stats [--since WHEN] [--label GLOB] [--by both|label|kind] [--top N] [--json]\n"
          "       slotfather slots [N|reset]\n"
          "       slotfather dashboard [--interval SECONDS] | dashboard --once [--width N] [--height N] [--color]")
@@ -1341,16 +1447,75 @@ def run_command(argv: list[str]) -> int:
     return run(count, label, argv, wait)
 
 
-def advise_command(argv: list[str]) -> int:
-    maximum, exclusive = None, False
+def request_options(argv: list[str], what: str, flags: dict) -> tuple[dict, str, str]:
+    """`flags` (option -> takes a value) and then `[--label L] [-- COMMAND...]`: (options, label, command). The
+    label defaults to the directory's name, as for run."""
+    found, label, command = {}, os.path.basename(os.getcwd()), ""
     while argv:
-        if argv[0] == "--max" and len(argv) > 1:
-            maximum, argv = parse_count(argv[1]), argv[2:]
-        elif argv[0] == "--exclusive":
-            exclusive, argv = True, argv[1:]
+        if argv[0] == "--":
+            command = " ".join(argv[1:])
+            break
+        if argv[0] in ("-l", "--label") and len(argv) > 1:
+            label, argv = argv[1], argv[2:]
+        elif argv[0] in flags and (not flags[argv[0]] or len(argv) > 1):
+            found[argv[0]] = argv[1] if flags[argv[0]] else True
+            argv = argv[2:] if flags[argv[0]] else argv[1:]
         else:
-            raise SlotError(f"unknown advise option {argv[0]}")
-    print(json.dumps(advise(maximum, exclusive), sort_keys=True))
+            raise SlotError(f"unknown {what} option {argv[0]}")
+    return found, label, command
+
+
+def advise_command(argv: list[str]) -> int:
+    found, label, command = request_options(argv, "advise", {"--max": True, "--exclusive": False})
+    maximum = parse_count(found["--max"]) if "--max" in found else None
+    print(json.dumps(advise(maximum, "--exclusive" in found, label=label, command=command), sort_keys=True))
+    return 0
+
+
+def available_command(argv: list[str]) -> int:
+    _, label, command = request_options(argv, "available", {})
+    print(available(label=label, command=command))
+    return 0
+
+
+def order_line(found: dict) -> str:
+    return (f"{found['order']}: safety {found['safety']:g}, limit {found['limit']:g} s, fallback "
+            f"{found['fallback']:g} s, overrun {found['overrun']:g} ({'saved' if found['saved'] else 'default'})")
+
+
+def order_command(argv: list[str]) -> int:
+    """`slotfather order [backfill|window] [--safety X] [--limit S] [--fallback S] [--overrun X] | reset`."""
+    directory = state_dir()
+    changes, reset = {}, False
+    while argv:
+        word = argv.pop(0)
+        if word in QUEUE_ORDERS:
+            changes["order"] = word
+        elif word == "reset" and not changes:
+            reset = True
+        elif word.startswith("--") and word[2:] in ORDER_KNOBS and argv:
+            try:
+                changes[word[2:]] = float(argv.pop(0))
+            except ValueError:
+                raise SlotError(f"{word} takes a number") from None
+        else:
+            raise SlotError(f"order takes backfill or window, --safety, --limit, --fallback, --overrun, or reset; "
+                            f"not {word!r}")
+    if reset and changes:
+        raise SlotError("order reset takes nothing else")
+    if changes or reset:
+        with locked(directory):
+            saved = dict(ORDER_DEFAULTS)  # what is saved, without this client's environment
+            with contextlib.suppress(OSError, ValueError, TypeError, AttributeError):
+                saved.update(checked_order(json.loads((directory / "order.json").read_text())))
+            values = None if reset else {**saved, **changes}
+            try:
+                save_order(values, directory)
+            except ValueError as error:
+                raise SlotError(str(error)) from None
+            except OSError as error:
+                raise SlotError(f"cannot save the order: {error}") from None
+    print(order_line(order_settings(directory)))
     return 0
 
 
@@ -1396,9 +1561,10 @@ def main(argv: list[str] | None = None) -> int:
         if command == "history" and (not rest or (len(rest) == 1 and rest[0].isdigit())):
             print("\n".join(history_lines(int(rest[0]) if rest else 20)))
             return 0
-        if command == "available" and not rest:
-            print(available())
-            return 0
+        if command == "available":
+            return available_command(rest)
+        if command == "order":
+            return order_command(rest)
         if command == "advise":
             return advise_command(rest)
         if command == "dashboard":
