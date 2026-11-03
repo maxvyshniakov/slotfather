@@ -164,6 +164,29 @@ class BackfillTests(PlanCase):
         self.assertEqual(("pair", M + 3000), (found.head["label"], found.start))
         self.assertEqual(["smoke"], [e["label"] for e in found.grants], "slots pair will not need at its start")
 
+    def test_a_head_past_its_limit_keeps_its_head_whatever_its_wait(self):
+        # Review of d1cccbe: past the limit nothing passes, as it always did; a 7200 s job must not take the slot of
+        # a lease that, unknown to the history, really ends in five minutes.
+        self.settings["limit"] = sf.ORDER_DEFAULTS["limit"]
+        held = [holder("one", 1, -300)]  # no history: the fallback
+        big = dict(waiter("big", 6, -2800), until=stamp(1000))
+        self.assertEqual([], self.started([big, waiter("long", 1, -10)], held, long=7200))
+
+    def test_a_head_keeps_its_head_while_a_held_lease_has_no_known_run(self):
+        held = [holder("one", 1, -300)]  # no history: it may end any moment
+        big = dict(waiter("big", 6, -700), until=stamp(1000))
+        self.assertEqual([], self.started([big, waiter("long", 1, -10)], held, long=7200))
+
+    def test_a_head_is_demoted_only_if_even_the_expected_runs_without_overrun_end_after_it_gives_up(self):
+        # `one` should have ended 2400 s ago: by the overrun it runs on for 1500 s more, but it may end any moment.
+        held = [holder("one", 1, -3000)]
+        big = dict(waiter("big", 6, -700), until=stamp(1000))
+        self.assertEqual([], self.started([big, waiter("long", 1, -10)], held, one=600, long=7200))
+        held = [holder("one", 1, -600), holder("two", 2, -100)]  # one ends in 3000 s, two in 100 s
+        self.assertEqual(["long"], self.started([big, waiter("long", 1, -10)], held, one=3600, two=200, long=7200))
+        self.assertEqual([], self.started([dict(big, until=stamp(3001)), waiter("long", 1, -10)], held, one=3600,
+                                          two=200, long=7200))
+
     def test_a_lease_back_in_the_queue_after_a_yield_keeps_its_head(self):
         """Its `until` was its first wait's: it does not give up now."""
         back = dict(holder("gate", 6, -3000), state="waiting", until=stamp(-2000), yields=1,
@@ -409,6 +432,9 @@ class OrderTests(SlotCase):
         self.started("gate")
         self.release("gate")
         self.finish(gate)
+        lines = [json.loads(line) for line in (self.state / "history.jsonl").read_text().splitlines()]
+        self.assertEqual([until], [sf.seconds(line.get("until")) for line in lines if line["label"] == "gate"])
+        self.assertEqual([None], [line.get("until") for line in lines if line["label"] == "short" and line.get("v")])
 
     def test_available_and_advise_answer_for_the_callers_command_when_it_is_given(self):
         one, gate = self.gate_behind_one()

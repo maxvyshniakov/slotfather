@@ -193,6 +193,21 @@ class TraceTests(unittest.TestCase):
         self.assertEqual([300.0], run.estimates.runs[("label", "ci")])
         self.assertIsNone(run.estimates.of("orphan", None))
 
+    def test_a_family_that_ever_gave_up_waits_at_most_its_longest_give_up(self):
+        items = [self.history("lane-1-alone", 6, "10:00:00", None, "10:30:00", 31, outcome="left"),
+                 self.history("lane-2-tests", 1, "10:00:00", None, "10:10:00", 32, outcome="left"),
+                 self.history("lane-3", 1, "10:00:00", "10:20:00", "10:40:00", 33),
+                 self.history("lane-4", 1, "10:00:00", "10:50:00", "11:00:00", 34),  # waited longer: no wait
+                 self.history("sid-kit", 1, "10:00:00", "10:00:00", "10:01:00", 35)]
+        items.append({**self.history("post-merge-5", 1, "10:00:00", "10:00:00", "10:05:00", 36),
+                      "until": "2026-11-02T10:10:00Z"})  # recorded since `until` is in the history
+        (self.dir / "history.jsonl").write_text("".join(json.dumps(i) + "\n" for i in items))
+        found = replay.family_patience(replay.requests(self.dir, sf.seconds("2026-11-02T12:00:00Z")))
+        start = sf.seconds("2026-11-02T10:00:00Z")
+        self.assertEqual({"lane-1-alone": 1800, "lane-2-tests": 600, "lane-3": 1800, "lane-4": None, "sid-kit": None,
+                          "post-merge-5": 600},
+                         {r["label"]: None if r.get("give_up") is None else r["give_up"] - start for r in found})
+
     def test_a_long_request_does_not_take_a_slot_the_head_needs_when_leases_end_out_of_order(self):
         # #643 review: x and z were expected to end within ten minutes and y in two hours, so by the expected order
         # one slot was spare for `long`; y ends early and z overruns, and the head would have waited for z.

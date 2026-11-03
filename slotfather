@@ -1039,6 +1039,8 @@ def record(directory: Path, entry: dict, outcome: str, status: int | None = None
         yielded = float(entry.get("yielded") or 0)
         away = epoch(entry.get("yielded_at"))
         item.update(yields=int(entry["yields"]), yielded=round(yielded + (max(0.0, ended - away) if away else 0), 2))
+    if entry.get("until"):
+        item["until"] = entry["until"]  # when its client would have given up (run --wait): the replay's patience
     meta = meta_of(entry)
     if meta:
         item["meta"] = meta
@@ -1452,6 +1454,28 @@ def reserve(found: Plan, held: list[dict], slots: int, used: int, moment: float,
     return max(0, min(have, slots - other - largest) - found.head["count"])
 
 
+def soonest_start(count: int, holding: list[dict], slots: int, used: int, moment: float, estimate) -> float | None:
+    """The earliest moment `count` slots can be free if each lease in `holding` ends when its expected run does,
+    with no overrun (one past its expected run may end any moment). None when that is unknown: a lease whose run
+    the history does not know (it may end any moment too), or slots held in an earlier queue. reserve() is the
+    cautious counterpart, for what may pass a head; this one is for whether a waiter can start at all before its
+    client gives up."""
+    ends = []
+    for entry in holding:
+        run = estimate(entry)
+        if run is None:
+            return None
+        granted = seconds(entry.get("granted"))
+        ran = 0.0 if granted is None else max(0.0, moment - granted - float(entry.get("yielded") or 0))
+        ends.append((moment + max(0.0, run - ran), entry["count"]))
+    have, start = max(0, slots - used), moment
+    for end, size in sorted(ends):
+        if have >= count:
+            break
+        have, start = have + size, end
+    return start if have >= count else None
+
+
 def fit(waiters: list[dict], slots: int) -> list[dict]:
     """Makes each waiter ask for at most the capacity `slots`, and an `-n all` one (its entry's `all`) for exactly
     it: a capacity that shrank under a waiter (a memory budget when a VM's balloon takes memory) would otherwise
@@ -1478,10 +1502,11 @@ def plan(waiters: list[dict], held: list[dict], slots: int, moment: float, order
     waited `limit` seconds, a later waiter that fits starts before it when `safety` times its expected run ends by
     the head's start and by that limit, or when it takes only slots the head will not need then (reserve()); past
     the limit nothing passes. An unknown run counts `fallback` seconds; a held lease past its expected run is
-    expected to run on for `overrun` times what it has run so far. A waiter whose client gives up before its
-    reserved start (its entry's `until`, from `run --wait`) is no head: it would leave without running, so it holds
-    nobody back. `settings` are order_settings() unless given; `order` overrides theirs. The head's start is worked
-    out only when a request behind it fits, or with `reserve_head`."""
+    expected to run on for `overrun` times what it has run so far. A waiter whose client gives up (its entry's
+    `until`, from `run --wait`) before it has waited `limit` and before even the held leases' expected runs,
+    without overrun, free its slots (soonest_start(); unknown runs keep it the head) is no head: it would leave
+    without running, so it holds nobody back. `settings` are order_settings() unless given; `order` overrides
+    theirs. The head's start is worked out only when a request behind it fits, or with `reserve_head`."""
     settings = settings or order_settings()
     order = order or settings["order"]
     estimate = estimate or (lambda entry: None)
@@ -1528,12 +1553,14 @@ def plan(waiters: list[dict], held: list[dict], slots: int, moment: float, order
         elif not passable:
             found.head = entry
             gives_up = None if entry.get("granted") else seconds(entry.get("until"))
-            if gives_up is not None:
-                reserve(found, held, slots, used, moment, estimate, fallback, overrun)
-                if found.start > gives_up:
-                    # Its client gives up before the slots it needs are expected free: holding the others back
-                    # for it would only leave slots idle until it leaves without running.
-                    found.head = found.start = None
+            began = seconds(entry.get("since"))
+            if gives_up is not None and began is not None and (not limit or moment < began + limit):
+                soonest = soonest_start(entry["count"], held + found.grants, slots, used, moment, estimate)
+                if soonest is not None and soonest > gives_up:
+                    # Its client gives up before the slots it needs can be free even if every held lease ends
+                    # when its kind usually does: holding the others back would only leave slots idle until it
+                    # leaves without running. Past its limit it is the head whatever its wait, as before.
+                    found.head = None
                     clock = time.strftime("%H:%M:%S", time.localtime(gives_up))
                     found.reason = found.reason or (f"{free} of {slots} slots free; {entry['label']} gives up at "
                                                     f"{clock}, before they are expected, so requests that fit pass it")

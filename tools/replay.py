@@ -104,7 +104,9 @@ def requests(directory: Path, moment: float) -> list[dict]:
         request = {"label": item.get("label"), "cmd": item.get("cmd"), "count": item["count"], "arrival": arrival,
                    "run": item.get("ran") if granted is not None else None,
                    "patience": item.get("waited") if granted is None else None,
-                   "waited": item.get("waited"), "source": "history", "outcome": item.get("outcome")}
+                   "waited": item.get("waited"), "source": "history", "outcome": item.get("outcome"),
+                   "give_up": sf.seconds(item.get("until")) or (arrival + item["waited"] if granted is None and
+                                                                isinstance(item.get("waited"), (int, float)) else None)}
         found.append(request)
         by_pid.setdefault(item.get("pid"), []).append((sf.seconds(item.get("ended")), request))
     start = min((r["arrival"] for r in found), default=moment)
@@ -334,12 +336,14 @@ class Replay:
                                    "state": "waiting", "meta": {"class": cls},
                                    "yieldable": yieldable(request, cls, self.slots)}
                 remaining[number] = self.run_of(request)
-                if request["patience"] is not None and request["source"] == "history" and \
-                        self.policy.get("until", True):
-                    # It gave up after its client's wait (run --wait), which the queue knows from its entry.
-                    waiting[number]["until"] = stamp(request["arrival"] + request["patience"])
-                if request["patience"] is not None:
-                    heapq.heappush(events, (moment + request["patience"], 1, order, "leave", number))
+                give_up = request.get("give_up")
+                if give_up is not None and self.policy.get("until", True):
+                    # Its client's wait (run --wait), which the queue knows from its entry.
+                    waiting[number]["until"] = stamp(give_up)
+                if give_up is None and request["patience"] is not None:
+                    give_up = request["arrival"] + request["patience"]
+                if give_up is not None:
+                    heapq.heappush(events, (give_up, 1, order, "leave", number))
                     order += 1
             elif kind == "leave":
                 if number in waiting:
@@ -350,7 +354,8 @@ class Replay:
                     continue  # it yielded before this end
                 entry = held.pop(number)
                 asked.pop(number, None)
-                if request.get("outcome") not in sf.UNFINISHED:  # as history_estimates() leaves them out
+                if request.get("outcome") not in sf.UNFINISHED or self.policy.get("reaped_estimates"):
+                    # history_estimates() leaves reaped leases out (before d9e5904 it counted them)
                     self.estimates.add(entry["label"], entry["cmd"], self.run_of(request))
                 result[number]["ended"] = moment
             elif kind == "yield":
@@ -471,6 +476,7 @@ POLICIES = {
     "fifo (window 0)": {"order": "window", "env": {"SLOTFATHER_OVERTAKE_WINDOW": "0"}},
     "backfill (shipped)": {"order": "backfill", "env": WINDOW},
     "  heads that give up hold on": {"order": "backfill", "env": WINDOW, "until": False},
+    "  installed (1708378)": {"order": "backfill", "env": WINDOW, "until": False, "reaped_estimates": True},
     "classes + yields (#643 shipped)": {"order": "backfill", "env": WINDOW, "settings": SHIPPED, "step": 300},
     "  classes only": {"order": "backfill", "env": WINDOW, "settings": CLASSES},
     "  yields only": {"order": "backfill", "env": WINDOW, "settings": {"yield_after": 120}, "step": 300},
@@ -523,11 +529,35 @@ def validate(requests: list[dict], results: list[dict], start: float, until: flo
             "within_60s": sum(e <= 60 for e in errors) / max(1, len(errors))}
 
 
+def family_patience(found: list[dict]) -> list[dict]:
+    """Gives every request a client wait as its family's (sf.family() of its label) longest recorded give-up, where
+    any request of that family gave up and the history has no `until` for it: lines before the history recorded
+    `until` do not say which requests had a wait, and taking only those that gave up as having one hides what a
+    head that gives up costs when it would not have. A request that waited longer than that in fact had no such
+    wait and keeps none."""
+    longest = {}
+    for request in found:
+        if request["source"] == "history" and request["patience"] is not None:
+            name = sf.family(request["label"])
+            longest[name] = max(longest.get(name, 0.0), float(request["patience"]))
+    for request in found:
+        patience = longest.get(sf.family(request["label"]))
+        if request["source"] == "log" or request.get("give_up") is not None or patience is None:
+            continue
+        if request["waited"] is not None and request["waited"] > patience:
+            continue
+        request["give_up"] = request["arrival"] + patience
+    return found
+
+
 def compare(directory: Path, moment: float, slots: int, policies: dict = POLICIES, seed_log: bool = True,
-            since: float | None = None, until: float | None = None) -> dict:
+            since: float | None = None, until: float | None = None, families: bool = False) -> dict:
     """Every order over the same requests; waits count for requests that arrived between `since` (default the first
-    request in the history) and `until` (default the last)."""
+    request in the history) and `until` (default the last). `families`: every request of a label family that ever
+    gave up waits at most that family's longest give-up (family_patience())."""
     found = requests(directory, moment)
+    if families:
+        family_patience(found)
     start = min((r["arrival"] for r in found if r["source"] == "history"), default=moment)
     until = max((r["arrival"] for r in found), default=moment) if until is None else until
     first = start if since is None else since
@@ -555,12 +585,12 @@ def report(summary: dict) -> str:
                      f"replayed {v['replayed_h']:.1f} h, mean abs error {v['mean_abs_error_s']:.0f} s, p90 "
                      f"{v['p90_abs_error_s']:.0f} s, {v['within_60s']:.0%} within 60 s")
     head = f"{'order':<32} {'total h':>7} {'mean s':>7} {'p90 s':>7} {'max s':>7} {'≥3 mean':>8} {'≥3 max':>7} " \
-           f"{'idle sh':>7} {'fit-idle':>8} {'held':>5}"
+           f"{'idle sh':>7} {'fit-idle':>8} {'held':>5} {'gave up':>7}"
     lines += ["", head]
     for name, m in summary["policies"].items():
         lines.append(f"{name:<32} {m['total_h']:>7.1f} {m['mean_s']:>7.0f} {m['p90_s']:>7.0f} {m['max_s']:>7.0f} "
                      f"{m['large_mean_s']:>8.0f} {m['large_max_s']:>7.0f} {m['idle_slot_h']:>7.1f} "
-                     f"{m['blocked_slot_h']:>8.1f} {m['held_mean']:>5.2f}")
+                     f"{m['blocked_slot_h']:>8.1f} {m['held_mean']:>5.2f} {m['never_ran']:>7}")
     counts = next(iter(summary["policies"].values()))["classes"]
     sizes = ", ".join(f"{n} {c['requests']}" for n, c in counts.items())
     lines += ["", f"by class ({sizes}; batch delay: its wait plus the time it yielded)",
@@ -581,6 +611,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--slots", type=int, help="capacity; default the saved or automatic one")
     parser.add_argument("--since", help="count waits of requests that arrived from then (ISO, UTC)")
     parser.add_argument("--until", help="... and until then")
+    parser.add_argument("--families", action="store_true",
+                        help="give every request of a label family that ever gave up that family's patience")
     parser.add_argument("--json", action="store_true")
     options = parser.parse_args(argv)
     directory = Path(options.dir).expanduser()
@@ -588,7 +620,7 @@ def main(argv: list[str] | None = None) -> int:
     os.environ["SLOTFATHER_DIR"] = str(directory)
     slots = options.slots or sf.total()
     summary = compare(directory, moment, slots, since=sf.seconds(options.since) if options.since else None,
-                      until=sf.seconds(options.until) if options.until else None)
+                      until=sf.seconds(options.until) if options.until else None, families=options.families)
     print(json.dumps(summary, indent=1) if options.json else report(summary))
     return 0
 
