@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """slotfather: one queue of leases on the machine's capacity, shared by every project and agent (#599).
 
-  slotfather run [-n N|all] [--label L] [--wait S] [--] COMMAND...   run COMMAND holding N slots (default 1)
-  slotfather status                                                  holders and waiters, in queue order
+  slotfather run [-n N|all] [--label L] [--meta K=V]... [--wait S] [--] COMMAND...
+                                                                     run COMMAND holding N slots (default 1)
+  slotfather status [--json [--pid PID]]                             holders and waiters, in queue order
   slotfather history [N]                                             the last N requests that left the queue
   slotfather stats [--since W] [--label L] [--by B] [--json]         what leases used and how full the machine was
   slotfather slots [N|reset]                                           show, save or reset shared capacity
@@ -115,6 +116,11 @@ ALL_NOTE = ("-n all holds every later request behind it until the whole machine 
             "command uses")
 # The variables a lease hands its command; a client may add its own prefix (Straylight's STRAYLIGHT_SLOT_).
 LEASE_ENV_PREFIXES = ["SLOTFATHER_"]
+# Lease metadata (#650, `run --meta key=value`): who asked and why (ticket, lane, phase, model, session ...), kept on
+# the queue entry and in the history. Keys are short lowercase words; values short printable text.
+META_KEY = re.compile(r"[a-z][a-z0-9_.-]{0,31}")
+META_VALUE_MAX = 200
+META_KEYS_MAX = 16
 
 
 class SlotError(Exception):
@@ -629,6 +635,9 @@ def record(directory: Path, entry: dict, outcome: str, status: int | None = None
     with contextlib.suppress(SlotError, OSError):
         item.update(cores=cores(), capacity=total())
     item.update(usage or {})
+    meta = meta_of(entry)
+    if meta:
+        item["meta"] = meta
     with contextlib.suppress(OSError):
         append_bounded(directory / "history.jsonl", json.dumps(item) + "\n", HISTORY_MAX)
 
@@ -717,8 +726,10 @@ def history_lines(limit: int, directory: Path | None = None) -> list[str]:
             wall = item.get("wall") or item.get("ran")
             cores_used = f"{item['cpu'] / wall:.1f} cores" if wall else f"{item['cpu']:.0f} s CPU"
             used = f" used {cores_used}, {item.get('rss_peak_mb', 0):.0f} MB"
+        meta = meta_of(item)
+        tags = f" meta={meta_text(meta)}" if meta else ""
         found.append(f"{when} {item.get('outcome')}: {item.get('count')} slot(s) {item.get('label')} waited "
-                     f"{waited}{ran}{status}{used} cmd={item.get('cmd')}")
+                     f"{waited}{ran}{status}{used}{tags} cmd={item.get('cmd')}")
     return found
 
 
@@ -768,6 +779,52 @@ def kind(command: str | None) -> str:
         else:
             found.append(os.path.basename(first.rstrip("/")) or first)
     return " ".join(found)[:60]
+
+
+def checked_meta(meta) -> dict[str, str]:
+    """Lease metadata, validated: raises SlotError for a key that is not a short lowercase word, a value that is
+    not short printable text, or too many keys."""
+    if meta is None:
+        return {}
+    if not isinstance(meta, dict):
+        raise SlotError("meta must be a mapping of key to value")
+    if len(meta) > META_KEYS_MAX:
+        raise SlotError(f"at most {META_KEYS_MAX} --meta keys")
+    found = {}
+    for key, value in meta.items():
+        if not isinstance(key, str) or not META_KEY.fullmatch(key):
+            raise SlotError(f"--meta key {key!r} must be a lowercase word (a-z, 0-9, _ . -), at most 32 characters")
+        if not isinstance(value, str) or len(value) > META_VALUE_MAX or not value.isprintable():
+            raise SlotError(f"--meta {key} takes printable text of at most {META_VALUE_MAX} characters")
+        found[key] = value
+    return found
+
+
+def parse_meta(pairs: list[str]) -> dict[str, str]:
+    """`key=value` words as lease metadata; a later key replaces an earlier one."""
+    found = {}
+    for pair in pairs:
+        key, equals, value = pair.partition("=")
+        if not equals:
+            raise SlotError(f"--meta takes key=value, not {pair!r}")
+        found[key] = value
+    return checked_meta(found)
+
+
+def meta_of(entry: dict) -> dict[str, str]:
+    """An entry's or history line's metadata: {} where it has none (an older client) or it is not a mapping of
+    text, as a foreign writer could leave."""
+    meta = entry.get("meta")
+    if not isinstance(meta, dict):
+        return {}
+    return {str(k): str(v) for k, v in meta.items() if isinstance(v, (str, int, float))}
+
+
+def meta_text(meta: dict) -> str:
+    """Metadata for one line: key=value pairs joined by commas, a value quoted where it holds a space, comma, quote
+    or equals sign."""
+    plain = re.compile(r'[^\s,="]+')
+    return ",".join(f"{k}={v if plain.fullmatch(v) else json.dumps(v)}" for k, v in meta.items())
 
 
 def overtakable(entry: dict, moment: float | None = None) -> bool:
@@ -1116,12 +1173,70 @@ def snapshot(directory: Path | None = None) -> tuple[list[dict], list[tuple[Path
 
 def status_lines(directory: Path | None = None) -> list[str]:
     live, legacy, _ = snapshot(directory)
-    lines = [f"{e['state']}: {e['count']} slot(s) {e['label']} pid={e['pid']} since={e['since']} cmd={e['cmd']}"
-             for e in live]
+    lines = []
+    for e in live:
+        meta = meta_of(e)
+        tags = f" meta={meta_text(meta)}" if meta else ""
+        lines.append(f"{e['state']}: {e['count']} slot(s) {e['label']} pid={e['pid']} since={e['since']}{tags} "
+                     f"cmd={e['cmd']}")
     lines += [f"legacy: {count} slot(s) {e.get('label')} pid={e.get('pid')} (earlier queue {path.parent.parent})"
               for path, e, count in legacy]
     used = sum(e["count"] for e in live if e["state"] == "held") + sum(count for _, _, count in legacy)
     return lines + [f"{used} of {total()} slots held"]
+
+
+def process_group(pid) -> int | None:
+    try:
+        return os.getpgid(pid)
+    except (OSError, TypeError):
+        return None
+
+
+def descendants(table: dict, pid) -> list[int]:
+    """`pid` and its live descendants, from a processes() table; [] when `pid` is not live."""
+    if pid not in table:
+        return []
+    children = {}
+    for child, (parent, _) in table.items():
+        children.setdefault(parent, []).append(child)
+    found, stack = [], [pid]
+    while stack:
+        here = stack.pop()
+        if here not in found:
+            found.append(here)
+            stack.extend(children.get(here, ()))
+    return sorted(found)
+
+
+def status_json(directory: Path | None = None, pid: int | None = None) -> dict:
+    """The queue for programs (`status --json`): every live entry with its lease id (the entry's name), the lease
+    path (what SLOTFATHER_LEASE holds), holder pid and process group, its live process tree and its metadata; with
+    `pid`, only the entries whose tree holds that process. A process that left the tree (launchd adopted it) still
+    carries SLOTFATHER_LEASE in its environment."""
+    directory = directory or state_dir()
+    table = processes()
+    with locked(directory):
+        live = reap(directory, table)
+    entries_found = []
+    for path, entry in live:
+        tree = descendants(table, entry.get("pid"))
+        item = {"id": path.stem, "lease": str(path), "state": entry.get("state"), "count": entry.get("count"),
+                "label": entry.get("label"), "pid": entry.get("pid"), "pgid": process_group(entry.get("pid")),
+                "start": entry.get("start"), "since": entry.get("since"), "granted": entry.get("granted"),
+                "cmd": entry.get("cmd"), "cwd": entry.get("cwd"), "meta": meta_of(entry), "tree": tree}
+        entries_found.append(item)
+    legacy = []
+    for path, entry, count in legacy_holders(table):
+        legacy.append({"id": path.stem, "lease": str(path), "state": "held", "count": count,
+                       "label": entry.get("label"), "pid": entry.get("pid"), "pgid": process_group(entry.get("pid")),
+                       "tree": descendants(table, entry.get("pid"))})
+    held = sum(e["count"] for e in entries_found if e["state"] == "held") + sum(e["count"] for e in legacy)
+    if pid is not None:
+        entries_found = [e for e in entries_found if pid in e["tree"]]
+        legacy = [e for e in legacy if pid in e["tree"]]
+    slots = total()
+    return {"v": 1, "slots": slots, "held": held, "free": max(0, slots - held), "entries": entries_found,
+            "legacy": legacy}
 
 
 def available(directory: Path | None = None, label: str = "", command: str = "") -> int:
@@ -1250,12 +1365,14 @@ def policy() -> str:
 
 
 def acquire(count: int | str, label: str, command: str = "", out=sys.stderr, wait: float | None = None,
-            note: str = "") -> Lease:
+            note: str = "", meta: dict | None = None) -> Lease:
     """Wait in the queue for `count` slots (at most the total); the lease is held by this process until released.
     Raises SlotTimeout, having left the queue, when `wait` seconds pass first. `note` follows the first word that
-    the request waits."""
+    the request waits. `meta` (key -> text) goes on the queue entry and the history line; a process that inherits
+    a lease keeps that lease's metadata and adds none."""
     if count != "all" and (type(count) is not int or count < 1):
         raise SlotError("count must be a positive integer or all")
+    meta = checked_meta(meta)
     if policy() == "bypass":
         return Lease(total())
     directory = state_dir()
@@ -1280,8 +1397,11 @@ def acquire(count: int | str, label: str, command: str = "", out=sys.stderr, wai
             sequence = 1
         sequence_file.write_text(str(sequence))
         path = directory / "queue" / f"{sequence:010d}-{me}.json"
-        write(path, {"pid": me, "start": table.get(me, (0, ""))[1], "count": count, "label": label,
-                     "cmd": command, "cwd": cwd, "since": now(), "state": "waiting"})
+        entry = {"pid": me, "start": table.get(me, (0, ""))[1], "count": count, "label": label, "cmd": command,
+                 "cwd": cwd, "since": now(), "state": "waiting"}
+        if meta:
+            entry["meta"] = meta  # older clients read past fields they do not know
+        write(path, entry)
     lease = Lease(count, path)
     deadline = None if wait is None else time.monotonic() + wait
     # A terminated waiter leaves the queue at once rather than at the next reap.
@@ -1330,11 +1450,11 @@ def terminate(signum, _frame):
     raise SystemExit(128 + signum)
 
 
-def run(count: int | str, label: str, argv: list[str], wait: float | None = None) -> int:
+def run(count: int | str, label: str, argv: list[str], wait: float | None = None, meta: dict | None = None) -> int:
     """Run argv under a lease of `count` slots; the command's exit status."""
     try:
         background = policy() == "background"
-        lease = acquire(count, label, " ".join(argv), wait=wait, note=ALL_NOTE if count == "all" else "")
+        lease = acquire(count, label, " ".join(argv), wait=wait, note=ALL_NOTE if count == "all" else "", meta=meta)
     except SlotTimeout as error:
         print(f"slot: {label}: {error}", file=sys.stderr)
         return TIMED_OUT
@@ -1405,8 +1525,8 @@ def dashboard(argv: list[str]) -> int:
 
 
 USAGE = ("usage: slotfather                     (in a terminal: the live dashboard)\n"
-         "       slotfather run [-n N|all] [--label L] [--wait SECONDS] [--] COMMAND...\n"
-         "       slotfather status | history [N] | available [--label L] [-- COMMAND...]\n"
+         "       slotfather run [-n N|all] [--label L] [--meta KEY=VALUE]... [--wait SECONDS] [--] COMMAND...\n"
+         "       slotfather status [--json [--pid PID]] | history [N] | available [--label L] [-- COMMAND...]\n"
          "       slotfather advise [--max N] [--exclusive] [--label L] [-- COMMAND...]\n"
          "       slotfather order [backfill|window] [--safety X] [--limit S] [--fallback S] [--overrun X] | reset\n"
          "       slotfather stats [--since WHEN] [--label GLOB] [--by both|label|kind] [--top N] [--json]\n"
@@ -1423,12 +1543,14 @@ def parse_count(value: str) -> int:
 
 
 def run_command(argv: list[str]) -> int:
-    count, label, wait = 1, os.path.basename(os.getcwd()), None
+    count, label, wait, pairs = 1, os.path.basename(os.getcwd()), None, []
     while argv:
         if argv[0] in ("-n", "--slots") and len(argv) > 1:
             count, argv = ("all" if argv[1] == "all" else parse_count(argv[1])), argv[2:]
         elif argv[0] in ("-l", "--label") and len(argv) > 1:
             label, argv = argv[1], argv[2:]
+        elif argv[0] == "--meta" and len(argv) > 1:
+            pairs, argv = pairs + [argv[1]], argv[2:]
         elif argv[0] == "--wait" and len(argv) > 1:
             try:
                 wait = float(argv[1])
@@ -1444,7 +1566,7 @@ def run_command(argv: list[str]) -> int:
             break
     if not argv:
         raise SlotError("no command to run")
-    return run(count, label, argv, wait)
+    return run(count, label, argv, wait, parse_meta(pairs))
 
 
 def request_options(argv: list[str], what: str, flags: dict) -> tuple[dict, str, str]:
@@ -1463,6 +1585,17 @@ def request_options(argv: list[str], what: str, flags: dict) -> tuple[dict, str,
         else:
             raise SlotError(f"unknown {what} option {argv[0]}")
     return found, label, command
+
+
+def status_command(argv: list[str]) -> int:
+    """`status --json [--pid PID]`."""
+    pid = None
+    if argv[:1] == ["--pid"] and len(argv) == 2 and argv[1].isdigit():
+        pid = int(argv[1])
+    elif argv:
+        raise SlotError("status takes --json and then optionally --pid PID")
+    print(json.dumps(status_json(pid=pid), sort_keys=True))
+    return 0
 
 
 def advise_command(argv: list[str]) -> int:
@@ -1558,6 +1691,8 @@ def main(argv: list[str] | None = None) -> int:
         if command == "status" and not rest:
             print("\n".join(status_lines()))
             return 0
+        if command == "status" and rest[:1] == ["--json"]:
+            return status_command(rest[1:])
         if command == "history" and (not rest or (len(rest) == 1 and rest[0].isdigit())):
             print("\n".join(history_lines(int(rest[0]) if rest else 20)))
             return 0

@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """slotfather-stats: what leases used and how full the machine was; `slotfather stats` runs it.
 
-  slotfather stats [--since WHEN] [--label GLOB] [--by both|label|kind] [--top N] [--json]
+  slotfather stats [--since WHEN] [--label GLOB] [--by both|label|kind|meta.KEY] [--top N] [--json]
 
 Reads history.jsonl (one line per request that left the queue; version 2 lines carry what a `run` used) and
 machine.jsonl (samples of the machine while leases ran), each with its rotated .1 part. WHEN is an age (90m, 36h,
 7d) or a local date or time (2026-11-02, 2026-11-02T15:00); GLOB matches labels (fnmatch). Requests group by label
-and by command kind, the program and its first argument (`bun run-browser-checks.mjs`, `verify.sh --checks [95]`):
+and by command kind, the program and its first argument (`bun run-browser-checks.mjs`, `verify.sh --checks [95]`),
+or by one key of the lease metadata (`--by meta.ticket`; requests without that key group under "-"):
 per group the median and 90th percentile of wait and run, and the cores used per slot held, CPU seconds over wall
 seconds times slots. The machine part gives the share of sampled time the one-minute load stood over the cores
 (more runnable threads than cores) and under them, the CPU busy share, and how often a slot's worth of cores sat
@@ -37,7 +38,7 @@ def load_core():
 sf = load_core()
 
 GAP = 60.0  # seconds; a longer gap between machine samples means no lease ran, and counts as this long
-USAGE = "usage: slotfather stats [--since WHEN] [--label GLOB] [--by both|label|kind] [--top N] [--json]"
+USAGE = "usage: slotfather stats [--since WHEN] [--label GLOB] [--by both|label|kind|meta.KEY] [--top N] [--json]"
 
 
 class StatsError(Exception):
@@ -207,12 +208,17 @@ def summarize(directory: Path | None = None, since: float | None = None, label: 
             continue
         items.append(item)
     groups = {}
+    meta_key = by[5:] if by.startswith("meta.") else None
     for item in items:
-        key = (item.get("label") if by != "kind" else None, kind(item.get("cmd")) if by != "label" else None)
+        if meta_key:
+            key = (sf.meta_of(item).get(meta_key), None)
+        else:
+            key = (item.get("label") if by != "kind" else None, kind(item.get("cmd")) if by != "label" else None)
         groups.setdefault(key, []).append(item)
     rows = []
     for (name, what), members in groups.items():
-        rows.append({"label": name, "kind": what, **usage_of(members)})
+        row = {"label": None, "kind": None, "meta": {meta_key: name}} if meta_key else {"label": name, "kind": what}
+        rows.append({**row, **usage_of(members)})
     rows.sort(key=lambda r: (-r["slot_hours"], -r["requests"]))
     try:
         capacity, saved = sf.capacity()
@@ -265,14 +271,22 @@ def report(summary: dict, top: int = 25) -> str:
     if h["busy_hours"]:
         lines.append(f"while any lease ran ({h['busy_hours']:.1f} h): {number(h['held_mean'])} slots held on average, "
                      f"every slot held {share(h['all_held'])} of the time")
-    width = max([len(str(r["label"] or "")) for r in summary["groups"][:top]] + [5])
+    meta_key = summary["by"][5:] if summary["by"].startswith("meta.") else None
+
+    def first(row) -> str:
+        if meta_key:
+            value = row["meta"].get(meta_key)
+            return "-" if value is None else str(value)
+        return str(row["label"])
+    title = summary["by"].upper() if meta_key else "LABEL"
+    width = max([len(first(r)) for r in summary["groups"][:top]] + [len(title)])
     width = min(width, 34)
     kinds = max([len(str(r["kind"] or "")) for r in summary["groups"][:top]] + [4])
     kinds = min(kinds, 40)
     head = []
     if summary["by"] != "kind":
-        head.append(f"{'LABEL':<{width}}")
-    if summary["by"] != "label":
+        head.append(f"{title:<{width}}")
+    if summary["by"] not in ("label",) and not meta_key:
         head.append(f"{'KIND':<{kinds}}")
     head.append(f"{'RUNS':>5} {'WAIT p50':>8} {'p90':>6} {'RUN p50':>7} {'p90':>6} {'SLOTS':>5} {'CORES':>5} "
                 f"{'PER SLOT':>8} {'PEAK MB':>7}")
@@ -280,8 +294,8 @@ def report(summary: dict, top: int = 25) -> str:
     for row in summary["groups"][:top]:
         cells = []
         if summary["by"] != "kind":
-            cells.append(f"{str(row['label'])[:width]:<{width}}")
-        if summary["by"] != "label":
+            cells.append(f"{first(row)[:width]:<{width}}")
+        if summary["by"] != "label" and not meta_key:
             cells.append(f"{str(row['kind'])[:kinds]:<{kinds}}")
         cells.append(f"{row['requests']:>5} {span(row['wait_p50']):>8} {span(row['wait_p90']):>6} "
                      f"{span(row['run_p50']):>7} {span(row['run_p90']):>6} {number(row['slots_p50'], 0):>5} "
@@ -322,7 +336,8 @@ def main(argv: list[str] | None = None) -> int:
                 since = parse_since(argv.pop(0))
             elif option == "--label" and argv:
                 label = argv.pop(0)
-            elif option == "--by" and argv and argv[0] in ("both", "label", "kind"):
+            elif option == "--by" and argv and (argv[0] in ("both", "label", "kind") or (
+                    argv[0].startswith("meta.") and sf.META_KEY.fullmatch(argv[0][5:]))):
                 by = argv.pop(0)
             elif option == "--top" and argv and argv[0].isdigit():
                 top = int(argv.pop(0))

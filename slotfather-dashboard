@@ -395,6 +395,7 @@ def dashboard_model() -> dict:
                 "rss": sum(p[2] for p in tree), "procs": len(tree),"key": (entry.get("pid"), entry.get("since")), "kind": kind, "count": count, "queue": queue,
                 "label": dashboard_text(entry.get("label", "")), "pid": entry.get("pid"),
                 "cmd": dashboard_text(entry.get("cmd", "")), "since": parse_utc(entry.get("since")),
+                "meta": dashboard_text(sf.meta_text(sf.meta_of(entry))),
                 "granted": parse_utc(entry.get("granted")), "passable": kind == "waiting" and sf.overtakable(entry),
                 "style": "warn" if kind == "waiting" else "legacy"}
 
@@ -633,6 +634,8 @@ def draw_detail(canvas: Canvas, y: int, x: int, height: int, width: int, model: 
                                        f"{span((moment - item['granted']).total_seconds())}", "text")]))
         facts.append(("memory", [(f"{megabytes(item['rss'] / 1024)} in {item['procs']} "
                                   f"process{'es' * (item['procs'] != 1)}", "text")]))
+    if item.get("meta"):
+        facts.append(("meta", [(item["meta"], "text")]))
     where = tilde(item["queue"] or cwd or "")
     room_for_path = inner - 10 - len(f"pid {item['pid']} · ")
     if text_width(where) > room_for_path > 1:
