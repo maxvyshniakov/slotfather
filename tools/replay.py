@@ -9,7 +9,10 @@ sequence) and the live queue (holders still running count as running until --now
 requests that gave up but start in a replay, are the median of their kind). Every order runs on the same requests
 in an event simulation: arrivals, ends, give-ups (a request that left the queue gives up after the wait it had)
 and a look every POLL seconds while anyone waits, as waiters do. The memory guard is ignored. `window` and
-`backfill` call the queue's own plan(); the other orders are written here and were not shipped. It prints the
+`backfill` call the queue's own plan(), and yields its yield_asks(); the other orders are written here and were
+not shipped. Recorded requests carry no class, so classify() gives one from the label and command, and yieldable()
+says whose client would yield (Straylight and Sid-Kit gates); an asked holder yields at the end of its step, a
+uniform time up to the policy's `step` seconds, and queues again with the rest of its run. It prints the
 current order's replay against the recorded waits, then per order the waits of the requests that arrived from
 --since (default the first request in the history) to --until, and the slot-hours idle meanwhile while someone
 waited, and while a waiter fitted the idle slots. Reads only; run it from a checkout.
@@ -157,16 +160,62 @@ def seed_runs(directory: Path, before: float) -> list[tuple]:
             if r["granted"] is not None and r["ended"] < before]
 
 
+# Classes for the replay: no recorded request carried one, so they come from its label and command
+
+SINGLE_TEST = re.compile(r"(--test-name-pattern|-p test_\S+\.py|\s-k\s|\S+::\S+)")
+TEST_RUNNERS = ("node --test", "npx vitest", "bunx vitest", "vitest", "bun test", "pytest", "cargo test")
+MEASURING = re.compile(r"measure|baseline|bench|profile|stress|repro|probe|-alone\b|mem\b")
+
+
+def classify(request: dict, slots: int) -> str:
+    """interactive: a pre-push check or a single test (one test file, a name pattern, one tool test); batch: a full
+    gate (verify with a check list of 50 or more, a post-merge smoke, Sid-Kit's verify.mjs, a lane check of an old
+    client, which ran full gates), and measurements (every slot, or a label that says so); normal otherwise."""
+    label, command = request.get("label") or "", request.get("cmd") or ""
+    what = sf.kind(command)
+    if "pre-push" in command or label.startswith("publish"):
+        return "interactive"
+    if request["count"] >= slots or MEASURING.search(label):
+        return "batch"
+    if SINGLE_TEST.search(command):
+        return "interactive"
+    words = command.split()
+    files = [w for w in words if re.search(r"\.(test|spec)\.[cm]?[jt]sx?$|(^|/)test[-_]\S+\.py$", w)]
+    if any(what.startswith(r) for r in TEST_RUNNERS) and len(files) == 1:
+        return "interactive"
+    if re.fullmatch(r"python3 (tools/)?test[-_]\S+\.py", what):
+        return "interactive"
+    checks = re.search(r"--checks \[(\d+)\]", what)
+    if (checks and int(checks[1]) >= 50) or "--suites" in what or "verify.mjs" in what:
+        return "batch"
+    family = sf.family(label)
+    if family in ("post-merge", "post-merge-pin-ui-libs", "ci-baseline-cold", "ci-baseline-warm"):
+        return "batch"
+    if family.startswith("lane") and not command:
+        return "batch"  # a lane check through Straylight's vendored client: its full gate
+    return "normal"
+
+
+def yieldable(request: dict, cls: str, slots: int) -> bool:
+    """Whether the request's client would implement the yield protocol: a batch gate of Straylight's verify or
+    Sid-Kit's verify.mjs, not a measurement (which must not be interrupted)."""
+    label = request.get("label") or ""
+    return cls == "batch" and request["count"] < slots and not MEASURING.search(label)
+
+
 # Orders written only here (rejected)
 
 def short_first(limit: float, bonus: float):
-    """A short class: a waiter expected to run under `limit` seconds queues as if it came `bonus` seconds earlier,
-    so long work that has waited longer than the bonus is still ahead of it (ageing)."""
+    """A short class by estimate: a waiter expected to run under `limit` seconds queues as if it came `bonus` seconds
+    earlier, so long work that has waited longer than the bonus is still ahead of it (ageing). Returns the waiters
+    in that order (for the window order, which serves them as given) and the bonus; under the backfill order the
+    short ones go to plan() as interactive, `bonus` seconds ahead."""
     def order(waiters, estimate):
-        def key(entry):
+        def short(entry):
             run = estimate(entry)
-            return sf.seconds(entry["since"]) - (bonus if run is not None and run <= limit else 0), entry["id"]
-        return sorted(waiters, key=key)
+            return run is not None and run <= limit
+        ordered = sorted(waiters, key=lambda e: (sf.seconds(e["since"]) - (bonus if short(e) else 0), e["id"]))
+        return [dict(e, meta={"class": "interactive" if short(e) else "normal"}) for e in ordered], bonus
     return order
 
 
@@ -189,6 +238,8 @@ class Replay:
         self.requests, self.slots, self.policy = requests, slots, policy
         self.estimates = sf.Estimates(seed)
         self.assumed = assumed or {}
+        self.classes = [classify(r, slots) for r in requests]
+        self.asks = self.yields = 0
 
     def run_of(self, request: dict) -> float:
         """The run a request has in the replay: recorded, or for one that never ran the median of its kind over the
@@ -208,24 +259,39 @@ class Replay:
             found *= math.exp(error)
         return None if found is None else found * bias
 
+    def settings(self) -> dict:
+        """The queue's defaults before classes (no class moves, nobody asked), and what the policy changes."""
+        return {**sf.ORDER_DEFAULTS, "interactive": 0.0, "batch": 0.0, "yield_after": 0.0,
+                **self.policy.get("settings", {})}
+
+    def step(self, number: int) -> float:
+        """How long the holder takes to reach the end of its current step once asked: uniform up to the policy's
+        `step` seconds, fixed per request."""
+        return random.Random(f"step-{number}").uniform(0, self.policy.get("step", 120))
+
     def decide(self, waiting: list[dict], held: list[dict], moment: float) -> list[dict]:
         """The grants of the policy's order with its settings (the queue's defaults, and what it changes)."""
         name = self.policy["order"]
-        settings = {**sf.ORDER_DEFAULTS, **self.policy.get("settings", {})}
+        settings = self.settings()
         if name == "all-only":
             return plan_all_only(waiting, held, self.slots, moment, self.estimate, settings).grants
         if name.startswith("short"):
-            ordered = self.policy["reorder"](waiting, self.estimate)
+            ordered, bonus = self.policy["reorder"](waiting, self.estimate)
             inner = "backfill" if name == "short+backfill" else "window"
-            return sf.plan(ordered, held, self.slots, moment, inner, self.estimate, settings=settings).grants
+            found = sf.plan(ordered, held, self.slots, moment, inner, self.estimate,
+                            settings={**settings, "interactive": bonus, "batch": 0.0}).grants
+            by_id = {e["id"]: e for e in waiting}
+            return [by_id[e["id"]] for e in found]
         return sf.plan(waiting, held, self.slots, moment, name, self.estimate, settings=settings).grants
 
     def simulate(self) -> list[dict]:
         environment = {k: os.environ.get(k) for k in self.policy.get("env", {})}
         os.environ.update(self.policy.get("env", {}))
+        askers, sf.ASKERS = sf.ASKERS, self.policy.get("askers", sf.ASKERS)
         try:
             return self._simulate()
         finally:
+            sf.ASKERS = askers
             for key, value in environment.items():
                 if value is None:
                     os.environ.pop(key, None)
@@ -238,12 +304,18 @@ class Replay:
             heapq.heappush(events, (request["arrival"], 0, order, "arrive", request["id"]))
             order += 1
         waiting, held = {}, {}
-        result = {r["id"]: {"id": r["id"], "granted": None, "ended": None, "left": None} for r in self.requests}
+        result = {r["id"]: {"id": r["id"], "granted": None, "ended": None, "left": None, "yields": 0,
+                            "yielded": 0.0, "class": self.classes[r["id"]]} for r in self.requests}
+        remaining = {}  # id -> seconds of its run still to go when it was last granted
+        began = {}  # id -> moment of its last grant
+        generation = {}  # id -> grant count, so an end scheduled before a yield is ignored
+        asked = {}  # holder id -> moment it was asked
         segments = []  # (from, to, slots held, someone waits, a waiter fits the free slots)
         last = None
         ticking = False
         while events:
-            moment, _, _, kind, number = heapq.heappop(events)
+            moment, _, _, kind, number, *rest = heapq.heappop(events)
+            extra = rest[0] if rest else None
             if last is not None and moment > last:
                 used = sum(e["count"] for e in held.values())
                 segments.append((last, moment, used, bool(waiting),
@@ -251,9 +323,12 @@ class Replay:
             last = moment
             request = self.requests[number] if number is not None else None
             if kind == "arrive":
+                cls = self.classes[number]
                 waiting[number] = {"id": number, "label": request["label"], "cmd": request["cmd"],
                                    "count": min(request["count"], self.slots), "since": stamp(request["arrival"]),
-                                   "state": "waiting"}
+                                   "state": "waiting", "meta": {"class": cls},
+                                   "yieldable": yieldable(request, cls, self.slots)}
+                remaining[number] = self.run_of(request)
                 if request["patience"] is not None:
                     heapq.heappush(events, (moment + request["patience"], 1, order, "leave", number))
                     order += 1
@@ -262,21 +337,63 @@ class Replay:
                     del waiting[number]
                     result[number]["left"] = moment
             elif kind == "end":
+                if generation.get(number) != extra or number not in held:
+                    continue  # it yielded before this end
                 entry = held.pop(number)
+                asked.pop(number, None)
                 self.estimates.add(entry["label"], entry["cmd"], self.run_of(request))
                 result[number]["ended"] = moment
+            elif kind == "yield":
+                if number not in held or number not in asked or generation.get(number) != extra or \
+                        asked[number] not in waiting:
+                    continue  # the ask was withdrawn, or it ended first, or the asker started or left meanwhile
+                entry = held.pop(number)
+                entry["rank"] = sf.rank_time(waiting[asked.pop(number)], self.settings()) + sf.YIELD_BEHIND
+                remaining[number] -= moment - began[number]
+                entry.update(state="waiting", yields=int(entry.get("yields") or 0) + 1, yielded_at=moment)
+                waiting[number] = entry
+                result[number]["yields"] += 1
+                self.yields += 1
             elif kind == "tick":
                 ticking = False
             if waiting:
                 ordered = sorted(waiting.values(), key=lambda e: (sf.seconds(e["since"]), e["id"]))
                 for entry in self.decide(ordered, list(held.values()), moment):
-                    del waiting[entry["id"]]
-                    entry.update(state="held", granted=stamp(moment))
-                    held[entry["id"]] = entry
-                    result[entry["id"]]["granted"] = moment
-                    heapq.heappush(events, (moment + self.run_of(self.requests[entry["id"]]), -1, order, "end",
-                                            entry["id"]))
+                    number = entry["id"]
+                    del waiting[number]
+                    if "yielded_at" in entry:  # back after a yield: as the queue keeps it, granted stays the first
+                        result[number]["yielded"] += moment - entry.pop("yielded_at")
+                        entry.update(yielded=result[number]["yielded"], resumed=stamp(moment),
+                                     granted=stamp(result[number]["granted"]))
+                    else:
+                        entry.update(granted=stamp(moment))
+                    entry["state"] = "held"
+                    held[number] = entry
+                    began[number] = moment
+                    generation[number] = generation.get(number, 0) + 1
+                    if result[number]["granted"] is None:
+                        result[number]["granted"] = moment
+                    heapq.heappush(events, (moment + remaining[number], -1, order, "end", number,
+                                            generation[number]))
                     order += 1
+                settings = self.settings()
+                if settings["yield_after"] and waiting:
+                    ordered = sorted(waiting.values(), key=lambda e: (sf.seconds(e["since"]), e["id"]))
+                    holders = list(held.values())
+                    wanted = sf.yield_asks(ordered, holders, self.slots, moment, self.estimate, settings=settings,
+                                           asked=[held[n] for n in asked])
+                    chosen = {h["id"]: w["id"] for h, w in wanted}
+                    for number in [n for n in asked if n not in chosen]:
+                        del asked[number]  # withdrawn
+                    for number, asker in chosen.items():
+                        known = number in asked
+                        asked[number] = asker
+                        if known:
+                            continue
+                        self.asks += 1
+                        delay = min(self.step(number), max(0.0, remaining[number] - (moment - began[number])))
+                        heapq.heappush(events, (moment + delay, 0, order, "yield", number, generation[number]))
+                        order += 1
             if waiting and not ticking:
                 heapq.heappush(events, (moment + POLL, 2, order, "tick", None))
                 order += 1
@@ -299,6 +416,8 @@ def percentile(values: list[float], q: float) -> float:
 
 def measure(requests: list[dict], results: list[dict], start: float, until: float, replay: Replay) -> dict:
     waits, large, left = [], [], 0
+    classes = {name: {"waits": [], "delays": []} for name in sf.CLASSES}
+    yielded = yields = 0.0
     for request, result in zip(requests, results):
         if request["arrival"] < start or request["arrival"] > until:
             continue
@@ -307,6 +426,10 @@ def measure(requests: list[dict], results: list[dict], start: float, until: floa
             continue
         wait = end - request["arrival"]
         waits.append(wait)
+        classes[result["class"]]["waits"].append(wait)
+        classes[result["class"]]["delays"].append(wait + result["yielded"])  # every second it was not running
+        yielded += result["yielded"] * request["count"]
+        yields += result["yields"]
         if request["count"] >= 3:
             large.append(wait)
         left += result["granted"] is None
@@ -317,7 +440,13 @@ def measure(requests: list[dict], results: list[dict], start: float, until: floa
             held += span * used
             idle += span * (replay.slots - used) * someone
             blocked += span * (replay.slots - used) * fits
-    return {"requests": len(waits), "total_h": sum(waits) / 3600, "mean_s": sum(waits) / max(1, len(waits)),
+    per_class = {name: {"requests": len(c["waits"]), "total_h": sum(c["waits"]) / 3600,
+                        "mean_s": sum(c["waits"]) / max(1, len(c["waits"])), "p90_s": percentile(c["waits"], 90),
+                        "max_s": max(c["waits"], default=0), "delay_max_s": max(c["delays"], default=0),
+                        "delay_total_h": sum(c["delays"]) / 3600}
+                 for name, c in classes.items()}
+    return {"classes": per_class, "yields": int(yields), "yielded_slot_h": yielded / 3600,
+            "requests": len(waits), "total_h": sum(waits) / 3600, "mean_s": sum(waits) / max(1, len(waits)),
             "p90_s": percentile(waits, 90), "max_s": max(waits, default=0),
             "large_mean_s": sum(large) / max(1, len(large)), "large_max_s": max(large, default=0),
             "idle_slot_h": idle / 3600, "blocked_slot_h": blocked / 3600,
@@ -325,10 +454,25 @@ def measure(requests: list[dict], results: list[dict], start: float, until: floa
 
 
 WINDOW = {"SLOTFATHER_OVERTAKE_WINDOW": "600"}
+CLASSES = {"interactive": 1800, "batch": 1800}  # the shipped class offsets
+SHIPPED = {**CLASSES, "yield_after": 120}
 POLICIES = {
     "window (current)": {"order": "window", "env": WINDOW},
     "fifo (window 0)": {"order": "window", "env": {"SLOTFATHER_OVERTAKE_WINDOW": "0"}},
     "backfill (shipped)": {"order": "backfill", "env": WINDOW},
+    "classes + yields (#643 shipped)": {"order": "backfill", "env": WINDOW, "settings": SHIPPED, "step": 300},
+    "  classes only": {"order": "backfill", "env": WINDOW, "settings": CLASSES},
+    "  yields only": {"order": "backfill", "env": WINDOW, "settings": {"yield_after": 120}, "step": 300},
+    "  interactive ahead only": {"order": "backfill", "env": WINDOW, "settings": {"interactive": 1800}},
+    "  batch behind only": {"order": "backfill", "env": WINDOW, "settings": {"batch": 1800}},
+    "  offsets 600 s": {"order": "backfill", "env": WINDOW, "step": 300,
+                        "settings": {"interactive": 600, "batch": 600, "yield_after": 120}},
+    "  batch 3600 s behind": {"order": "backfill", "env": WINDOW, "step": 300,
+                              "settings": {**SHIPPED, "batch": 3600}},
+    "  normal waiters ask too": {"order": "backfill", "env": WINDOW, "settings": SHIPPED, "step": 300,
+                                 "askers": ("interactive", "normal")},
+    "  steps up to 600 s": {"order": "backfill", "env": WINDOW, "settings": SHIPPED, "step": 600},
+    "  estimates noisy": {"order": "backfill", "env": WINDOW, "settings": SHIPPED, "step": 300, "noise": 1.0},
     "backfill, no window": {"order": "backfill", "env": {"SLOTFATHER_OVERTAKE_WINDOW": "0"}},
     "backfill, safety 1.5": {"order": "backfill", "env": WINDOW, "settings": {"safety": 1.5}},
     "backfill, no head limit": {"order": "backfill", "env": WINDOW, "settings": {"limit": 0}},
@@ -389,13 +533,23 @@ def report(summary: dict) -> str:
         lines.append(f"current order vs recorded waits ({v['requests']} requests): recorded {v['recorded_h']:.1f} h, "
                      f"replayed {v['replayed_h']:.1f} h, mean abs error {v['mean_abs_error_s']:.0f} s, p90 "
                      f"{v['p90_abs_error_s']:.0f} s, {v['within_60s']:.0%} within 60 s")
-    head = f"{'order':<28} {'total h':>7} {'mean s':>7} {'p90 s':>7} {'max s':>7} {'≥3 mean':>8} {'≥3 max':>7} " \
+    head = f"{'order':<32} {'total h':>7} {'mean s':>7} {'p90 s':>7} {'max s':>7} {'≥3 mean':>8} {'≥3 max':>7} " \
            f"{'idle sh':>7} {'fit-idle':>8} {'held':>5}"
     lines += ["", head]
     for name, m in summary["policies"].items():
-        lines.append(f"{name:<28} {m['total_h']:>7.1f} {m['mean_s']:>7.0f} {m['p90_s']:>7.0f} {m['max_s']:>7.0f} "
+        lines.append(f"{name:<32} {m['total_h']:>7.1f} {m['mean_s']:>7.0f} {m['p90_s']:>7.0f} {m['max_s']:>7.0f} "
                      f"{m['large_mean_s']:>8.0f} {m['large_max_s']:>7.0f} {m['idle_slot_h']:>7.1f} "
                      f"{m['blocked_slot_h']:>8.1f} {m['held_mean']:>5.2f}")
+    counts = next(iter(summary["policies"].values()))["classes"]
+    sizes = ", ".join(f"{n} {c['requests']}" for n, c in counts.items())
+    lines += ["", f"by class ({sizes}; batch delay: its wait plus the time it yielded)",
+              f"{'order':<32} {'int mean':>8} {'int p90':>7} {'int max':>7} {'norm mean':>9} {'norm p90':>8} "
+              f"{'bat mean':>8} {'bat max':>7} {'delay max':>9} {'delay h':>7} {'yields':>6} {'yield sh':>8}"]
+    for name, m in summary["policies"].items():
+        i, n, b = (m["classes"][c] for c in ("interactive", "normal", "batch"))
+        lines.append(f"{name:<32} {i['mean_s']:>8.0f} {i['p90_s']:>7.0f} {i['max_s']:>7.0f} {n['mean_s']:>9.0f} "
+                     f"{n['p90_s']:>8.0f} {b['mean_s']:>8.0f} {b['max_s']:>7.0f} {b['delay_max_s']:>9.0f} "
+                     f"{b['delay_total_h']:>7.1f} {m['yields']:>6} {m['yielded_slot_h']:>8.2f}")
     return "\n".join(lines)
 
 

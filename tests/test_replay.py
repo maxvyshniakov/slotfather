@@ -20,13 +20,15 @@ FIXTURE = ROOT / "tests" / "fixtures" / "replay"
 NOW = sf.seconds("2026-11-03T01:48:36Z")  # when the live queue in the fixture was copied
 INCIDENT = (sf.seconds("2026-11-03T00:48:50Z"), sf.seconds("2026-11-03T01:40:00Z"))
 SHIPPED, CURRENT = "backfill (shipped)", "window (current)"
+CLASSES = "classes + yields (#643 shipped)"
 
 
 class RecordedReplayTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         policies = {name: replay.POLICIES[name] for name in (CURRENT, SHIPPED, "fifo (window 0)",
-                                                              "backfill, estimates noisy")}
+                                                              "backfill, estimates noisy", CLASSES,
+                                                              "  estimates noisy")}
         cls.whole = replay.compare(FIXTURE, NOW, 6, policies)
         cls.incident = replay.compare(FIXTURE, NOW, 6, policies, since=INCIDENT[0], until=INCIDENT[1])
 
@@ -48,10 +50,55 @@ class RecordedReplayTests(unittest.TestCase):
         current, noisy = (self.whole["policies"][name] for name in (CURRENT, "backfill, estimates noisy"))
         self.assertLessEqual(noisy["large_max_s"], current["large_max_s"])
 
+    def test_classes_wait_less_and_serve_interactive_work_first_without_starving_batch_work(self):
+        backfill, classes = (self.whole["policies"][name] for name in (SHIPPED, CLASSES))
+        self.assertLess(classes["total_h"], 0.8 * backfill["total_h"])
+        self.assertLess(classes["classes"]["interactive"]["p90_s"], 0.5 * backfill["classes"]["interactive"]["p90_s"])
+        self.assertLessEqual(classes["large_max_s"], backfill["large_max_s"])
+        self.assertLessEqual(classes["classes"]["batch"]["delay_max_s"],
+                             1.1 * backfill["classes"]["batch"]["delay_max_s"])
+        noisy, before = (self.whole["policies"][name] for name in ("  estimates noisy", "backfill, estimates noisy"))
+        bound = replay.CLASSES["interactive"] + replay.CLASSES["batch"]  # the most a class moves a request
+        self.assertLessEqual(noisy["classes"]["batch"]["delay_max_s"], before["classes"]["batch"]["delay_max_s"] + bound)
+        incident = self.incident["policies"]
+        self.assertLessEqual(incident[CLASSES]["total_h"], incident[SHIPPED]["total_h"])
+
     def test_the_incident_waits_far_less(self):
         current, shipped = (self.incident["policies"][name] for name in (CURRENT, SHIPPED))
         self.assertLess(shipped["total_h"], 0.7 * current["total_h"])
         self.assertLessEqual(shipped["blocked_slot_h"], current["blocked_slot_h"])
+
+
+class YieldTraceTests(unittest.TestCase):
+    """A Straylight gate (batch, yieldable) holds five of six slots and a lane check the sixth, both for an hour; a
+    pre-push check (interactive) comes ten minutes in."""
+
+    def requests(self):
+        checks = "/w/verify.sh --checks " + ",".join(f"c{n}" for n in range(60)) + " --jobs 4"
+        found = [{"label": "lane-1-gate", "cmd": checks, "count": 5, "arrival": 0.0, "run": 3600.0},
+                 {"label": "lane-2", "cmd": "/w/verify.sh --checks a,b", "count": 1, "arrival": 0.0, "run": 3600.0},
+                 {"label": "sid-kit-wt-1", "cmd": "node scripts/pre-push.mjs origin", "count": 1, "arrival": 600.0,
+                  "run": 60.0}]
+        for number, request in enumerate(found):
+            request.update(id=number, patience=None, waited=None, source="history",
+                           arrival=sf.seconds("2026-11-02T10:00:00Z") + request["arrival"])
+        return found
+
+    def test_the_gate_yields_to_the_pre_push_check_and_resumes(self):
+        found = self.requests()
+        self.assertEqual(["batch", "normal", "interactive"], [replay.classify(r, 6) for r in found])
+        seed = [("lane-1-gate", found[0]["cmd"], 3600.0), ("lane-2", found[1]["cmd"], 3600.0)]
+        both = replay.Replay(found, 6, replay.POLICIES[CLASSES], seed)
+        gate, _, check = both.simulate()
+        waited = check["granted"] - found[2]["arrival"]
+        self.assertGreaterEqual(waited, 120, "it asks once it has waited yield_after")
+        self.assertLessEqual(waited, 120 + 300 + replay.POLL, "the gate yields at the end of its step")
+        self.assertEqual(1, gate["yields"])
+        self.assertAlmostEqual(60, gate["yielded"], delta=replay.POLL + 1, msg="back once the check is done")
+        self.assertAlmostEqual(found[0]["arrival"] + 3600 + gate["yielded"], gate["ended"], delta=1)
+        alone = replay.Replay(found, 6, replay.POLICIES["  classes only"], seed).simulate()
+        self.assertAlmostEqual(3600 - 600, alone[2]["granted"] - found[2]["arrival"], delta=replay.POLL,
+                               msg="without yields it waits for the first holder to end")
 
 
 class TraceTests(unittest.TestCase):

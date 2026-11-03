@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """slotfather: one queue of leases on the machine's capacity, shared by every project and agent (#599).
 
-  slotfather run [-n N|all] [--label L] [--meta K=V]... [--wait S] [--] COMMAND...
+  slotfather run [-n N|all] [--label L] [--meta K=V]... [--class C] [--yieldable] [--wait S] [--] COMMAND...
                                                                      run COMMAND holding N slots (default 1)
+  slotfather yield                                                   inside a yieldable lease: yield if asked
   slotfather status [--json [--pid PID]]                             holders and waiters, in queue order
   slotfather history [N]                                             the last N requests that left the queue
   slotfather stats [--since W] [--label L] [--by B] [--json]         what leases used and how full the machine was
@@ -26,7 +27,11 @@ three times its expected run ends before the head can start (when the held lease
 the head has waited 2700 s, its limit; past the limit nothing passes it. An all-slot request therefore starts at
 most the limit plus the overrun of what passed it. `slotfather order` shows and saves the order and these numbers
 for every client (order.json beside the queue); a client's environment can only tighten them, and
-SLOTFATHER_QUEUE=window falls back to the earlier order, where the head holds back everyone behind it. A process
+SLOTFATHER_QUEUE=window falls back to the earlier order, where the head holds back everyone behind it. Classes
+(`--class interactive|normal|batch`, normal by default): an interactive waiter queues as if it came 1800 s earlier,
+a batch one 1800 s later; an interactive waiter that has waited 120 s asks holders of a lower class that took
+`--yieldable` to yield, by a marker file their client checks between steps (SLOTFATHER_YIELD) before it runs
+`slotfather yield`; nothing ever stops a holder. A process
 that already runs under a lease (SLOTFATHER_LEASE, or a holder among its ancestors) runs without a second lease, so
 nested wrappers neither deadlock nor count twice. A lease whose holder died (its pid gone, or reused by a process
 with another start time) is reaped by the next queue operation. While memory is short (free swap under SLOTFATHER_MIN_FREE_SWAP_MB, default 512, where swap is on; or the
@@ -94,9 +99,22 @@ QUEUE_ORDERS = ("backfill", "window")  # `slotfather order`; the first is the de
 # limit: seconds after the head queued from which nothing passes it, as in the window order (0: never);
 # fallback: seconds a request with no run like it in the history is expected to run;
 # overrun: a held lease past its estimate is expected to run on for this share of what it has run.
-ORDER_DEFAULTS = {"order": "backfill", "safety": 3.0, "limit": 2700.0, "fallback": 3600.0, "overrun": 0.5}
-ORDER_KNOBS = {"safety": ("BACKFILL_SAFETY", 1.0), "limit": ("BACKFILL_LIMIT", 0.0),
-               "fallback": ("BACKFILL_FALLBACK", 0.0), "overrun": ("BACKFILL_OVERRUN", 0.0)}  # variable, least
+# Classes (#643): interactive: a waiter queues `interactive` seconds earlier than it came; batch: `batch` seconds
+# later (0: neither moves). yield_after: an interactive waiter that has waited this long, and would not get slots
+# within it, asks yieldable holders of a lower class to yield (0: nobody is asked).
+ORDER_DEFAULTS = {"order": "backfill", "safety": 3.0, "limit": 2700.0, "fallback": 3600.0, "overrun": 0.5,
+                  "interactive": 1800.0, "batch": 1800.0, "yield_after": 120.0}
+# variable, least, how a client's environment tightens it: up (only higher counts), down (only lower), limit (a
+# lower nonzero value; 0 is the loosest), delay (a higher value, or 0, the tightest).
+ORDER_KNOBS = {"safety": ("BACKFILL_SAFETY", 1.0, "up"), "limit": ("BACKFILL_LIMIT", 0.0, "limit"),
+               "fallback": ("BACKFILL_FALLBACK", 0.0, "up"), "overrun": ("BACKFILL_OVERRUN", 0.0, "down"),
+               "interactive": ("PRIORITY_INTERACTIVE", 0.0, "down"), "batch": ("PRIORITY_BATCH", 0.0, "down"),
+               "yield_after": ("YIELD_AFTER", 0.0, "delay")}
+ORDER_BASE = ("order", "safety", "limit", "fallback", "overrun")  # always saved; the rest only when not the default
+CLASSES = ("interactive", "normal", "batch")  # `run --class`, or the lease metadata's `class`; normal by default
+YIELDS_MAX = 2  # times one lease is asked to yield
+ASKERS = ("interactive",)  # the classes whose waiters ask (the replay found nothing in letting normal ones ask)
+YIELD_BEHIND = 0.001  # seconds behind the waiter it yields to that a yielded lease queues
 SHELLS = ("sh", "bash", "zsh", "dash", "fish")
 ESTIMATE_RUNS = 20  # recent runs of a kind its estimate takes the median of
 ESTIMATE_BYTES = 1 << 20  # of the history's end (and of its rotated part) read for estimates
@@ -616,6 +634,7 @@ def reap(directory: Path, table: dict) -> list[tuple[Path, dict]]:
             live.append((path, entry))
         else:
             path.unlink(missing_ok=True)
+            marker(path).unlink(missing_ok=True)
             log(directory, f"reaped {entry.get('state')} lease of {entry.get('count')} for "
                            f"{entry.get('label')} (pid {entry.get('pid')} exited)")
             record(directory, entry, "reaped")
@@ -635,6 +654,10 @@ def record(directory: Path, entry: dict, outcome: str, status: int | None = None
     with contextlib.suppress(SlotError, OSError):
         item.update(cores=cores(), capacity=total())
     item.update(usage or {})
+    if entry.get("yields"):
+        yielded = float(entry.get("yielded") or 0)
+        away = epoch(entry.get("yielded_at"))
+        item.update(yields=int(entry["yields"]), yielded=round(yielded + (max(0.0, ended - away) if away else 0), 2))
     meta = meta_of(entry)
     if meta:
         item["meta"] = meta
@@ -796,6 +819,8 @@ def checked_meta(meta) -> dict[str, str]:
             raise SlotError(f"--meta key {key!r} must be a lowercase word (a-z, 0-9, _ . -), at most 32 characters")
         if not isinstance(value, str) or len(value) > META_VALUE_MAX or not value.isprintable():
             raise SlotError(f"--meta {key} takes printable text of at most {META_VALUE_MAX} characters")
+        if key == "class" and value not in CLASSES:
+            raise SlotError(f"the class is one of {', '.join(CLASSES)}, not {value!r}")
         found[key] = value
     return found
 
@@ -851,17 +876,19 @@ def order_settings(directory: Path | None = None) -> dict:
         found.update(order="window", saved=True)
     if setting("QUEUE") == "window":
         found["order"] = "window"
-    for key, (name, least) in ORDER_KNOBS.items():
+    for key, (name, least, tighten) in ORDER_KNOBS.items():
         try:
             value = float(setting(name) or "nan")
         except ValueError:
             continue
         if not math.isfinite(value) or value < least:
             continue
-        if key in ("safety", "fallback"):
+        if tighten == "up":
             found[key] = max(found[key], value)
-        elif key == "overrun":
+        elif tighten == "down":
             found[key] = min(found[key], value)
+        elif tighten == "delay":  # 0 asks nobody, the tightest
+            found[key] = 0.0 if not value or not found[key] else max(found[key], value)
         elif value > 0:  # limit: 0 is no limit, the loosest
             found[key] = value if not found[key] else min(found[key], value)
     return found
@@ -890,8 +917,10 @@ def save_order(values: dict | None, directory: Path | None = None) -> None:
         return
     values = checked_order({k: v for k, v in values.items() if k in ORDER_DEFAULTS})
     path.parent.mkdir(parents=True, exist_ok=True)
+    # The keys before classes always; a class knob only when it differs from its default, since a slotfather before
+    # them refuses a file with keys it does not know (and falls back to the window order).
     write(path, {k: values.get(k, ORDER_DEFAULTS[k]) if k == "order" else float(values.get(k, ORDER_DEFAULTS[k]))
-                 for k in ORDER_DEFAULTS})
+                 for k in ORDER_DEFAULTS if k in ORDER_BASE or values.get(k, ORDER_DEFAULTS[k]) != ORDER_DEFAULTS[k]})
 
 
 def queue_order() -> str:
@@ -975,6 +1004,30 @@ def history_estimates(directory: Path) -> Estimates:
     return Estimates(runs)
 
 
+def class_of(entry: dict) -> str:
+    """interactive, normal or batch: the entry's metadata `class`, normal when it has none or another word."""
+    value = meta_of(entry).get("class")
+    return value if value in CLASSES else "normal"
+
+
+def rank_time(entry: dict, settings: dict) -> float:
+    """When a waiter counts as queued: an interactive one `interactive` seconds before it came, a batch one `batch`
+    seconds after. The offset is its ageing: a batch request that has waited longer than the two together is ahead
+    of every interactive one that comes after."""
+    queued = seconds(entry.get("since"))
+    queued = math.inf if queued is None else queued
+    cls = class_of(entry)
+    found = queued - settings.get("interactive", 0.0) if cls == "interactive" else \
+        queued + settings.get("batch", 0.0) if cls == "batch" else queued
+    behind = entry.get("rank")  # a lease that yielded queues behind the waiter it yielded to
+    return max(found, float(behind)) if type(behind) in (int, float) and math.isfinite(behind) else found
+
+
+def ranked(waiters: list[dict], settings: dict) -> list[dict]:
+    """Waiters in the order the queue serves them: by rank_time(), then as they came (a stable sort)."""
+    return sorted(waiters, key=lambda entry: rank_time(entry, settings))
+
+
 class Plan:
     """What grant() does to the waiters: `grants` start now, in queue order; `reason` says why the first that does
     not start waits; `head` is the waiter the others must not delay, expected to start at `start` (epoch seconds)."""
@@ -992,7 +1045,7 @@ def reserve(found: Plan, held: list[dict], slots: int, used: int, moment: float,
     ends = []
     for entry in held + found.grants:
         granted = seconds(entry.get("granted"))
-        ran = 0.0 if granted is None else max(0.0, moment - granted)
+        ran = 0.0 if granted is None else max(0.0, moment - granted - float(entry.get("yielded") or 0))
         run = estimate(entry)
         run = fallback if run is None else run
         ends.append((moment + max(run - ran, overrun * ran), entry["count"]))
@@ -1018,7 +1071,9 @@ def plan(waiters: list[dict], held: list[dict], slots: int, moment: float, order
     window: in arrival order; a waiter that does not fit lets later ones that fit start first until it has waited
     SLOTFATHER_OVERTAKE_WINDOW, then holds back everyone behind it.
 
-    backfill: the same within the window; the first waiter past it that does not fit is the head. Its start is
+    backfill: waiters in their class order (ranked(): an interactive one `interactive` seconds earlier than it came,
+    a batch one `batch` seconds later, a yielded lease just behind the waiter it yielded to); the same within the
+    window; the first waiter past it that does not fit is the head. Its start is
     reserved: the moment enough slots will be free, from the expected ends of the held leases. Until the head has
     waited `limit` seconds, a later waiter that fits starts before it when `safety` times its expected run ends by
     the head's start and by that limit, or when it takes only slots the head will not need then (reserve()); past
@@ -1030,6 +1085,8 @@ def plan(waiters: list[dict], held: list[dict], slots: int, moment: float, order
     order = order or settings["order"]
     estimate = estimate or (lambda entry: None)
     window = overtake_window()
+    if order == "backfill":
+        waiters = ranked(waiters, settings)
     fallback, safety, overrun, limit = (settings[key] for key in ("fallback", "safety", "overrun", "limit"))
     found = Plan()
     used = sum(e["count"] for e in held) + other
@@ -1075,6 +1132,73 @@ def plan(waiters: list[dict], held: list[dict], slots: int, moment: float, order
         until = time.strftime("%H:%M:%S", time.localtime(queued + window))
         found.reason = found.reason or (f"{free} of {slots} slots free; requests that fit may pass "
                                         f"{entry['label']} until {until}")
+    return found
+
+
+def yield_asks(waiters: list[dict], held: list[dict], slots: int, moment: float, estimate=None, other: int = 0,
+               settings: dict | None = None, asked=()) -> list[tuple[dict, dict]]:
+    """Polite preemption (#643): (holder, waiter) pairs, the holders of `held` (entries, after this look's grants)
+    that a waiter asks to yield now. Only an interactive waiter asks, once it has waited `yield_after` seconds, does
+    not fit, and would not get its slots within `yield_after` by the held leases' expected ends; it asks only
+    holders that opted in (`yieldable`), are of a lower class, have held their slots `yield_after` seconds since
+    their last grant and were asked fewer than YIELDS_MAX times, and only as many as it needs (holders in `asked`,
+    their ids, first; then the lowest class; then the one expected to run longest), and only when grant() would
+    then start it, with the asked holders back among the waiters at their own rank. Nobody is ever stopped: a
+    holder yields when its client gets round to it, or not at all."""
+    settings = settings or order_settings()
+    after = settings.get("yield_after") or 0
+    if not after or settings["order"] != "backfill":
+        return []
+    estimate = estimate or (lambda entry: None)
+    level = {name: n for n, name in enumerate(CLASSES)}
+    asked_ids = {id(entry) for entry in asked}
+    holding, found, granted = list(held), [], []
+
+    def expected_end(entry):
+        began = seconds(entry.get("granted"))
+        ran = 0.0 if began is None else max(0.0, moment - began - float(entry.get("yielded") or 0))
+        run = estimate(entry)
+        run = settings["fallback"] if run is None else run
+        return moment + max(run - ran, settings["overrun"] * ran)
+
+    for entry in ranked(waiters, settings):
+        if class_of(entry) not in ASKERS or any(entry is g for g in granted):
+            continue
+        queued = seconds(entry.get("since"))
+        if queued is None or moment - queued < after:
+            continue
+        free = slots - other - sum(h["count"] for h in holding)
+        if entry["count"] <= free:
+            continue  # it fits: what holds it back is not slots
+        have, when = free, moment
+        for end, count in sorted((expected_end(h), h["count"]) for h in holding):
+            if have >= entry["count"]:
+                break
+            have, when = have + count, end
+        if have >= entry["count"] and when - moment <= after:
+            continue  # its slots are expected soon anyway
+        candidates = [h for h in holding if h.get("yieldable") and level[class_of(h)] > level[class_of(entry)]
+                      and int(h.get("yields") or 0) < YIELDS_MAX
+                      and moment - (seconds(h.get("resumed") or h.get("granted")) or moment) >= after]
+        candidates.sort(key=lambda h: (id(h) not in asked_ids, -level[class_of(h)], -expected_end(h)))
+        chosen, need = [], entry["count"] - free
+        for h in candidates:
+            if need <= 0:
+                break
+            chosen.append(h)
+            need -= h["count"]
+        if need > 0:
+            continue
+        behind = rank_time(entry, settings) + YIELD_BEHIND
+        back = [dict(h, state="waiting", rank=behind) for h in chosen]
+        rest = [w for w in waiters if not any(w is g for g in granted)] + back
+        trial = plan(rest, [h for h in holding if not any(h is c for c in chosen)], slots, moment, estimate=estimate,
+                     other=other, settings=settings)
+        if not any(g is entry for g in trial.grants):
+            continue
+        found += [(h, entry) for h in chosen]
+        holding = [h for h in holding if not any(h is c for c in chosen)] + [entry]
+        granted.append(entry)
     return found
 
 
@@ -1134,15 +1258,142 @@ def estimator(directory: Path):
     return estimate
 
 
+# Polite preemption (#643): a holder that opted in (`run --yieldable`) is asked to yield by a marker file beside its
+# entry, <entry>.yield, which its client checks between steps; it yields with `slotfather yield` (or
+# Lease.yield_slots()), which puts it back among the waiters just behind the waiter that asked and returns once the
+# lease is granted again. Nothing else ever happens to a holder that does not.
+
+def marker(path: Path) -> Path:
+    """The yield request beside a queue entry (SLOTFATHER_YIELD in a yieldable lease's command)."""
+    return path.with_suffix(".yield")
+
+
+def asked(path: Path) -> dict | None:
+    """The yield request for the entry at `path`, or None."""
+    try:
+        found = json.loads(marker(path).read_text())
+    except (OSError, ValueError):
+        return None
+    return found if isinstance(found, dict) else None
+
+
+def epoch(value) -> float | None:
+    """A moment stored as epoch seconds or as a now() stamp, as epoch seconds; None for anything else."""
+    return float(value) if type(value) in (int, float) and math.isfinite(value) else seconds(value)
+
+
+def resume(entry: dict, moment: float | None = None) -> None:
+    """A yielded lease that was granted again (at `moment`, else its `granted` stamp): `granted` is its first grant
+    again (waits and runs in the history stay its own), `resumed` this grant, `yielded` the seconds it spent back in
+    the queue."""
+    away = epoch(entry.get("yielded_at"))
+    if away is None:
+        return
+    again = entry.get("granted")
+    back = moment if moment is not None else seconds(again) or time.time()
+    entry["yielded"] = round(float(entry.get("yielded") or 0) + max(0.0, back - away), 2)
+    entry.update(resumed=again, granted=entry.get("first_granted") or again)
+    for key in ("yielded_at", "first_granted", "rank"):
+        entry.pop(key, None)
+
+
+def ask(directory: Path, live: list[tuple[Path, dict]], held: list[dict], waiters: list[dict],
+        estimate, other: int) -> None:
+    """Writes the yield requests yield_asks() wants and withdraws the others. Under the queue lock."""
+    paths = {id(e): path for path, e in live}
+    wanted = yield_asks(waiters, held, total(), time.time(), estimate, other,
+                        asked=[e for e in held if marker(paths[id(e)]).exists()])
+    asks = {id(h): w for h, w in wanted}
+    for path, entry in live:
+        place = marker(path)
+        if id(entry) in asks:
+            who = asks[id(entry)]
+            if place.exists():
+                continue
+            write(place, {"by": paths[id(who)].stem, "label": who.get("label"), "class": class_of(who),
+                          "count": who["count"], "at": now()})
+            log(directory, f"asked {entry['label']} (pid {entry['pid']}) to yield {entry['count']} for "
+                           f"{who.get('label')}")
+        elif place.exists():
+            place.unlink(missing_ok=True)
+            log(directory, f"withdrew the yield request to {entry['label']} (pid {entry['pid']})")
+    for place in (directory / "queue").glob("*.yield"):  # requests left by entries gone meanwhile
+        if not place.with_suffix(".json").exists():
+            place.unlink(missing_ok=True)
+
+
+def yield_lease(path: Path, out=sys.stderr) -> bool:
+    """Yields the held lease at `path` if it was asked to and the waiter that asked still waits: the lease goes back
+    among the waiters just behind that waiter, the queue grants at once, and this returns True when the lease is
+    held again. Returns False at once when nothing asked."""
+    directory = path.parent.parent
+    with locked(directory):
+        try:
+            entry = json.loads(path.read_text())
+        except (OSError, ValueError):
+            raise SlotError("the lease vanished from the queue") from None
+        request = asked(path)
+        if entry.get("state") != "held" or request is None:
+            return False
+        live = reap(directory, processes())
+        asker = next((e for p, e in live if p.stem == request.get("by") and e.get("state") != "held"), None)
+        if asker is None:  # it started or left meanwhile; the next look would have withdrawn the request
+            marker(path).unlink(missing_ok=True)
+            return False
+        entry.update(state="waiting", yields=int(entry.get("yields") or 0) + 1, yielded_at=round(time.time(), 3),
+                     first_granted=entry.get("granted"), rank=rank_time(asker, order_settings(directory)) + YIELD_BEHIND)
+        write(path, entry)
+        marker(path).unlink(missing_ok=True)
+        log(directory, f"yielded {entry['count']} ({path.name}) to {asker.get('label')}")
+        grant(directory, processes())
+    print(f"slot: {entry.get('label')} yielded {entry['count']} slot(s) to {asker.get('label')}; it resumes when "
+          f"they are free", file=out, flush=True)
+    held_again(path)
+    print(f"slot: {entry.get('label')} resumes with {entry['count']} slot(s)", file=out, flush=True)
+    return True
+
+
+def held_again(path: Path) -> None:
+    """Waits until the yielded lease at `path` is granted again, looking at the queue as a waiter does."""
+    directory = path.parent.parent
+    poll = float(setting("POLL") or 2)
+    poll_max = max(poll, float(setting("POLL_MAX") or POLL_MAX))
+    interval, look = poll, 0.0
+    while True:
+        if time.monotonic() >= look:
+            with locked(directory):
+                grant(directory, processes())
+                try:
+                    entry = json.loads(path.read_text())
+                except (OSError, ValueError):
+                    raise SlotError("the lease vanished from the queue") from None
+                if entry.get("state") == "held":
+                    if "yielded_at" in entry:  # an older client granted it
+                        resume(entry)
+                        write(path, entry)
+                    return
+            interval = min(interval * 1.5, poll_max)
+            look = time.monotonic() + interval
+        try:
+            if json.loads(path.read_text()).get("state") == "held":
+                look = 0.0  # held: settle it under the lock at once
+                continue
+        except (OSError, ValueError):
+            raise SlotError("the lease vanished from the queue") from None
+        time.sleep(min(poll, max(0.0, look - time.monotonic())))
+
+
 def grant(directory: Path, table: dict) -> str | None:
-    """Grant the waiters plan() starts, in queue order, while memory allows. Returns why the first that does not
-    start still waits."""
+    """Grant the waiters plan() starts, in their order, while memory allows; then ask yieldable holders to yield for
+    interactive waiters that still wait (yield_asks()). Returns why the first that does not start still waits."""
     live = reap(directory, table)
     held = [e for _, e in live if e["state"] == "held"]
     waiters = [e for _, e in live if e["state"] != "held"]
     paths = {id(e): path for path, e in live}
-    found = plan(waiters, held, total(), time.time(), estimate=estimator(directory), other=legacy_used(table))
-    used = sum(e["count"] for e in held) + legacy_used(table)
+    estimate = estimator(directory)
+    other = legacy_used(table)
+    found = plan(waiters, held, total(), time.time(), estimate=estimate, other=other)
+    used = sum(e["count"] for e in held) + other
     short = None
     for entry in found.grants:
         if used:
@@ -1150,9 +1401,13 @@ def grant(directory: Path, table: dict) -> str | None:
             if short:
                 return short
         entry.update(state="held", granted=now())
+        resume(entry, time.time())
         write(paths[id(entry)], entry)
         used += entry["count"]
         log(directory, f"granted {entry['count']} to {entry['label']} (pid {entry['pid']})")
+    rest = [e for e in waiters if not any(e is g for g in found.grants)]
+    with contextlib.suppress(OSError, SlotError):
+        ask(directory, live, held + found.grants, rest, estimate, other)
     return found.reason
 
 
@@ -1172,16 +1427,24 @@ def snapshot(directory: Path | None = None) -> tuple[list[dict], list[tuple[Path
 
 
 def status_lines(directory: Path | None = None) -> list[str]:
-    live, legacy, _ = snapshot(directory)
+    directory = directory or state_dir()
+    table = processes()
+    with locked(directory):
+        live = reap(directory, table)
+    legacy = legacy_holders(table)
     lines = []
-    for e in live:
+    for path, e in live:
         meta = meta_of(e)
         tags = f" meta={meta_text(meta)}" if meta else ""
+        if e.get("yieldable"):
+            request = asked(path) if e.get("state") == "held" else None
+            tags += " yieldable" + (f" asked-to-yield-for={request.get('label')}" if request else "") + \
+                (f" yielded={e['yields']}" if e.get("yields") else "")
         lines.append(f"{e['state']}: {e['count']} slot(s) {e['label']} pid={e['pid']} since={e['since']}{tags} "
                      f"cmd={e['cmd']}")
     lines += [f"legacy: {count} slot(s) {e.get('label')} pid={e.get('pid')} (earlier queue {path.parent.parent})"
               for path, e, count in legacy]
-    used = sum(e["count"] for e in live if e["state"] == "held") + sum(count for _, _, count in legacy)
+    used = sum(e["count"] for _, e in live if e["state"] == "held") + sum(count for _, _, count in legacy)
     return lines + [f"{used} of {total()} slots held"]
 
 
@@ -1223,8 +1486,16 @@ def status_json(directory: Path | None = None, pid: int | None = None) -> dict:
         item = {"id": path.stem, "lease": str(path), "state": entry.get("state"), "count": entry.get("count"),
                 "label": entry.get("label"), "pid": entry.get("pid"), "pgid": process_group(entry.get("pid")),
                 "start": entry.get("start"), "since": entry.get("since"), "granted": entry.get("granted"),
-                "cmd": entry.get("cmd"), "cwd": entry.get("cwd"), "meta": meta_of(entry), "tree": tree}
+                "cmd": entry.get("cmd"), "cwd": entry.get("cwd"), "meta": meta_of(entry), "tree": tree,
+                "class": class_of(entry), "yieldable": bool(entry.get("yieldable")),
+                "yields": int(entry.get("yields") or 0), "yield_asked": asked(path), "position": None}
         entries_found.append(item)
+    settings = order_settings(directory)
+    serving = ranked([e for _, e in live if e.get("state") != "held"], settings) \
+        if settings["order"] == "backfill" else [e for _, e in live if e.get("state") != "held"]
+    places = {id(e): n for n, e in enumerate(serving, 1)}
+    for (path, entry), item in zip(live, entries_found):
+        item["position"] = places.get(id(entry))  # waiters: their place in the order the queue serves them
     legacy = []
     for path, entry, count in legacy_holders(table):
         legacy.append({"id": path.stem, "lease": str(path), "state": "held", "count": count,
@@ -1297,8 +1568,8 @@ def advise(maximum: int | None = None, exclusive: bool = False, cores_now: int |
 class Lease:
     """A held lease, an inherited one, or none (bypass). Release it once the work has finished."""
 
-    def __init__(self, count: int, path: Path | None = None, inherited: bool = False):
-        self.count, self.path, self.inherited = count, path, inherited
+    def __init__(self, count: int, path: Path | None = None, inherited: bool = False, yieldable: bool = False):
+        self.count, self.path, self.inherited, self.yieldable = count, path, inherited, yieldable
         self.status = None  # the command's exit status, for the history, where the holder knows it
         self.usage = None  # what the command's process tree used (TreeUsage.result), where the holder measured it
 
@@ -1308,7 +1579,22 @@ class Lease:
         env = {}
         for prefix in LEASE_ENV_PREFIXES:
             env.update({prefix + "LEASE": str(self.path), prefix + "COUNT": str(self.count)})
+            if self.yieldable and not self.inherited:
+                env[prefix + "YIELD"] = str(marker(self.path))
         return env
+
+    def yield_requested(self) -> dict | None:
+        """The yield request for this lease, or None: {"by", "label", "class", "count", "at"} of the waiter that
+        asked. Cheap (one stat and a small read); call it between steps."""
+        return None if self.path is None or self.inherited else asked(self.path)
+
+    def yield_slots(self, out=sys.stderr) -> bool:
+        """Yields the lease if it was asked to: back among the waiters, just behind the waiter that asked, until it is
+        granted again; returns True then, False at once when nothing asked (or the asker no longer waits). Call it
+        only between steps, with none of the lease's own work running."""
+        if self.path is None or self.inherited:
+            return False
+        return yield_lease(self.path, out=out)
 
     def release(self) -> None:
         if self.path is not None and not self.inherited:
@@ -1320,9 +1606,10 @@ class Lease:
                     entry = None
                 self.path.unlink(missing_ok=True)
                 log(directory, f"released {self.count} ({self.path.name})")
+                marker(self.path).unlink(missing_ok=True)
                 if isinstance(entry, dict):
-                    record(directory, entry, "released" if entry.get("state") == "held" else "left", self.status,
-                           self.usage)
+                    ran = entry.get("state") == "held" or bool(entry.get("yields"))  # a yielded lease ran
+                    record(directory, entry, "released" if ran else "left", self.status, self.usage)
                 # Hand the slots on now: waiters look at the queue less often the longer they wait.
                 with contextlib.suppress(SlotError, OSError):
                     grant(directory, processes())
@@ -1340,7 +1627,8 @@ def inherited_lease(table: dict) -> tuple[Path, dict, int] | None:
     mine = ancestors(table, os.getpid())
     own = setting("LEASE")
     for path, entry in entries(state_dir()):
-        if entry.get("state") == "held" and alive(entry, table) and (own == str(path) or entry["pid"] in mine):
+        mine_now = entry.get("state") == "held" or "yielded_at" in entry  # a yielded lease is still this tree's
+        if mine_now and alive(entry, table) and (own == str(path) or entry["pid"] in mine):
             return path, entry, entry["count"]
     for path, entry, count in legacy_holders(table):
         if own == str(path) or entry["pid"] in mine:
@@ -1352,7 +1640,9 @@ def inherited(table: dict) -> Lease | None:
     found = inherited_lease(table)
     if found is None:
         return None
-    path, _, count = found
+    path, entry, count = found
+    if "yielded_at" in entry:
+        held_again(path)  # it yielded: what runs under it waits until it is granted again
     # A lease in an earlier queue is honoured but not handed on: nested runs find its holder among their ancestors.
     return Lease(count, path if path.parent.parent == state_dir() else None, inherited=True)
 
@@ -1365,11 +1655,12 @@ def policy() -> str:
 
 
 def acquire(count: int | str, label: str, command: str = "", out=sys.stderr, wait: float | None = None,
-            note: str = "", meta: dict | None = None) -> Lease:
+            note: str = "", meta: dict | None = None, yieldable: bool = False) -> Lease:
     """Wait in the queue for `count` slots (at most the total); the lease is held by this process until released.
     Raises SlotTimeout, having left the queue, when `wait` seconds pass first. `note` follows the first word that
     the request waits. `meta` (key -> text) goes on the queue entry and the history line; a process that inherits
-    a lease keeps that lease's metadata and adds none."""
+    a lease keeps that lease's metadata and adds none. A `yieldable` lease may be asked to yield for interactive
+    waiters (see Lease.yield_slots(); the README's client protocol); it never is otherwise."""
     if count != "all" and (type(count) is not int or count < 1):
         raise SlotError("count must be a positive integer or all")
     meta = checked_meta(meta)
@@ -1401,8 +1692,10 @@ def acquire(count: int | str, label: str, command: str = "", out=sys.stderr, wai
                  "cwd": cwd, "since": now(), "state": "waiting"}
         if meta:
             entry["meta"] = meta  # older clients read past fields they do not know
+        if yieldable:
+            entry["yieldable"] = True
         write(path, entry)
-    lease = Lease(count, path)
+    lease = Lease(count, path, yieldable=yieldable)
     deadline = None if wait is None else time.monotonic() + wait
     # A terminated waiter leaves the queue at once rather than at the next reap.
     main_thread = threading.current_thread() is threading.main_thread()
@@ -1450,11 +1743,13 @@ def terminate(signum, _frame):
     raise SystemExit(128 + signum)
 
 
-def run(count: int | str, label: str, argv: list[str], wait: float | None = None, meta: dict | None = None) -> int:
+def run(count: int | str, label: str, argv: list[str], wait: float | None = None, meta: dict | None = None,
+        yieldable: bool = False) -> int:
     """Run argv under a lease of `count` slots; the command's exit status."""
     try:
         background = policy() == "background"
-        lease = acquire(count, label, " ".join(argv), wait=wait, note=ALL_NOTE if count == "all" else "", meta=meta)
+        lease = acquire(count, label, " ".join(argv), wait=wait, note=ALL_NOTE if count == "all" else "", meta=meta,
+                        yieldable=yieldable)
     except SlotTimeout as error:
         print(f"slot: {label}: {error}", file=sys.stderr)
         return TIMED_OUT
@@ -1525,10 +1820,12 @@ def dashboard(argv: list[str]) -> int:
 
 
 USAGE = ("usage: slotfather                     (in a terminal: the live dashboard)\n"
-         "       slotfather run [-n N|all] [--label L] [--meta KEY=VALUE]... [--wait SECONDS] [--] COMMAND...\n"
+         "       slotfather run [-n N|all] [--label L] [--meta KEY=VALUE]... [--class interactive|normal|batch]\n"
+         "                      [--yieldable] [--wait SECONDS] [--] COMMAND...      (inside a lease: slotfather yield)\n"
          "       slotfather status [--json [--pid PID]] | history [N] | available [--label L] [-- COMMAND...]\n"
          "       slotfather advise [--max N] [--exclusive] [--label L] [-- COMMAND...]\n"
-         "       slotfather order [backfill|window] [--safety X] [--limit S] [--fallback S] [--overrun X] | reset\n"
+         "       slotfather order [backfill|window] [--safety X] [--limit S] [--fallback S] [--overrun X]\n"
+         "                        [--interactive S] [--batch S] [--yield-after S] | reset\n"
          "       slotfather stats [--since WHEN] [--label GLOB] [--by both|label|kind] [--top N] [--json]\n"
          "       slotfather slots [N|reset]\n"
          "       slotfather dashboard [--interval SECONDS] | dashboard --once [--width N] [--height N] [--color]")
@@ -1543,7 +1840,7 @@ def parse_count(value: str) -> int:
 
 
 def run_command(argv: list[str]) -> int:
-    count, label, wait, pairs = 1, os.path.basename(os.getcwd()), None, []
+    count, label, wait, pairs, yieldable = 1, os.path.basename(os.getcwd()), None, [], False
     while argv:
         if argv[0] in ("-n", "--slots") and len(argv) > 1:
             count, argv = ("all" if argv[1] == "all" else parse_count(argv[1])), argv[2:]
@@ -1551,6 +1848,12 @@ def run_command(argv: list[str]) -> int:
             label, argv = argv[1], argv[2:]
         elif argv[0] == "--meta" and len(argv) > 1:
             pairs, argv = pairs + [argv[1]], argv[2:]
+        elif argv[0] == "--class" and len(argv) > 1:
+            if argv[1] not in CLASSES:
+                raise SlotError(f"--class takes {', '.join(CLASSES)}, not {argv[1]!r}")
+            pairs, argv = pairs + [f"class={argv[1]}"], argv[2:]
+        elif argv[0] == "--yieldable":
+            yieldable, argv = True, argv[1:]
         elif argv[0] == "--wait" and len(argv) > 1:
             try:
                 wait = float(argv[1])
@@ -1566,7 +1869,7 @@ def run_command(argv: list[str]) -> int:
             break
     if not argv:
         raise SlotError("no command to run")
-    return run(count, label, argv, wait, parse_meta(pairs))
+    return run(count, label, argv, wait, parse_meta(pairs), yieldable)
 
 
 def request_options(argv: list[str], what: str, flags: dict) -> tuple[dict, str, str]:
@@ -1585,6 +1888,19 @@ def request_options(argv: list[str], what: str, flags: dict) -> tuple[dict, str,
         else:
             raise SlotError(f"unknown {what} option {argv[0]}")
     return found, label, command
+
+
+def yield_command(argv: list[str]) -> int:
+    """`slotfather yield`, from inside a yieldable lease between two steps: yields if asked and returns once the
+    lease is held again; returns at once when nothing asked. Exit 0 either way."""
+    if argv:
+        raise SlotError("yield takes no arguments")
+    found = inherited_lease(processes())
+    if found is None or found[0].parent.parent != state_dir():
+        raise SlotError("yield runs inside a lease of this queue (SLOTFATHER_LEASE, or a holder among its ancestors)")
+    if not yield_lease(found[0]):
+        print("slot: no yield requested", file=sys.stderr)
+    return 0
 
 
 def status_command(argv: list[str]) -> int:
@@ -1613,7 +1929,9 @@ def available_command(argv: list[str]) -> int:
 
 def order_line(found: dict) -> str:
     return (f"{found['order']}: safety {found['safety']:g}, limit {found['limit']:g} s, fallback "
-            f"{found['fallback']:g} s, overrun {found['overrun']:g} ({'saved' if found['saved'] else 'default'})")
+            f"{found['fallback']:g} s, overrun {found['overrun']:g}; interactive {found['interactive']:g} s ahead, "
+            f"batch {found['batch']:g} s behind, yield after {found['yield_after']:g} s "
+            f"({'saved' if found['saved'] else 'default'})")
 
 
 def order_command(argv: list[str]) -> int:
@@ -1626,14 +1944,14 @@ def order_command(argv: list[str]) -> int:
             changes["order"] = word
         elif word == "reset" and not changes:
             reset = True
-        elif word.startswith("--") and word[2:] in ORDER_KNOBS and argv:
+        elif word.startswith("--") and word[2:].replace("-", "_") in ORDER_KNOBS and argv:
             try:
-                changes[word[2:]] = float(argv.pop(0))
+                changes[word[2:].replace("-", "_")] = float(argv.pop(0))
             except ValueError:
                 raise SlotError(f"{word} takes a number") from None
         else:
-            raise SlotError(f"order takes backfill or window, --safety, --limit, --fallback, --overrun, or reset; "
-                            f"not {word!r}")
+            raise SlotError(f"order takes backfill or window, --safety, --limit, --fallback, --overrun, "
+                            f"--interactive, --batch, --yield-after, or reset; not {word!r}")
     if reset and changes:
         raise SlotError("order reset takes nothing else")
     if changes or reset:
@@ -1693,6 +2011,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if command == "status" and rest[:1] == ["--json"]:
             return status_command(rest[1:])
+        if command == "yield":
+            return yield_command(rest)
         if command == "history" and (not rest or (len(rest) == 1 and rest[0].isdigit())):
             print("\n".join(history_lines(int(rest[0]) if rest else 20)))
             return 0

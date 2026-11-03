@@ -73,10 +73,14 @@ def parse_since(text: str, moment: float | None = None) -> float:
 
 
 def wall_of(item: dict) -> float | None:
+    """Seconds the lease held its slots: its wall (else its run) less the time it yielded them back (#643)."""
     value = item.get("wall")
     if not isinstance(value, (int, float)):
         value = item.get("ran")
-    return float(value) if isinstance(value, (int, float)) else None
+    if not isinstance(value, (int, float)):
+        return None
+    away = item.get("yielded")
+    return max(0.0, float(value) - (float(away) if isinstance(away, (int, float)) else 0.0))
 
 
 def measured(item: dict) -> bool:

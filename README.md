@@ -29,6 +29,8 @@ slotfather run -n 1 --label tests -- python3 -m unittest discover
 slotfather run -n 2 -- make build
 slotfather run -n all -- ./benchmark.sh
 slotfather run -n 1 --label lane-650 --meta ticket=650 --meta lane=lane-650 --meta phase=verify -- ./verify.sh
+slotfather run -n 1 --class interactive -- node scripts/pre-push.mjs
+slotfather run -n 4 --class batch --yieldable -- ./verify.sh --checks ...   # its client runs `slotfather yield`
 slotfather status
 slotfather status --json --pid 4242
 slotfather history 50
@@ -52,7 +54,7 @@ State lives in `~/.local/state/slotfather/`; `queue.log` records grants, release
 
 **Lease metadata.** `run --meta key=value` (repeatable; the library's `acquire(..., meta={...})`) says who asked and why: `ticket`, `lane`, `phase`, `model`, a `session`, whatever a client finds useful. Keys are lowercase words of at most 32 characters (`a-z`, digits, `_ . -`), values printable text of at most 200, at most 16 keys; a later key replaces an earlier one. The metadata is stored on the queue entry and in the request's history line (`"meta": {...}`), and shown by `status` and `history` (`meta=ticket=650,lane=lane-650` before `cmd=`), in the dashboard's SELECTED panel, and grouped by `stats --by meta.KEY`. A nested `run` that inherits a lease runs under that lease's metadata and adds none of its own. Older clients read past the field: they list, grant (keeping it on the entry) and release such entries as before; only a request an older client reaps leaves a history line without its metadata.
 
-**`status --json`** is the queue for programs, such as a guard that must not kill another holder's lease: `{"v": 1, "slots", "held", "free", "entries": [...], "legacy": [...]}`, each entry `{"id", "lease", "state", "count", "label", "pid", "pgid", "start", "since", "granted", "cmd", "cwd", "meta", "tree"}`. `id` is the entry's name, `lease` its path (the value of `SLOTFATHER_LEASE` in the lease's command), `pid` the holder (`slotfather run`, or the process that called `acquire()`), `pgid` its process group, `tree` the holder and its live descendants. `status --json --pid PID` keeps only the entries whose tree holds PID: an empty list means the process belongs to no lease of this queue, unless launchd adopted it, in which case its environment still carries `SLOTFATHER_LEASE`. The extracted version also reads leases in Straylight's earlier queue during migration; old clients do not see new leases, so retire old wrappers before relying on mutual isolation.
+**`status --json`** is the queue for programs, such as a guard that must not kill another holder's lease: `{"v": 1, "slots", "held", "free", "entries": [...], "legacy": [...]}`, each entry `{"id", "lease", "state", "count", "label", "pid", "pgid", "start", "since", "granted", "cmd", "cwd", "meta", "tree", "class", "yieldable", "yields", "yield_asked", "position"}` (the last five: see Polite preemption). `id` is the entry's name, `lease` its path (the value of `SLOTFATHER_LEASE` in the lease's command), `pid` the holder (`slotfather run`, or the process that called `acquire()`), `pgid` its process group, `tree` the holder and its live descendants. `status --json --pid PID` keeps only the entries whose tree holds PID: an empty list means the process belongs to no lease of this queue, unless launchd adopted it, in which case its environment still carries `SLOTFATHER_LEASE`. The extracted version also reads leases in Straylight's earlier queue during migration; old clients do not see new leases, so retire old wrappers before relying on mutual isolation.
 
 ## Dashboard
 
@@ -92,7 +94,7 @@ While leases run, holders also append a machine sample to `machine.jsonl` at mos
 
 `grant()` runs in every client that looks at the queue (each waiter, every few seconds, and each release), and it starts the waiters `plan()` picks:
 
-1. Waiters are taken in arrival order; each that fits starts.
+1. Waiters are taken in arrival order, moved by their class (see Classes below); each that fits starts.
 2. A waiter that does not fit lets later requests that fit start first for `SLOTFATHER_OVERTAKE_WINDOW` seconds after it queued (600), as before.
 3. The first waiter past its window that does not fit is the **head**. Its start is reserved: the moment the held leases' expected ends free enough slots for it. A later request that fits starts before it only if three times (*safety*) its expected run ends by that moment and by the time the head will have waited its *limit* (2700 s), or if it takes only spare slots: those the head will not need at that moment even if the leases expected to run on past it are the largest ones (EASY backfill, made independent of which lease ends first). From the limit on nothing passes: the head holds everyone back as the window order did.
 
@@ -100,13 +102,40 @@ Expected runs come from `history.jsonl` (its last megabyte, read only when a req
 
 `available` and `advise` answer for a request of unknown run (the fallback) unless given the command: `slotfather available --label L -- COMMAND...`, `slotfather advise [--max N] --label L -- COMMAND...`; `advise` reports the run it expected as `run_estimate` (`null`: unknown).
 
-**Settings.** `slotfather order` shows the order and its numbers; `slotfather order backfill|window`, `--safety X` (at least 1), `--limit S` (0: no limit), `--fallback S` and `--overrun X` save them for every client in `order.json` beside the queue, like `slots` saves capacity, and `slotfather order reset` restores the defaults. They take effect at the next look at the queue, also while it is busy. Every client's look grants for the whole queue, so a client's environment can only tighten them: `SLOTFATHER_QUEUE=window`, or a higher `SLOTFATHER_BACKFILL_SAFETY` or `_FALLBACK`, a lower `_OVERRUN` or a lower nonzero `_LIMIT`; looser values are ignored. A saved file that cannot be read gives the window order.
+**Settings.** `slotfather order` shows the order and its numbers; `slotfather order backfill|window`, `--safety X` (at least 1), `--limit S` (0: no limit), `--fallback S`, `--overrun X`, and the classes' `--interactive S`, `--batch S` and `--yield-after S` (see below) save them for every client in `order.json` beside the queue, like `slots` saves capacity, and `slotfather order reset` restores the defaults. They take effect at the next look at the queue, also while it is busy. Every client's look grants for the whole queue, so a client's environment can only tighten them: `SLOTFATHER_QUEUE=window`, or a higher `SLOTFATHER_BACKFILL_SAFETY` or `_FALLBACK`, a lower `_OVERRUN` or a lower nonzero `_LIMIT`, a lower `SLOTFATHER_PRIORITY_INTERACTIVE` or `_BATCH` (classes move requests less), a higher `SLOTFATHER_YIELD_AFTER` or `0` (nobody is asked); looser values are ignored. A saved file that cannot be read gives the window order. The class knobs are written to `order.json` only when they differ from their defaults: a slotfather before them refuses a file with keys it does not know and falls back to the window order.
 
 **When an estimate is wrong.** A request that runs longer than expected delays the head by the difference. The limit bounds it: no request passes a head after the limit, and none that is expected to end after it, so beyond the leases it waited for, the head waits only for the overrun of what passed it. An overestimate only keeps a request behind the head, as the window order did. The replays below with estimates halved, doubled and scattered (each one off by a random factor, e^N(0,1)) keep the longest wait of large requests at the current order's.
 
 **Mixed versions.** Queue entries, `history.jsonl` and every output (`status`, `available`, `advise`, `slots`, `history`, the lease variables and nesting) are unchanged, so old and new clients share one queue. An older client grants by its own order whenever it looks, so until every client is updated the queue admits what either order allows: a new client's look starts a short request an old one would hold back, and an old client's look keeps today's behaviour for what the new order would refuse. Straylight's vendored `tools/slotfather` predates the history, so its runs are not in the estimates until it uses this one.
 
-**Falling back.** `slotfather order window` restores the order before #643 for every client of this version at their next look; `SLOTFATHER_QUEUE=window` does it for one client. Installing the previous version from a checkout of `bfa114b` with `python3 install.py` also works; the queue and history need nothing.
+**Falling back.** `slotfather order window` restores the order before #643 for every client of this version at their next look, without classes or yield requests; `SLOTFATHER_QUEUE=window` does it for one client. `slotfather order --yield-after 0` keeps the classes and asks nobody to yield; `--interactive 0 --batch 0` keeps backfill without classes. Installing the previous version from a checkout of `bfa114b` (or `3e3a621`, backfill without classes) with `python3 install.py` also works; the queue and history need nothing.
+
+### Classes
+
+`run --class interactive|normal|batch` (the same as `--meta class=...`; the library's `acquire(meta={"class": ...})`) says how much someone waits for the request. **interactive** is work a person or agent waits on at once: a pre-push check, a single test. **batch** is work nobody waits on minute by minute: full gates, post-merge smokes, measurements (`-n all` gets no class of its own: say `--class batch`). Everything else, and every request that names no class, is **normal**.
+
+The class moves where a waiter stands in the order, by a fixed offset that is also its ageing: an interactive waiter queues as if it came *interactive* seconds (1800) earlier, a batch one as if it came *batch* seconds (1800) later. So a batch request is ahead of every normal request that comes more than 30 minutes after it and of every interactive one that comes more than an hour after it; nothing waits behind newer work for longer than that. The window order (`slotfather order window`) has no classes.
+
+Classes change only the order in which `plan()` takes the waiters; the window, the head and its reservation then work as before on that order, and the window and the limit count from when a request really queued. The head is the first waiter in class order that is past its window and does not fit; a request that ranks ahead of it is not passing it, so a batch head (a `-n all` measurement) can start after its limit by the runs of the requests that rank ahead of it, those that came within 30 minutes after it (normal) or an hour (interactive). An interactive request that does not fit becomes the head in its turn and gets the head's reservation.
+
+### Polite preemption
+
+A holder that opted in (`run --yieldable`, `acquire(..., yieldable=True)`) can be asked to give its slots back for a while; it is never stopped, killed or signalled, and a holder that did not opt in is never asked. An **interactive** waiter asks when it has waited *yield_after* seconds (120), does not fit, and by the held leases' expected ends would not get its slots within another *yield_after*. It asks only yieldable holders of a lower class that have held their slots *yield_after* seconds since their last grant and have yielded fewer than two times; only as many as it needs (first those already asked, then batch before normal, then the one expected to run longest); and only when the queue would then start it, with the asked holders back among the waiters. Every look decides again: a request no longer needed (the waiter started or left) is withdrawn.
+
+The request is a file beside the holder's queue entry, `<entry>.yield`, whose path the lease's command gets in `SLOTFATHER_YIELD`; it holds `{"by", "label", "class", "count", "at"}` of the waiter that asked. `slotfather yield` from inside the lease (the library's `lease.yield_slots()`) yields if asked and the waiter still waits: the lease goes back to the queue (the same entry and holder, state `waiting`) just behind that waiter, the queue grants at once so the waiter starts, and the command returns when the lease is granted again with its slots. Without a request it returns at once, saying `no yield requested`; it exits 0 either way. A nested `slotfather run` under a yielded lease waits until the lease is back. `status` shows `yieldable`, `asked-to-yield-for=LABEL` and `yielded=N`; `status --json` adds `class`, `yieldable`, `yields`, `yield_asked` (the request or `null`) and `position` (a waiter's place in the order the queue serves); the dashboard's SELECTED panel shows the request; `queue.log` records asks, withdrawals and yields. The history line of a lease that yielded carries `yields` and `yielded` (seconds back in the queue); its wait and run count from its first grant, and `stats` leaves the yielded time out of cores per slot.
+
+#### What a client implements to be preemptible
+
+Straylight's `tools/verify.py` and `tools/heavy.py` and Sid-Kit's `scripts/heavy.sh` and `scripts/verify.mjs` are the intended clients; they are not changed here.
+
+1. **Opt in when taking the lease**: `slotfather run --yieldable --class batch ... -- COMMAND` (Sid-Kit's `heavy.sh`), or, for a client that holds its lease in-process (Straylight's `verify.py` through `tools/slot_lease.py`), `acquire(count, label, command, yieldable=True, meta={"class": "batch", ...})`.
+2. **Look for a request between steps**, whenever a step ends and none of the lease's own work runs: Straylight between checks, Sid-Kit between `verify.mjs` steps. The look is one `stat`: `[ -e "$SLOTFATHER_YIELD" ]` in a shell, `os.path.exists(os.environ.get("SLOTFATHER_YIELD", ""))` in Python, `lease.yield_requested()` in-process. With parallel jobs (`--jobs N`), stop starting new steps once a request is seen and let the running ones finish first.
+3. **Yield**: run `slotfather yield` (in-process `lease.yield_slots()`); it blocks while the lease is back in the queue. Then go on with the next step, with the same slots. Nothing has to be undone: a yield happens between steps.
+4. **Never** yield in the middle of a step or a measurement (a measurement does not opt in), never kill or signal a process to make room, and do not start new work under the lease while yielding.
+
+A client may ignore a request: the waiter then waits as it would have, and the request is withdrawn once it is no longer needed.
+
+**Mixed versions.** A slotfather before classes (`3e3a621` and earlier, Straylight's vendored copy) ignores them and the requests: its looks grant in arrival order, so until every client runs this version a waiter may start as either order allows. It lists a yielded lease as a waiter and may grant it again before the waiter it yielded to; `slotfather yield` then returns as usual. Since the yield itself grants at once, the waiter normally starts before an older client looks.
 
 ### How the order was chosen
 
@@ -142,6 +171,38 @@ Rejected:
 - **Booking by measured use** (packing slots by the cores a kind uses) needs a day of v2 usage lines; leases used 0.4 cores per slot in #635's first sample, so capacity, not order, is the lever there.
 - A **per-command `--estimate`** flag: callers do not know their run time better than the history.
 
+#### How the classes were chosen
+
+The same replay, with a class for each recorded request from its label and command (`classify()`: interactive for pre-push checks, one test file or name pattern, a single tool test; batch for gates of 50 or more checks, post-merge smokes, Sid-Kit's `verify.mjs`, old-client lane gates, `-n all` and labels that say measure, baseline, profile, stress, repro or probe; normal otherwise) and gates of Straylight and Sid-Kit taken as yieldable. An asked holder yields at the end of its step, a uniform time up to 300 s. Queue of 2026-11-02 14:21 to 2026-11-03 03:30 UTC (295 requests on 6 slots; 51 interactive, 156 normal, 78 batch); the current order replays the recorded waits within 60 s for 89% of them. Waits in seconds; *batch max* includes the time a batch request yielded.
+
+| Order | total h | p90 | ≥3 max | interactive mean | p90 | max | normal mean | batch mean | batch max | yields |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| window (before #643) | 40.0 | 1881 | 3911 | 631 | 2132 | 3911 | 244 | 944 | 3729 | 0 |
+| backfill (`3e3a621`) | 30.3 | 1560 | 3911 | 381 | 884 | 3911 | 145 | 860 | 3729 | 0 |
+| **classes 1800/1800 + yields after 120 s (shipped)** | **26.2** | **1324** | **3880** | **155** | **358** | **1895** | **92** | **925** | **3880** | **6** |
+| classes only | 26.8 | 1324 | 3880 | 184 | 596 | 1895 | 97 | 925 | 3880 | 0 |
+| yields only | 29.9 | 1560 | 3911 | 361 | 884 | 3911 | 141 | 860 | 3729 | 5 |
+| interactive ahead only | 33.0 | 1597 | 3704 | 275 | 864 | 2386 | 181 | 978 | 3849 | 0 |
+| batch behind only | 28.2 | 1464 | 3880 | 267 | 828 | 1895 | 98 | 932 | 3880 | 0 |
+| offsets 600 s | 30.0 | 1597 | 3957 | 235 | 884 | 1895 | 133 | 966 | 3957 | 6 |
+| batch 3600 s behind | 26.6 | 1378 | 4829 | 152 | 296 | 1895 | 60 | 1007 | 4829 | 5 |
+| normal waiters ask too | 25.7 | 1192 | 3880 | 152 | 358 | 1895 | 81 | 925 | 3880 | 9 |
+| steps up to 600 s | 26.6 | 1324 | 3880 | 166 | 495 | 1895 | 97 | 925 | 3880 | 5 |
+| shipped, estimates scattered | 27.5 | 1373 | 4428 | 171 | 612 | 1895 | 97 | 965 | 4428 | 5 |
+| backfill, estimates scattered | 29.6 | 1560 | 3911 | 380 | 884 | 3911 | 134 | 850 | 3729 | 0 |
+| a short class by estimate (≤ 5 min, 30 min ahead) | 28.3 | 1507 | 3520 | 322 | 823 | 3247 | 110 | 875 | 3770 | 0 |
+
+Classes with yields cut the total wait by 14% and interactive waits by more than half (mean 381 to 155 s, p90 884 to 358 s, longest 3911 to 1895 s); normal work waits less too. Batch work pays for it, inside the hour the offsets bound: its mean wait grows by 8% (860 to 925 s) and its longest by 4% (3729 to 3880 s), by 19% with scattered estimates. Most of the gain comes from holding batch work back; yields add little to the total but halve what classes leave of the interactive p90 (596 to 358 s), at 6 yields in 13 hours that gave back 0.07 slot-hours. In the #643 incident window the total wait stays at 4.5 h: there the head was a measurement that every class waits behind (in the fixture copied during the incident, with the runs then still going estimated, it falls from 4.6 to 3.2 h).
+
+Rejected:
+
+- **Interactive ahead only** waits longer than backfill alone (33.0 h): checks that jump ahead of gates' heads delay those heads and everyone behind them. **Smaller offsets** (600 s) gain nothing (30.0 h); **batch 3600 s behind** lets the longest batch wait grow to 4829 s for 0.4 h less in total.
+- **Normal waiters asking too**: 0.5 h less in total for half again as many yields, of gates that nobody waits on at a terminal.
+- **A short class by estimate** (no client change needed; the rejected row of the backfill table): 28.3 h and an interactive mean twice the shipped one; a kind's first run is classed wrongly, and old clients ignore it as they ignore classes.
+- **Shrinking instead of yielding** (`yield --keep N`): the replay cannot tell how long a gate runs on fewer slots (leases used about 0.4 cores per slot in #635's sample, so a shrink might cost nothing or the gate's whole parallelism), so it is not offered.
+- **A signal to the holder** (SIGUSR1, SIGTERM) instead of a file: a holder that installed no handler dies of it; a file asks only clients that look. **Stopping** a holder (SIGSTOP) or killing it: never.
+- **Batch and normal waiters asking**, and asks for `-n all`: preemption is for work someone is waiting on.
+
 Re-run after more history: `python3 tools/replay.py` (or `--since/--until` for a period, `--json`).
 
 ## Configuration
@@ -176,12 +237,14 @@ Capacity changes and reset are refused while any live holder or waiter exists, i
 | `SLOTFATHER_OVERTAKE_WINDOW` | Seconds after it queued during which a waiter that does not fit lets later requests that fit start first; default 600. With `window` and `0`, requests are served strictly in arrival order. |
 | `SLOTFATHER_QUEUE` | `window`: this client grants by the order before #643 whatever `slotfather order` saved (see Ordering). |
 | `SLOTFATHER_BACKFILL_SAFETY`, `_LIMIT`, `_FALLBACK`, `_OVERRUN` | Tighten this client's backfill below what `slotfather order` saved (higher safety or fallback, lower overrun or nonzero limit); looser values are ignored. |
+| `SLOTFATHER_PRIORITY_INTERACTIVE`, `_BATCH` | Move this client's classes less than `slotfather order` saved (seconds; lower values only; 0: not at all). |
+| `SLOTFATHER_YIELD_AFTER` | Ask holders to yield later than saved (seconds; higher values only), or `0`: this client's looks ask nobody. |
 | `SLOTFATHER_SAMPLE_MAX` | Longest interval, in seconds, between a holder's looks at its command's process tree; default 10. |
 | `SLOTFATHER_MACHINE_EVERY` | Seconds between machine samples while leases run; default 15. |
 | `SLOTFATHER_LOADAVG` | Advice test/diagnostic override: one number or `load1 load5 load15`. |
 | `SLOTFATHER_MEMORY_FILE` | Memory test seam: file containing `free_swap_MB pressure_level`. |
 
-A command receives `SLOTFATHER_LEASE` and `SLOTFATHER_COUNT` for its existing lease. Do not fabricate these values to skip queue admission.
+A command receives `SLOTFATHER_LEASE` and `SLOTFATHER_COUNT` for its existing lease, and a yieldable lease's command `SLOTFATHER_YIELD`, the path of its yield request (see Polite preemption). Do not fabricate these values to skip queue admission.
 
 ## Verify
 
@@ -189,4 +252,4 @@ A command receives `SLOTFATHER_LEASE` and `SLOTFATHER_COUNT` for its existing le
 slotfather run -n 1 -- python3 -m unittest discover -s tests -v
 ```
 
-Installer tests use isolated home directories and real live-process entries to check refusal, preservation, file guards, and repeated installation. Queue tests observe commands and queue admission using independent temporary state, controlled release files, and real child processes. They cover FIFO fairness, the overtaking window, backfill past a head (through real processes, and with a client of the previous version on the same queue), the run history and its rotation, exclusive requests, nesting, stale leases, memory guard, CLI outcomes, legacy migration, load advice, and persistent shared capacity changes. Metadata tests run requests with `--meta` through status, `status --json` (lease, process group, tree, `--pid`), the history, a nested run, the dashboard, `stats --by meta.KEY`, and the previous version on the same queue. Usage tests account fake process tables (reaped children, orphans that outlive their parent, launchd children carrying the lease, reused pids, memory), measure a real tree with a burning orphan under `run`, and check `stats` over old and new history lines and machine samples. Order tests decide `plan()` on fixed queues (window, reservation, fallback, overrun, limit, spare slots when leases end out of order), check the estimates, their cache and command kinds, the saved settings and what a client's environment may change, and `available`/`advise` for a given command; the replay test runs the recorded queue of 2026-11-02/03 in `tests/fixtures/replay` (commands cut to their kind) and checks that the current order reproduces the recorded waits and that backfill waits less without a longer wait for large requests, also with scattered estimates; a small trace checks that a long request does not take a slot the head needs when leases end out of order.
+Installer tests use isolated home directories and real live-process entries to check refusal, preservation, file guards, and repeated installation. Queue tests observe commands and queue admission using independent temporary state, controlled release files, and real child processes. They cover FIFO fairness, the overtaking window, backfill past a head (through real processes, and with a client of the previous version on the same queue), the run history and its rotation, exclusive requests, nesting, stale leases, memory guard, CLI outcomes, legacy migration, load advice, and persistent shared capacity changes. Class tests decide `plan()` and `yield_asks()` on fixed queues (offsets and ageing, a yielded lease behind its asker, who asks whom and when not), check the class settings and what a client's environment may change, run the whole protocol through real processes (a yieldable gate yields between steps and resumes, a holder that did not opt in is never asked, a request is shown and withdrawn when its waiter leaves), and run the previous version beside it; the replay test checks that classes with yields wait less on the recorded queue without holding batch work back beyond the offsets, and that a gate yields to a pre-push check and resumes in a small trace. Metadata tests run requests with `--meta` through status, `status --json` (lease, process group, tree, `--pid`), the history, a nested run, the dashboard, `stats --by meta.KEY`, and the previous version on the same queue. Usage tests account fake process tables (reaped children, orphans that outlive their parent, launchd children carrying the lease, reused pids, memory), measure a real tree with a burning orphan under `run`, and check `stats` over old and new history lines and machine samples. Order tests decide `plan()` on fixed queues (window, reservation, fallback, overrun, limit, spare slots when leases end out of order), check the estimates, their cache and command kinds, the saved settings and what a client's environment may change, and `available`/`advise` for a given command; the replay test runs the recorded queue of 2026-11-02/03 in `tests/fixtures/replay` (commands cut to their kind) and checks that the current order reproduces the recorded waits and that backfill waits less without a longer wait for large requests, also with scattered estimates; a small trace checks that a long request does not take a slot the head needs when leases end out of order.

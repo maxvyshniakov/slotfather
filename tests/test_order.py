@@ -184,8 +184,8 @@ class SettingsTests(unittest.TestCase):
 
     def test_saved_settings_are_every_clients(self):
         sf.save_order({"order": "backfill", "safety": 4, "limit": 1800, "fallback": 7200, "overrun": 0.25})
-        self.assertEqual({"order": "backfill", "safety": 4, "limit": 1800, "fallback": 7200, "overrun": 0.25,
-                          "saved": True}, sf.order_settings())
+        self.assertEqual({**sf.ORDER_DEFAULTS, "order": "backfill", "safety": 4, "limit": 1800, "fallback": 7200,
+                          "overrun": 0.25, "saved": True}, sf.order_settings())
 
     def test_the_environment_can_only_tighten_them(self):
         sf.save_order(dict(sf.ORDER_DEFAULTS))
@@ -344,11 +344,12 @@ class OrderTests(SlotCase):
             self.finish(process)
 
     def test_the_order_is_saved_for_every_client_and_reset(self):
-        self.assertEqual("backfill: safety 3, limit 2700 s, fallback 3600 s, overrun 0.5 (default)",
+        classes = "interactive 1800 s ahead, batch 1800 s behind, yield after 120 s"
+        self.assertEqual(f"backfill: safety 3, limit 2700 s, fallback 3600 s, overrun 0.5; {classes} (default)",
                          self.tool("order").stdout.strip())
-        self.assertEqual("window: safety 3, limit 2700 s, fallback 3600 s, overrun 0.5 (saved)",
+        self.assertEqual(f"window: safety 3, limit 2700 s, fallback 3600 s, overrun 0.5; {classes} (saved)",
                          self.tool("order", "window").stdout.strip())
-        self.assertEqual("backfill: safety 4, limit 1800 s, fallback 3600 s, overrun 0.5 (saved)",
+        self.assertEqual(f"backfill: safety 4, limit 1800 s, fallback 3600 s, overrun 0.5; {classes} (saved)",
                          self.tool("order", "backfill", "--safety", "4", "--limit", "1800").stdout.strip())
         self.assertEqual({"order": "backfill", "safety": 4.0, "limit": 1800.0, "fallback": 3600.0, "overrun": 0.5},
                          json.loads((self.state / "order.json").read_text()))

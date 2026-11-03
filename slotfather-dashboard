@@ -13,6 +13,7 @@ import contextlib
 import datetime
 import importlib.machinery
 import importlib.util
+import json
 import math
 import os
 from pathlib import Path
@@ -388,6 +389,10 @@ def dashboard_model() -> dict:
     live, legacy, _ = sf.snapshot(directory)
     slots, saved = sf.capacity()
     own, children = process_usage()
+    asks = {}  # holder pid -> the label of the waiter that asked it to yield
+    for place in (directory / "queue").glob("*.yield"):
+        with contextlib.suppress(OSError, ValueError, AttributeError):
+            asks[int(place.stem.split("-")[-1])] = str(json.loads(place.read_text()).get("label") or "?")
 
     def item(entry: dict, kind: str, count: int, queue: str = "") -> dict:
         tree = process_tree(entry.get("pid"), own, children) if kind != "waiting" else []
@@ -396,16 +401,20 @@ def dashboard_model() -> dict:
                 "label": dashboard_text(entry.get("label", "")), "pid": entry.get("pid"),
                 "cmd": dashboard_text(entry.get("cmd", "")), "since": parse_utc(entry.get("since")),
                 "meta": dashboard_text(sf.meta_text(sf.meta_of(entry))),
+                "yieldable": bool(entry.get("yieldable")), "yields": int(entry.get("yields") or 0),
+                "asked": dashboard_text(asks.get(entry.get("pid"), "")),
                 "granted": parse_utc(entry.get("granted")), "passable": kind == "waiting" and sf.overtakable(entry),
                 "style": "warn" if kind == "waiting" else "legacy"}
 
     holders = [item(e, "held", e["count"]) for e in live if e["state"] == "held"]
     holders += [item(e, "legacy", count, str(path.parent.parent)) for path, e, count in legacy]
-    live_waiters = [e for e in live if e["state"] != "held"]
-    waiters = [item(e, "waiting", e["count"]) for e in live_waiters]
-    used = sum(h["count"] for h in holders)
     settings, start = sf.order_settings(directory), None
     order = settings["order"]
+    live_waiters = [e for e in live if e["state"] != "held"]
+    if order == "backfill":
+        live_waiters = sf.ranked(live_waiters, settings)  # the order the queue serves them in
+    waiters = [item(e, "waiting", e["count"]) for e in live_waiters]
+    used = sum(h["count"] for h in holders)
     if order == "backfill" and live_waiters:
         with contextlib.suppress(Exception):  # an estimate that cannot be read leaves the sentence without a time
             found = sf.plan(live_waiters, [e for e in live if e["state"] == "held"], slots, time.time(), order,
@@ -636,6 +645,11 @@ def draw_detail(canvas: Canvas, y: int, x: int, height: int, width: int, model: 
                                   f"process{'es' * (item['procs'] != 1)}", "text")]))
     if item.get("meta"):
         facts.append(("meta", [(item["meta"], "text")]))
+    if item.get("asked"):
+        facts.append(("yield", [(f"asked to yield for {item['asked']}", "warn")]))
+    elif item.get("yieldable") or item.get("yields"):
+        facts.append(("yield", [("yields between steps when asked" + (f" · yielded {item['yields']}×"
+                                                                       if item.get("yields") else ""), "dim")]))
     where = tilde(item["queue"] or cwd or "")
     room_for_path = inner - 10 - len(f"pid {item['pid']} · ")
     if text_width(where) > room_for_path > 1:
