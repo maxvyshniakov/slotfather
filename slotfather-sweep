@@ -677,13 +677,17 @@ def plan(snap: Snapshot, settings: dict, protected: dict[int, str] | None = None
                 item["action"] = "stop" if live else "would-stop"
         else:
             item["action"] = "report"
-    # A candidate inside another that will be stopped goes with it.
+    # A candidate inside another that will be stopped goes with it; one inside another reported under a session is
+    # in that one's tree.
     stopping = {item["pid"] for item in found if item["action"] in ("stop", "would-stop")}
+    reported = {item["pid"] for item in found if item.get("under_session")}
     kept = []
     for item in found:
         above = next((a for a in snap.ancestors(item["pid"]) if a in stopping), None)
         if above is not None and item["action"] != "spared":
             continue
+        if item.get("under_session") and any(a in reported for a in snap.ancestors(item["pid"])):
+            continue  # listed with the session's child above it, in whose tree it is
         kept.append(item)
     return kept
 

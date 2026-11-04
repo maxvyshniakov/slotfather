@@ -242,9 +242,10 @@ class SessionTests(unittest.TestCase):
                  proc(102, 40, "/bin/zsh -c until ! pgrep -f y; do sleep 20; done", age=30 * 3600),
                  proc(103, 40, "/bin/zsh -c tail -f z", tty="ttys001", age=9 * 3600),
                  proc(104, 40, "/bin/zsh -c until ! pgrep -f v; do sleep 20; done", age=30 * 3600),
+                 proc(105, 104, "ugrep -E FAIL", age=30 * 3600),
                  proc(110, 1, "/bin/zsh -c until ! pgrep -f w; do sleep 20; done", age=1 * 3600)]
         cwds = {100: sweep.Cwd("/w", False), 101: sweep.Cwd(gone, True), 102: sweep.Cwd(gone, True),
-                104: sweep.Cwd(gone, True), 110: sweep.Cwd(gone, True)}
+                104: sweep.Cwd(gone, True), 105: sweep.Cwd(gone, True), 110: sweep.Cwd(gone, True)}
         seen = {sweep.gone_key(procs[2]): NOW - 7 * 3600, sweep.gone_key(procs[3]): NOW - 5 * 3600}
         found = plan(snap(procs, cwds, gone=(gone, f"{wt}/scratch")), live=True, gone_since=seen)
         self.assertEqual({100: "spared", 101: "stop", 102: "spared", 104: "spared", 110: "stop"},
@@ -254,6 +255,7 @@ class SessionTests(unittest.TestCase):
                          "reported; no session above it: stopped (110)")
         self.assertEqual((7 * 3600, 5 * 3600, 0), (found[101]["gone_for"], found[102]["gone_for"],
                                                    found[104]["gone_for"]))
+        self.assertEqual([104, 105], found[104]["tree"], "its child (105) is listed with it, not on its own")
         self.assertTrue(found[100]["under_session"] and found[102]["under_session"])
         self.assertNotIn("under_session", found[101])
         self.assertIn("under live session pid 40 (claude); report only: a live session's child", found[102]["reason"])
