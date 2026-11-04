@@ -547,8 +547,15 @@ class DashboardOrderTests(SlotCase):
         gate = self.request("gate", "all")
         self.wait_for(lambda: "waiting: 4 slot(s) gate" in self.status(), "the gate to queue")
         text = self.tool("dashboard", "--once", "--width", "200", "--height", "40").stdout
-        self.assertRegex(text, r"next is gate, which needs 4 slots with 3 free · it should start by "
-                               r"\d\d:\d\d:\d\d; one that ends by then starts first until \d\d:\d\d:\d\d")
+        lines = text.splitlines()
+        header = next(index for index,line in enumerate(lines) if "QUEUE" in line)
+        values = {}
+        for name in ("start est", "backfill by", "pass until"):
+            column = lines[header].index(name)
+            values[name] = lines[header + 2][column:column + 8]
+            self.assertRegex(values[name], r"^\d\d:\d\d:\d\d$")
+        self.assertEqual(values["start est"], values["backfill by"])
+        self.assertIn("1  gate", lines[header + 2])
         for label in ("one", "gate"):
             self.release(label)
         for process in (one, gate):
