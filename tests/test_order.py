@@ -546,16 +546,20 @@ class DashboardOrderTests(SlotCase):
         self.started("one")
         gate = self.request("gate", "all")
         self.wait_for(lambda: "waiting: 4 slot(s) gate" in self.status(), "the gate to queue")
-        text = self.tool("dashboard", "--once", "--width", "200", "--height", "40").stdout
-        lines = text.splitlines()
-        header = next(index for index,line in enumerate(lines) if "QUEUE" in line)
-        values = {}
-        for name in ("start est", "backfill by", "pass until"):
-            column = lines[header].index(name)
-            values[name] = lines[header + 2][column:column + 8]
-            self.assertRegex(values[name], r"^\d\d:\d\d:\d\d$")
-        self.assertEqual(values["start est"], values["backfill by"])
-        self.assertIn("1  gate", lines[header + 2])
+        with mock.patch.dict(os.environ,self.env,clear=True):
+            dashboard=load(TOOL+"-dashboard","order_dashboard")
+            model=dashboard.dashboard_model()
+            canvas=dashboard.Canvas(200,40)
+            dashboard.dashboard_draw(canvas,model,selected=len(model["holders"]))
+        lines=canvas.render(False).splitlines()
+        details=lines[0].index("╭",1)
+        values={}
+        for name in ("start est","backfill by","pass until"):
+            line=next(line for line in lines if name in line[details:])
+            values[name]=line[details:].split(name,1)[1].strip().split()[0]
+            self.assertRegex(values[name],r"^\d\d:\d\d:\d\d$")
+        self.assertEqual(values["start est"],values["backfill by"])
+        self.assertIn("▶gate",canvas.render(False))
         for label in ("one", "gate"):
             self.release(label)
         for process in (one, gate):

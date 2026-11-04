@@ -20,6 +20,7 @@ import tempfile
 import termios
 import time
 import unittest
+from unittest import mock
 
 from test_slotfather import TOOL, SlotCase
 
@@ -41,8 +42,7 @@ class DashboardTests(SlotCase):
     def test_table_headers_share_the_border_and_empty_messages_start_under_them(self):
         text = self.snapshot(width=220, height=50)
         lines = text.splitlines()
-        for title, message in (("RUNNING", "Nothing running"), ("QUEUE", "Empty ·"),
-                               ("EVENTS", "No grants")):
+        for title, message in (("LANES", "No lanes"), ("EVENTS", "No grants")):
             row = next(i for i, line in enumerate(lines) if title in line)
             self.assertEqual(lines[row].index(title), lines[row + 2].index(message))
             self.assertIn("╭", lines[row])
@@ -60,6 +60,24 @@ class DashboardTests(SlotCase):
                 self.assertIn("slotfather", text.splitlines()[-1])
                 self.assertIn("live", text.splitlines()[-1])
 
+    def test_admission_is_available_slots_not_worker_advice_and_honours_memory_gates(self):
+        def model():
+            with mock.patch.dict(os.environ,self.env,clear=True):
+                return load_dashboard().dashboard_model()
+        self.assertEqual(4,model()["admission"])
+        self.memory.write_text("128 1\n")
+        self.assertEqual(4,model()["admission"],"an idle host may still start its first lease")
+        holder=self.request("memory-gate-owner",1)
+        self.started("memory-gate-owner")
+        state=model()
+        self.assertEqual(3,state["free"])
+        self.assertEqual(0,state["admission"],"low swap blocks additional work despite free slots")
+        self.assertEqual(1,state["advice"]["jobs"],"worker advice is not admission permission")
+        self.memory.write_text("8000 1\n")
+        self.assertEqual(3,model()["admission"])
+        self.release("memory-gate-owner")
+        self.finish(holder)
+
     def test_an_idle_queue_reads_open_with_every_slot_free(self):
         text = self.snapshot()
         self.assertIn("SLOTS", text.splitlines()[0])
@@ -68,7 +86,7 @@ class DashboardTests(SlotCase):
         self.assertNotIn("slotfather", "\n".join(text.splitlines()[:-1]))
         self.assertNotIn(str(self.state), text)
         self.assertNotIn("OPEN", text)
-        self.assertIn("Nothing running · all 4 slots free", text)
+        self.assertIn("No lanes · all 4 slots free", text)
         self.assertNotIn("\x1b[", text, "a snapshot to a pipe is plain text")
 
     def test_a_blocked_head_explains_why_a_smaller_request_behind_it_waits(self):
@@ -82,13 +100,15 @@ class DashboardTests(SlotCase):
         self.assertNotIn("QUEUED", text)
         self.assertNotIn("next is", text)
         self.assertNotIn("next:", text)
-        self.assertIn("free", text.split("QUEUE", 1)[1].splitlines()[0])
         self.assertNotIn("2/4 held", text)
-        running, queue = text.index("RUNNING"), text.index("QUEUE ")
-        self.assertLess(running, text.index("│▶ holder"), "the holder is listed under RUNNING")
+        self.assertIn("no admission",text)
+        self.assertIn("LANES", text)
+        self.assertNotIn("RUNNING", text)
+        self.assertNotIn("QUEUE", text)
+        self.assertIn("│ ▶holder", text)
         self.assertEqual(1, text.count("▶"), "only the selected row has a cursor")
-        self.assertRegex(text[queue:], r"1  gate +4 .* next")
-        self.assertRegex(text[queue:], r"2  small +1 .* 4 ")
+        self.assertRegex(text, r"gate +waiting #1 +4")
+        self.assertRegex(text, r"small +waiting #2 +1")
         for label in ("holder", "gate", "small"):
             self.release(label)
         for process in (holder, gate, small):
@@ -102,7 +122,13 @@ class DashboardTests(SlotCase):
         self.wait_for(lambda: "waiting: 4 slot(s) gate" in self.status(), "the gate to queue")
         text = self.snapshot()
         self.assertNotIn("PASSING", text)
-        self.assertIn("pass until", text)
+        self.assertIn("waiting #1", text)
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            dashboard=load_dashboard()
+            model=dashboard.dashboard_model()
+            canvas=dashboard.Canvas(160,40)
+            dashboard.dashboard_draw(canvas,model,selected=len(model["holders"]))
+            self.assertIn("pass until",canvas.render(False))
         for label in ("holder", "gate"):
             self.release(label)
         for process in (holder, gate):
@@ -153,15 +179,22 @@ class DashboardTests(SlotCase):
                     return
             self.fail("live terminal did not render the expected selection")
         read_until(lambda text: "lane      click-owner" in text and "status    running" in text)
-        # SLOTS is six rows, RUNNING is five; queue data begins at zero-based row 13.
-        os.write(master, b"\x1b[<0;10;14M\x1b[<0;10;14m")
-        read_until(lambda text: "lane      click-target" in text and "status    waiting" in text)
+        # LANES starts at row 5: holder at 7, gap at 8, waiter at 9 (zero-based).
+        os.write(master, b"\x1b[<0;10;10M\x1b[<0;10;10m")
+        read_until(lambda text: re.search(r"lane\s+click-target",text) and re.search(r"status\s+waiting",text))
         os.write(master, b"m")
         read_until(lambda text: "text selection" in text)
         self.assertIn(b"\x1b[?1006l\x1b[?1000l", screen)
         os.write(master, b"m")
         read_until(lambda text: screen.count(b"\x1b[?1000h\x1b[?1006h") >= 2)
 
+        self.release("click-owner")
+        self.started("click-target")
+        screen.clear()
+        os.write(master, b"r")
+        read_until(lambda text: re.search(r"lane\s+click-target",text) and re.search(r"status\s+running",text))
+        self.assertIn("▶click-target".encode(), screen,
+                      "the same lease stays selected after moving into the active group")
         os.write(master, b"q")
         read_until(lambda text: process.poll() is not None)
         self.assertEqual(0, process.wait(timeout=3))
@@ -202,7 +235,7 @@ class SeparationTests(SlotCase):
             os.execve(TOOL, [TOOL], {**self.env, "TERM": "xterm-ghostty"})
         fcntl.ioctl(terminal, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
         screen, deadline = b"", time.monotonic() + 15
-        while b"RUNNING" not in screen and time.monotonic() < deadline:
+        while b"LANES" not in screen and time.monotonic() < deadline:
             if select.select([terminal], [], [], 0.1)[0]:
                 with contextlib.suppress(OSError):
                     screen += os.read(terminal, 65536)
@@ -220,12 +253,12 @@ class SeparationTests(SlotCase):
             os.kill(pid, 9)
             os.waitpid(pid, 0)
             self.fail("the dashboard did not quit on q")
-        self.assertIn(b"RUNNING", screen)
+        self.assertIn(b"LANES", screen)
         self.assertIn(b"\x1b[?1000h\x1b[?1006h", screen)
         self.assertIn(b"\x1b[?1006l\x1b[?1000l", screen)
         self.assertEqual(0, os.waitstatus_to_exitcode(status))
         text = screen.decode("utf-8")  # strict: a stray byte of a multibyte character fails here
-        self.assertIn("▉", text)
+        self.assertIn("■", text)
         self.assertNotRegex(text, r"\x1b\[\d+b", "no REP: a terminal repeats bytes, not characters")
         self.assertTrue(text.rstrip().endswith("\x1b[?1049l"), "quitting leaves the alternate screen")
 
@@ -235,18 +268,44 @@ class SeparationTests(SlotCase):
             self.assertNotIn(word, source)
 
 
+class UnifiedLaneTests(unittest.TestCase):
+    def test_running_and_waiting_share_a_viewport_with_an_unselectable_gap(self):
+        tool=load_dashboard()
+        now=datetime.datetime.now(datetime.timezone.utc)
+        holder=dict(label="active",kind="held",count=1,pid=10,style="h0",cpu=150,since=now,granted=now)
+        waiter=dict(label="pending",kind="waiting",count=2,pid=11,style="warn",cpu=0,since=now,granted=None)
+        model=dict(holders=[holder],waiters=[waiter],slots=6,cores=12)
+        canvas=tool.Canvas(130,8)
+        tool.draw_lanes(canvas,0,0,8,130,model,1,now)
+        lines=canvas.render(False).splitlines()
+        self.assertIn("LANES",lines[0])
+        self.assertIn("active",lines[2])
+        self.assertFalse(lines[3][1:-1].strip())
+        self.assertIn("│ ▶pending",lines[4])
+        self.assertIn("waiting #1",lines[4])
+        column=lines[0].index("cpu use/share")+len("cpu use/share")
+        self.assertEqual("—",lines[4][column-1])
+        self.assertEqual(1,tool.mouse_action(canvas,("mouse",0,20,4,True),{},0))
+        self.assertEqual(0,tool.mouse_action(canvas,("mouse",0,20,3,True),{},0))
+        canvas=tool.Canvas(130,6)
+        tool.draw_lanes(canvas,0,0,6,130,model,1,now)
+        lines=canvas.render(False).splitlines()
+        self.assertIn("pending",lines[3],"selection must remain visible beyond the gap")
+        self.assertIn("↑ 1 above",lines[1],"counts exclude the group separator")
+
+
 class MouseInputTests(unittest.TestCase):
     def test_click_and_wheel_follow_the_visible_rows_of_an_overflowing_table(self):
         tool = load_dashboard()
         now = datetime.datetime.now(datetime.timezone.utc)
         holders = [dict(label=f"job-{i}", kind="held", count=1, pid=100+i, style="h0",
                         cpu=0, since=now, granted=now) for i in range(8)]
-        model = dict(holders=holders, slots=8, cores=8)
+        model = dict(holders=holders, waiters=[], slots=8, cores=8)
         scroll = {}
         def render():
             canvas = tool.Canvas(100, 7)
             canvas.scroll = scroll
-            tool.draw_running(canvas, 0, 0, 7, 100, model, 0, now)
+            tool.draw_lanes(canvas, 0, 0, 7, 100, model, 0, now)
             return canvas
         canvas = render()
         self.assertEqual(1, tool.mouse_action(canvas, ("mouse", 0, 20, 3, True), scroll, 0))
@@ -286,6 +345,55 @@ class MouseInputTests(unittest.TestCase):
         finally:
             os.close(read)
             os.close(write)
+
+
+class IdleStatusTests(unittest.TestCase):
+    def test_failed_process_sample_is_not_returned_as_zero_cpu(self):
+        tool=load_dashboard()
+        failure=subprocess.CompletedProcess(["ps"],1,stdout="",stderr="unavailable")
+        with mock.patch.object(tool.subprocess,"run",return_value=failure):
+            with self.assertRaises(OSError):
+                tool.process_usage()
+
+
+    def test_idle_duration_tracks_low_usage_and_resets_on_activity_or_a_new_grant(self):
+        tool=load_dashboard()
+        now=datetime.datetime.now(datetime.timezone.utc)
+        item=dict(key=(12345,"lease"),label="build",kind="held",count=1,pid=12345,style="h0",cpu=10,
+                  rss=1024,procs=1,granted=now-datetime.timedelta(minutes=10),since=now-datetime.timedelta(minutes=10),
+                  queue="",cmd="build",tree=[])
+        model=dict(holders=[item],waiters=[],slots=6,cores=12,updated=now)
+        tracked={}
+        tool.dashboard_idle(model,tracked)
+        model["updated"]=now+datetime.timedelta(seconds=92)
+        tool.dashboard_idle(model,tracked)
+        canvas=tool.Canvas(90,24)
+        tool.draw_detail(canvas,0,0,24,90,model,0,None,model["updated"])
+        text=canvas.render(False)
+        self.assertIn("status    running · 1 slot · idle for 1m 32s",text)
+        self.assertNotIn("idle while holding slots",text)
+        item["cpu"]=50
+        tool.dashboard_idle(model,tracked)
+        self.assertIsNone(item["idle_since"])
+        item["cpu"]=10
+        model["updated"]=now+datetime.timedelta(seconds=100)
+        tool.dashboard_idle(model,tracked)
+        self.assertEqual(model["updated"],item["idle_since"])
+        item["granted"]=now+datetime.timedelta(seconds=110)
+        model["updated"]=item["granted"]
+        tool.dashboard_idle(model,tracked)
+        self.assertEqual(item["granted"],item["idle_since"])
+        model["holders"]=[]
+        tool.dashboard_idle(model,tracked)
+        self.assertFalse(tracked)
+        model["holders"]=[item]
+        tool.dashboard_idle(model,tracked)
+        tool.clear_idle(model,tracked)
+        self.assertFalse(tracked)
+        self.assertNotIn("idle_since",item)
+        model["updated"]=now+datetime.timedelta(seconds=200)
+        tool.dashboard_idle(model,tracked)
+        self.assertEqual(model["updated"],item["idle_since"])
 
 
 class DetailLayoutTests(unittest.TestCase):
@@ -335,16 +443,17 @@ class QueuePolicyTests(unittest.TestCase):
     def test_backfill_policy_is_structured_as_deadlines_not_a_sentence(self):
         tool = load_dashboard()
         since = datetime.datetime.now().astimezone().replace(hour=10, minute=0, second=0, microsecond=0)
-        model = dict(holders=[], waiters=[dict(count=3, since=since, passable=False, label="head", pid=100)], free=1,
+        model = dict(holders=[], waiters=[dict(count=3, since=since, passable=False, label="head", pid=100,
+                     kind="waiting",style="warn",cmd="work",queue="",tree=[])], free=1,used=1,slots=4,guard=None,
                      order="backfill", start=since+datetime.timedelta(minutes=30), limit=1200)
         self.assertEqual({"start est": "10:30:00", "backfill by": "10:30:00", "pass until": "10:20:00"},
                          tool.queue_policy(model))
-        canvas = tool.Canvas(140, 7)
-        tool.draw_queue(canvas, 0, 0, 7, 140, model, 0, since)
+        canvas = tool.Canvas(100,24)
+        tool.draw_detail(canvas,0,0,24,100,model,0,None,since)
         lines = canvas.render(False).splitlines()
         for title, value in (("start est", "10:30:00"), ("backfill by", "10:30:00"), ("pass until", "10:20:00")):
-            column = lines[0].index(title)
-            self.assertEqual(value, lines[2][column:column+8])
+            line=next(line for line in lines if title in line)
+            self.assertRegex(line,re.escape(title)+r"\s+"+re.escape(value))
         model["waiters"] = []
         self.assertEqual({}, tool.queue_policy(model))
 
@@ -356,9 +465,8 @@ class SlotBarTests(unittest.TestCase):
         tool.draw_slots(canvas, 0, 2, 116, dict(slots=6, used=1, waiters=[],
                         holders=[dict(count=1, kind="held", style="h0", label="lane-624-flows-are-graphs")]))
         lines = canvas.render(False).splitlines()
-        self.assertFalse(lines[1].strip(), "gap between slots and labels")
-        self.assertIn("lane-624-flows-are-graphs", lines[2])
-        self.assertEqual(lines[0].rindex("░") + 1, lines[2].index("free") + 4)
+        self.assertIn("lane-624-flows-are-graphs", lines[1])
+        self.assertEqual(lines[0].rindex("🮅") + 1, lines[1].index("free") + 4)
 
     def test_each_slot_is_solid_with_only_a_gap_between_slots(self):
         tool = load_dashboard()
@@ -366,16 +474,66 @@ class SlotBarTests(unittest.TestCase):
         tool.draw_slots(canvas, 0, 2, 116, dict(slots=3, used=2, waiters=[],
                         holders=[dict(count=2, kind="held", style="h0", label="build")]))
         line = canvas.render(False).splitlines()[0]
-        self.assertEqual("█" * 38 + "  " + "█" * 37 + "  " + "░" * 37, line[2:118])
+        self.assertEqual("🮅" * 38 + "  " + "🮅" * 37 + "  " + "🮅" * 37, line[2:118])
         self.assertNotIn("▉", line)
+
+
+class MachineStatusTests(unittest.TestCase):
+    def test_memory_gate_first_lease_exception_is_consumed_by_a_waiter_ahead(self):
+        tool=load_dashboard()
+        settings=dict(tool.sf.ORDER_DEFAULTS)
+        waiter=dict(count=1,label="waiting",cmd="work",since=tool.sf.now(),state="waiting")
+        self.assertEqual(0,tool.dashboard_admission([waiter],[],6,0,"memory pressure",None,settings))
+        self.assertEqual(6,tool.dashboard_admission([],[],6,0,"memory pressure",None,settings))
+        self.assertEqual(5,tool.dashboard_admission([waiter],[],6,0,None,None,settings))
+        waiter["meta"]={"class":"batch"}
+        self.assertEqual(6,tool.dashboard_admission([waiter],[],6,0,"memory pressure",None,settings),
+                         "a normal probe ranked first may use the idle-host exemption")
+
+
+    def test_compact_status_keeps_admission_visible(self):
+        tool=load_dashboard()
+        model=dict(admission=0,advice=dict(unleased_load=4.5),
+                   memory=dict(level=2,swap_total=1024,swap_free=128))
+        for width in (44,46):
+            parts=tool.machine_status(model,width)
+            text="".join(part for part,_ in parts)
+            self.assertLessEqual(tool.text_width(text),width)
+            self.assertIn("no admission",text)
+            self.assertIn("swap low",text)
+
+
+    def test_status_row_separates_memory_swap_and_real_admission_then_gaps_before_bars(self):
+        tool=load_dashboard()
+        now=datetime.datetime.now(datetime.timezone.utc)
+        for level,free,admission,memory_word,swap_word in ((1,800,2,"memory ok","swap ok"),
+                                                        (2,800,0,"memory low","swap ok"),
+                                                        (1,128,0,"memory ok","swap low")):
+            with self.subTest(level=level,free=free):
+                canvas=tool.Canvas(110,24)
+                model=dict(slots=6,cores=12,averages=(4,4,4),admission=admission,
+                           advice=dict(unleased_load=4.5,jobs=1),guard=None,
+                           memory=dict(level=level,used=768,total=1024,swap_total=1024,swap_free=free),
+                           history=[(now-datetime.timedelta(hours=1),now,1)])
+                tool.draw_machine(canvas,0,0,24,110,model)
+                lines=canvas.lines(False)
+                self.assertIn(memory_word,lines[2]);self.assertIn(swap_word,lines[2])
+                self.assertIn("unleased cores: 4.5",lines[2])
+                self.assertIn(f"admission: {admission}" if admission else "no admission",lines[2])
+                self.assertFalse(lines[3][1:-1].strip())
+                self.assertIn("load 1m",lines[4])
+                self.assertNotIn("advise",canvas.render(False))
+                self.assertNotIn("guard",canvas.render(False))
+                self.assertIn("38;5;255m",canvas.lines(True)[2])
+                if not admission:self.assertIn("38;5;167m",canvas.lines(True)[2])
 
 
 class MemoryBarTests(unittest.TestCase):
     def test_machine_has_usage_bars_and_a_chart_spanning_the_inner_width(self):
         tool = load_dashboard()
         now = datetime.datetime(2026, 1, 1, 12, tzinfo=datetime.timezone.utc)
-        canvas = tool.Canvas(90, 24)
-        tool.draw_machine(canvas, 0, 0, 24, 90, dict(slots=4, cores=12, averages=(1,2,3),
+        canvas = tool.Canvas(90, 18)
+        tool.draw_machine(canvas, 0, 0, 18, 90, dict(slots=4, cores=12, averages=(1,2,3),
                           advice=dict(unleased_load=0, jobs=2), guard=None,
                           memory=dict(level=1, used=768, total=1024, swap_total=512, swap_free=128),
                           history=[(now-datetime.timedelta(hours=1), now, 4)]))
@@ -385,6 +543,7 @@ class MemoryBarTests(unittest.TestCase):
         self.assertIn("used 384 MB of 512 MB", text)
         self.assertNotIn("load avg", text)
         self.assertNotIn("pressure", text)
+        self.assertEqual(6,sum("█" in line for line in lines))
         first_chart = next(i for i, line in enumerate(lines) if "█" in line)
         self.assertFalse(lines[first_chart - 1][1:-1].strip(), "gap above chart")
         self.assertFalse(lines[-4][1:-1].strip(), "one gap row before legend")
@@ -404,22 +563,22 @@ class MemoryBarTests(unittest.TestCase):
     def test_memory_bar_colour_reflects_pressure_without_a_separate_pressure_row(self):
         tool = load_dashboard()
         now = datetime.datetime.now(datetime.timezone.utc)
-        for level, colour in ((1,75), (2,179), (4,167)):
+        for level, colour in ((1,75), (2,167), (4,167)):
             with self.subTest(level=level):
                 canvas = tool.Canvas(90,24)
                 tool.draw_machine(canvas,0,0,24,90,dict(slots=4,cores=12,averages=(1,2,3),
                                   advice=dict(unleased_load=0,jobs=2),guard=None,
                                   memory=dict(level=level,used=768,total=1024,swap_total=512,swap_free=128),
                                   history=[(now-datetime.timedelta(hours=1),now,4)]))
-                row = next(i for i,line in enumerate(canvas.lines(False)) if "memory" in line)
+                row = next(i for i,line in enumerate(canvas.lines(False)) if "memory" in line and "used" in line)
                 self.assertIn(f"\x1b[0;38;5;{colour}m", canvas.lines(True)[row])
                 self.assertNotIn("pressure", canvas.render(False))
 
     def test_full_capacity_is_orange_even_in_a_one_row_histogram(self):
         tool=load_dashboard()
         now=datetime.datetime.now(datetime.timezone.utc)
-        canvas=tool.Canvas(90,10)
-        tool.draw_machine(canvas,0,0,10,90,dict(slots=4,cores=12,averages=(1,2,3),
+        canvas=tool.Canvas(90,11)
+        tool.draw_machine(canvas,0,0,11,90,dict(slots=4,cores=12,averages=(1,2,3),
                           advice=dict(unleased_load=0,jobs=2),guard=None,
                           memory=dict(level=1,used=768,total=1024,swap_total=512,swap_free=128),
                           history=[(now-datetime.timedelta(hours=1),now,4)]))
