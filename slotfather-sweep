@@ -44,6 +44,7 @@ from pathlib import Path
 import plistlib
 import re
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -152,14 +153,45 @@ def orphan_kind(cmd: str) -> str | None:
         return "tail-f"
     base = re.sub(r"[\d.]+$", "", base) or base
     if base in RUNNERS:
-        for word in parts[1:]:
-            word = word.strip("'\";")
-            if base in SHELLS and "/" not in word and "." not in word:
+        for n, word in enumerate(runner_script(parts)):
+            if word == "--test":
+                return "runner"
+            if base in SHELLS and ("/" not in word and "." not in word or n):
                 continue  # a shell's `test` or `[` is no test runner; its script (./verify.sh) is
             stem = os.path.basename(word).split(".")[0]
-            if RUNNER_WORD.match(stem) or re.search(r"\.(test|spec)\.[cm]?[jt]sx?$", word) or word == "--test":
+            if RUNNER_WORD.match(stem) or re.search(r"\.(test|spec)\.[cm]?[jt]sx?$", word):
                 return "runner"
     return None
+
+
+VALUE_OPTIONS = {"--cwd", "-C", "--prefix", "--filter", "-F", "-r", "--require", "--import", "--loader", "-w",
+                 "--workspace", "--dir", "--directory", "-p", "--project"}
+SUBCOMMANDS = {"run", "exec", "x", "run-script"}
+
+
+def runner_script(parts: list[str]) -> list[str]:
+    """What a runner runs: its script (or `-m` module, or a shell's `-c` command) and the word after it when that
+    is no option (`node cli.mjs verify`, `npm run test`), or ["--test"]. Options and their values are skipped, so
+    `node server.js --root /srv/e2e` and `python3 -m http.server --directory ~/tests` name no test."""
+    rest = [w.strip("'\";") for w in parts[1:]]
+    at = 0
+    while at < len(rest):
+        word = rest[at]
+        if word == "--test":
+            return [word]
+        if word in ("-m", "-c"):
+            script = rest[at + 1:at + 2]
+            after = rest[at + 2:at + 3]
+            return script + ([after[0]] if script and after and not after[0].startswith("-") else [])
+        if word.startswith("-"):
+            at += 2 if word in VALUE_OPTIONS else 1
+            continue
+        if word in SUBCOMMANDS:
+            at += 1
+            continue
+        after = rest[at + 1:at + 2]
+        return [word] + ([after[0]] if after and not after[0].startswith("-") else [])
+    return []
 
 
 def dev_server_kind(cmd: str) -> str | None:
@@ -190,12 +222,13 @@ class Snapshot:
     """The process table and what the sweep needs to know about it. Tests build one from fake tables."""
 
     def __init__(self, procs: dict[int, Proc], cwds: dict[int, Cwd] | None = None, managed=(),
-                 moment: float | None = None, uid: int | None = None, me=(), isdir=None, notes=()):
+                 moment: float | None = None, uid: int | None = None, me=(), isdir=None, notes=(), foreign=()):
         self.procs, self.cwds, self.managed = procs, cwds or {}, set(managed)
+        self.foreign = set(foreign)
         self.moment = time.time() if moment is None else moment
         self.uid = os.geteuid() if uid is None else uid
         self.me = set(me)
-        self.isdir = isdir or os.path.isdir
+        self.isdir = isdir or dir_state  # True, False (gone) or None (unknown)
         self.notes = list(notes)
         self.children: dict[int, list[int]] = {}
         for proc in procs.values():
@@ -254,15 +287,31 @@ def parse_table(text: str) -> dict[int, Proc]:
     return found
 
 
-def removed_dir(path: str, inode: int | None, isdir=os.path.isdir) -> bool:
-    """Whether a working directory is gone: nothing at its path, or another directory there now."""
-    if not path.startswith("/"):
+def dir_state(path: str) -> bool | None:
+    """True: a directory is there; False: nothing is (or a file); None: unknown, as when the sweep may not look
+    (launchd without Full Disk Access under ~/Documents, ~/Desktop, iCloud): unknown is never gone."""
+    try:
+        return stat.S_ISDIR(os.stat(path).st_mode)
+    except (FileNotFoundError, NotADirectoryError):
         return False
-    if not isdir(path):
-        return True
+    except OSError:
+        return None
+
+
+def removed_dir(path: str, inode: int | None, isdir=dir_state) -> bool | None:
+    """Whether a working directory is gone: nothing at its path, or another directory there now; None: unknown."""
+    if not path.startswith("/"):
+        return None
+    state = isdir(path)
+    if state is not True:
+        return None if state is None else True
     if inode is not None:
-        with contextlib.suppress(OSError):
+        try:
             return os.stat(path).st_ino != inode
+        except (FileNotFoundError, NotADirectoryError):
+            return True
+        except OSError:
+            return None
     return False
 
 
@@ -271,16 +320,7 @@ def working_dirs(procs: dict[int, Proc], uid: int) -> tuple[dict[int, Cwd], list
     lsof; Linux: /proc/PID/cwd, which says " (deleted)" for a removed one."""
     found, notes = {}, []
     if LINUX:
-        for pid, proc in procs.items():
-            if proc.uid != uid:
-                continue
-            with contextlib.suppress(OSError):
-                link = os.readlink(sf.proc_path(str(pid), "cwd"))
-                if link.endswith(" (deleted)"):
-                    found[pid] = Cwd(link[:-len(" (deleted)")], True)
-                    continue
-                inode = os.stat(sf.proc_path(str(pid), "cwd")).st_ino
-                found[pid] = Cwd(link, removed_dir(link, inode))
+        found, notes, _ = proc_cwds(procs, uid)
         return found, notes
     try:
         result = subprocess.run(["lsof", "-a", "-d", "cwd", "-u", str(uid), "-w", "-Fpin"], capture_output=True,
@@ -299,54 +339,130 @@ def working_dirs(procs: dict[int, Proc], uid: int) -> tuple[dict[int, Cwd], list
     return found, notes
 
 
+def proc_cwds(procs: dict[int, Proc], uid: int) -> tuple[dict[int, Cwd], list[str], set[int]]:
+    """Linux: the working directories from /proc/PID/cwd, notes, and the pids in another mount namespace (a
+    container: rootless podman, `docker run --user $(id -u)`), whose paths mean nothing here; those are left out
+    and never candidates. A directory is gone only when the kernel says so: " (deleted)" or no links left."""
+    found, notes, foreign = {}, [], set()
+    try:
+        own = os.readlink(sf.proc_path("self", "ns", "mnt"))
+    except OSError:
+        own = None
+    for pid, proc in procs.items():
+        if proc.uid != uid:
+            continue
+        try:
+            if own is not None and os.readlink(sf.proc_path(str(pid), "ns", "mnt")) != own:
+                foreign.add(pid)
+                continue
+            link = os.readlink(sf.proc_path(str(pid), "cwd"))
+        except OSError:
+            if own is not None:
+                foreign.add(pid)  # its namespace cannot be read: do not judge it
+            continue
+        if link.endswith(" (deleted)"):
+            found[pid] = Cwd(link[:-len(" (deleted)")], True)
+            continue
+        try:
+            removed = os.stat(sf.proc_path(str(pid), "cwd")).st_nlink == 0
+        except OSError:
+            removed = None
+        found[pid] = Cwd(link, removed)
+    if foreign:
+        notes.append(f"{len(foreign)} process(es) in another mount namespace (a container) left out")
+    return found, notes, foreign
+
+
 def managed_jobs(procs: dict[int, Proc], uid: int) -> set[int]:
     """Processes a service manager runs on purpose: launchd jobs of this user (macOS), systemd services' main
     processes (Linux). They have ppid 1 like an orphan; a service is not one."""
     found = set()
     if not LINUX:
-        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
-            result = subprocess.run(["launchctl", "list"], capture_output=True, text=True, timeout=TIMEOUT)
-            for line in result.stdout.splitlines()[1:]:
-                first = line.split("\t", 1)[0].strip()
-                if first.isdigit():
-                    found.add(int(first))
+        # `launchctl list` answers for the caller's domain only (from ssh or cron not the GUI one), so the GUI
+        # domain's services are asked for by name as well.
+        for command in (["launchctl", "list"], ["launchctl", "print", f"gui/{uid}"]):
+            with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+                result = subprocess.run(command, capture_output=True, text=True, timeout=TIMEOUT)
+                found |= launchd_pids(result.stdout, command[1])
         return found
-    units: dict[str, int | None] = {}
+    snap = Snapshot(procs, uid=uid)
+    units: dict[tuple[bool, str], int] = {}
     for pid, proc in procs.items():
-        if proc.uid != uid or proc.ppid != 1:
+        if proc.uid != uid or not snap.adopted(proc):
             continue
         try:
             lines = sf.proc_path(str(pid), "cgroup").read_text().splitlines()
         except OSError:
             continue
-        path = next((line.split(":", 2)[2] for line in lines if line.startswith("0::")), "")
-        unit = path.rstrip("/").rsplit("/", 1)[-1]
-        if not unit.endswith(".service"):
+        key = service_of(lines)
+        if key is None:
             continue
-        if unit not in units:
-            units[unit] = None
-            with contextlib.suppress(OSError, subprocess.TimeoutExpired, ValueError):
-                result = subprocess.run(["systemctl", "show", "--property", "MainPID", "--value", unit],
-                                        capture_output=True, text=True, timeout=TIMEOUT)
-                if result.returncode == 0:
-                    units[unit] = int(result.stdout.strip() or 0)
-            if units[unit] is None:  # no systemctl here: a process in a service is taken as the service's
-                units[unit] = -1
-        if units[unit] in (pid, -1):
+        if key not in units:
+            units[key] = main_pid(*key)
+        if units[key] in (pid, -1):
             found.add(pid)
     return found
+
+
+def launchd_pids(text: str, how: str) -> set[int]:
+    """The pids of running jobs in `launchctl list` (PID first on each line) or `launchctl print gui/UID` (its
+    services block: pid, status, label) output."""
+    found = set()
+    if how == "list":
+        for line in text.splitlines()[1:]:
+            first = line.split("\t", 1)[0].strip()
+            if first.isdigit() and int(first) > 0:
+                found.add(int(first))
+        return found
+    inside = False
+    for line in text.splitlines():
+        if line.strip() == "services = {":
+            inside = True
+        elif inside and line.strip() == "}":
+            inside = False
+        elif inside:
+            first = (line.split() or [""])[0]
+            if first.isdigit() and int(first) > 0:
+                found.add(int(first))
+    return found
+
+
+def service_of(cgroup_lines: list[str]) -> tuple[bool, str] | None:
+    """(in a user's manager, unit) of a process's cgroup v2 path when it is a .service, else None."""
+    path = next((line.split(":", 2)[2] for line in cgroup_lines if line.startswith("0::")), "")
+    unit = path.rstrip("/").rsplit("/", 1)[-1]
+    if not unit.endswith(".service"):
+        return None
+    return ("/user@" in path, unit)
+
+
+def main_pid(user: bool, unit: str, run=subprocess.run) -> int:
+    """The unit's MainPID from its manager (`systemctl --user` for a user's), or -1 when it cannot be asked: then
+    every process in the service is taken as the service's."""
+    try:
+        result = run(["systemctl", *(["--user"] if user else []), "show", "--property", "MainPID", "--value", unit],
+                     capture_output=True, text=True, timeout=TIMEOUT)
+        if result.returncode == 0:
+            return int(result.stdout.strip() or 0)
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        pass
+    return -1
 
 
 def snapshot() -> Snapshot:
     procs = table()
     uid = os.geteuid()
-    cwds, notes = working_dirs(procs, uid)
+    foreign = set()
+    if LINUX:
+        cwds, notes, foreign = proc_cwds(procs, uid)
+    else:
+        cwds, notes = working_dirs(procs, uid)
     me, here = set(), os.getpid()
     while here in procs and here not in me and here > 1:
         me.add(here)
         here = procs[here].ppid
     me.add(os.getpid())
-    return Snapshot(procs, cwds, managed_jobs(procs, uid), uid=uid, me=me, notes=notes)
+    return Snapshot(procs, cwds, managed_jobs(procs, uid), uid=uid, me=me, notes=notes, foreign=foreign)
 
 
 # Leases: never touch what runs inside one
@@ -405,6 +521,8 @@ def exempt(proc: Proc, snap: Snapshot) -> str | None:
         return "an app"
     if proc.pid in snap.managed:
         return "a launchd or systemd job"
+    if proc.pid in snap.foreign:
+        return "in another mount namespace"
     return None
 
 
@@ -418,17 +536,17 @@ def roots() -> tuple[str, ...]:
 
 
 def gone_paths(cmd: str, isdir, within: tuple[str, ...]) -> list[str]:
-    """Absolute paths in a command (also an option's =value) under `within` whose directory no longer exists; words
-    with a glob or a shell variable are no paths."""
+    """Absolute paths in a command (also an option's =value and the items of a `:`, `,` or `;` list) under `within`
+    whose directory is certainly gone (not merely unreadable); words with a glob or a shell variable are no paths."""
     found = []
     for word in words(cmd):
-        for part in (word, word.partition("=")[2]):
-            path = part.strip("'\";,()[]")
+        for part in re.split(r"[=:,;]", word):  # NODE_PATH=a:b, -cp a.jar:b.jar, --paths=a,b
+            path = part.strip("'\"()[]")
             if not path.startswith("/") or len(path) < 2 or not path.startswith(within) or \
                     re.search(r"[*?\[\]{}$`]", path):
                 continue  # a glob or a variable is no path the process is in
             parent = os.path.dirname(path.rstrip("/"))
-            if parent and parent != "/" and parent.rstrip("/") + "/" not in within and not isdir(parent) \
+            if parent and parent != "/" and parent.rstrip("/") + "/" not in within and isdir(parent) is False \
                     and path not in found:
                 found.append(path)
     return found
@@ -467,11 +585,15 @@ def reaches_session(snap: Snapshot, pid: int) -> int | None:
 
 
 def plan(snap: Snapshot, settings: dict, protected: dict[int, str] | None = None, carriers=None,
-         only: set[int] | None = None, live: bool = False, dev_servers: bool = False) -> list[dict]:
+         only: set[int] | None = None, live: bool = False, dev_servers: bool = False,
+         gone_since: dict[str, float] | None = None) -> list[dict]:
     """The sweep's items: each candidate process with its class, kind, tree and action (would-stop or stop, report,
     spared). `protected` maps pids in a live lease's tree to its label; `carriers(pids)` gives those of pids that
-    carry a lease (pid -> label). `only` limits the candidates to those pids."""
+    carry a lease (pid -> label). `only` limits the candidates to those pids. `gone_since` maps "pid start" to when
+    a sweep first saw that process's working directory gone (sweep-state.json); a process not in it counts as seen
+    gone now."""
     protected = protected or {}
+    gone_since = gone_since or {}
     enabled = set(settings["classes"])
     within = roots()
     session_dirs = None
@@ -487,11 +609,16 @@ def plan(snap: Snapshot, settings: dict, protected: dict[int, str] | None = None
         item = None
         cwd = snap.cwds.get(pid)
         if "removed" in enabled and age >= settings["removed_age"]:
-            gone = gone_paths(proc.cmd, snap.isdir, within)
-            if cwd is not None and cwd.removed:
-                item = {"class": "removed", "reason": f"cwd {cwd.path} is gone", "cwd_gone": True}
-            elif gone:
-                item = {"class": "removed", "reason": f"{gone[0]} is in a directory that is gone"}
+            if cwd is not None and cwd.removed is True:
+                first = gone_since.get(gone_key(proc))
+                item = {"class": "removed", "reason": f"cwd {cwd.path} is gone", "cwd_gone": True,
+                        "gone_for": round(max(0.0, snap.moment - first)) if first else 0}
+            elif orphan_kind(proc.cmd) or dev_server_kind(proc.cmd):
+                # A path in the command counts only for the dev kinds: any other program may name a directory it
+                # is about to create (an output path) or a list the split above did not foresee.
+                gone = gone_paths(proc.cmd, snap.isdir, within)
+                if gone:
+                    item = {"class": "removed", "reason": f"{gone[0]} is in a directory that is gone"}
         if item is None and "orphan" in enabled and snap.adopted(proc) and age >= settings["orphan_age"]:
             kind = orphan_kind(proc.cmd)
             if kind and not dev_server_kind(proc.cmd):
@@ -537,11 +664,15 @@ def plan(snap: Snapshot, settings: dict, protected: dict[int, str] | None = None
         elif session is not None:
             item.update(action="spared", reason=f"{item['reason']}; a session (pid {session}) in its tree")
         elif item["class"] in STOPPING or (item["class"] == "dev-server" and dev_servers):
-            if above is not None and not (item.get("cwd_gone") and item["age"] >= settings["session_removed_age"]):
-                # A live session's child is its owner's to stop; only one whose working directory has been gone
-                # for session_removed_age waits on a worktree that will not come back.
+            beside = above is not None and same_gone_dir(snap, above, item)
+            if above is not None and (beside or not (
+                    item.get("cwd_gone") and item.get("gone_for", 0) >= settings["session_removed_age"])):
+                # A live session's child is its owner's to stop; only one whose working directory a sweep has
+                # seen gone for session_removed_age waits on a worktree that will not come back, and not when the
+                # session itself works in that removed directory (its MCP servers, language servers).
                 item.update(action="spared", under_session=True,
-                            reason=f"{item['reason']}; report only: a live session's child")
+                            reason=f"{item['reason']}; report only: a live session's child"
+                                   + ("; the session works in the same removed directory" if beside else ""))
             else:
                 item["action"] = "stop" if live else "would-stop"
         else:
@@ -555,6 +686,36 @@ def plan(snap: Snapshot, settings: dict, protected: dict[int, str] | None = None
             continue
         kept.append(item)
     return kept
+
+
+def gone_key(proc: Proc) -> str:
+    return f"{proc.pid} {proc.start}"
+
+
+def same_gone_dir(snap: Snapshot, session: int, item: dict) -> bool:
+    """Whether the session itself sits in the removed checkout its child's working directory was in."""
+    there = snap.cwds.get(session)
+    if there is None or there.removed is not True or not item.get("cwd"):
+        return False
+    return project_root(there.path) == project_root(item["cwd"]) or \
+        item["cwd"].startswith(there.path.rstrip("/") + "/")
+
+
+def track_gone(snap: Snapshot, before: dict[str, float]) -> dict[str, float]:
+    """sweep-state.json's "gone_since" after this look: every process of the user whose working directory is gone,
+    with the moment a sweep first saw it so (kept from `before`), and nothing for processes no longer gone."""
+    return {gone_key(proc): before.get(gone_key(proc), snap.moment) for pid, proc in snap.procs.items()
+            if proc.uid == snap.uid and snap.cwds.get(pid) is not None and snap.cwds[pid].removed is True}
+
+
+def read_state(directory: Path) -> dict:
+    try:
+        data = json.loads((directory / "sweep-state.json").read_text())
+    except (OSError, ValueError):
+        return {}
+    gone = data.get("gone_since") if isinstance(data, dict) else None
+    return {"gone_since": {str(k): float(v) for k, v in gone.items() if isinstance(v, (int, float))}} \
+        if isinstance(gone, dict) else {}
 
 
 # Waits that never end
@@ -735,22 +896,24 @@ def identities(pids: list[int]) -> dict[int, tuple[str, bool]]:
     return found
 
 
-def stop(item: dict, snap: Snapshot, grace: float, now=time.monotonic, pause=time.sleep) -> dict:
+def stop(item: dict, snap: Snapshot, grace: float, now=time.monotonic, pause=time.sleep, look=None,
+         kill=os.kill) -> dict:
     """SIGTERM to the item's tree, SIGKILL to what is left after `grace` seconds; only to pids whose start time is
     the one the sweep saw. Returns {"result": stopped|killed|gone|failed, "signalled": [...], "left": [...]}."""
+    look = look or identities
     expected = {p: " ".join(snap.procs[p].start.split()) for p in item["tree"] if p in snap.procs}
-    seen = identities(list(expected))
+    seen = look(list(expected))
     targets = [p for p, start in expected.items() if p in seen and seen[p][0] == start and not seen[p][1]]
     if not targets:
         return {"result": "gone", "signalled": [], "left": []}
     signalled = []
     for pid in targets:
         with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.kill(pid, signal.SIGTERM)
+            kill(pid, signal.SIGTERM)
             signalled.append(pid)
 
     def remaining() -> list[int]:
-        here = identities(targets)
+        here = look(targets)
         return [p for p in targets if p in here and here[p][0] == expected[p] and not here[p][1]]
     deadline = now() + grace
     left = remaining()
@@ -761,7 +924,7 @@ def stop(item: dict, snap: Snapshot, grace: float, now=time.monotonic, pause=tim
         return {"result": "stopped", "signalled": signalled, "left": []}
     for pid in left:
         with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.kill(pid, signal.SIGKILL)
+            kill(pid, signal.SIGKILL)
     deadline = now() + 2
     while left and now() < deadline:
         pause(0.1)
@@ -772,10 +935,18 @@ def stop(item: dict, snap: Snapshot, grace: float, now=time.monotonic, pause=tim
 # Settings
 
 def settings(directory: Path | None = None) -> dict:
-    """sweep.json beside the queue over DEFAULTS; a file that cannot be read gives the defaults with "error"."""
-    found = dict(DEFAULTS, classes=list(DEFAULTS["classes"]), saved=False)
+    """sweep.json beside the queue over DEFAULTS. Unknown keys are ignored with a "warnings" entry (a newer
+    slotfather may have written them); a file that cannot be read or holds a bad value gives the defaults with
+    "error", and a live sweep then stops nothing."""
+    found = dict(DEFAULTS, classes=list(DEFAULTS["classes"]), saved=False, warnings=[])
     try:
-        found.update(checked(json.loads(((directory or sf.state_dir()) / "sweep.json").read_text())), saved=True)
+        data = json.loads(((directory or sf.state_dir()) / "sweep.json").read_text())
+        if not isinstance(data, dict):
+            raise ValueError(f"not sweep settings: {data!r}")
+        unknown = sorted(set(data) - set(DEFAULTS))
+        if unknown:
+            found["warnings"].append(f"sweep.json: unknown setting(s) {', '.join(unknown)} ignored")
+        found.update(checked({k: v for k, v in data.items() if k in DEFAULTS}), saved=True)
     except FileNotFoundError:
         pass
     except (OSError, ValueError, TypeError) as error:
@@ -828,15 +999,18 @@ def config_command(argv: list[str], directory: Path) -> int:
                 raise SweepError(str(error)) from None
         sf.require_own(directory, "a sweep settings change")
         with sf.locked(directory):
-            saved = {k: v for k, v in settings(directory).items() if k in DEFAULTS}
+            current = settings(directory)
+            if "error" in current:  # a broken file is replaced by the defaults and these changes
+                current = dict(DEFAULTS, classes=list(DEFAULTS["classes"]))
+            saved = {k: v for k, v in current.items() if k in DEFAULTS}
             try:
                 values = checked({**saved, **changes})
             except ValueError as error:
                 raise SweepError(str(error)) from None
             sf.write(directory / "sweep.json", values)
     found = settings(directory)
-    if "error" in found:
-        print(f"slotfather sweep: {found['error']}", file=sys.stderr)
+    for problem in found["warnings"] + ([found["error"]] if "error" in found else []):
+        print(f"slotfather sweep: {problem}", file=sys.stderr)
     print(f"sweep settings ({'saved in ' + str(directory / 'sweep.json') if found['saved'] else 'defaults'}):")
     for key in DEFAULTS:
         value = found[key]
@@ -851,10 +1025,14 @@ def config_command(argv: list[str], directory: Path) -> int:
 def sweep(directory: Path, live: bool = False, dev_servers: bool = False, only: set[int] | None = None,
           logged: bool = True) -> dict:
     found_settings = settings(directory)
+    refused = live and "error" in found_settings
+    if refused:
+        live = False  # settings that cannot be read stop nothing: the sweep reports what it would do
     snap = snapshot()
     protected, paths = leases(directory, snap)
     carriers = (lambda pids: carried(pids, paths)) if paths else None
-    items = plan(snap, found_settings, protected, carriers, only, live, dev_servers)
+    before = read_state(directory).get("gone_since", {})
+    items = plan(snap, found_settings, protected, carriers, only, live, dev_servers, before)
     if live:
         for item in items:
             if item["action"] == "stop":
@@ -872,8 +1050,11 @@ def sweep(directory: Path, live: bool = False, dev_servers: bool = False, only: 
     counts["container"] = len(docker["items"])
     report = {"v": VERSION, "at": round(snap.moment, 3), "live": live, "dev_servers": dev_servers,
               "only": sorted(only) if only is not None else None,
-              "settings": {k: found_settings[k] for k in DEFAULTS}, "notes": snap.notes + (
-                  [found_settings["error"]] if "error" in found_settings else []),
+              "settings": {k: found_settings[k] for k in DEFAULTS},
+              "settings_error": found_settings.get("error"), "live_refused": refused,
+              "notes": snap.notes + found_settings["warnings"] + (
+                  [found_settings["error"] + ("; the live sweep stopped nothing" if refused else "")]
+                  if "error" in found_settings else []),
               "items": items, "containers": docker, "memory": memory, "found": counts,
               "stopped": {c: sum(i["class"] == c and i["action"] in ("stopped", "killed") for i in items)
                           for c in ("removed", "orphan", "dev-server")},
@@ -886,6 +1067,7 @@ def sweep(directory: Path, live: bool = False, dev_servers: bool = False, only: 
     if logged and sf.foreign_owner(directory) is None:
         with contextlib.suppress(OSError):
             directory.mkdir(parents=True, exist_ok=True)
+            sf.write(directory / "sweep-state.json", {"v": VERSION, "gone_since": track_gone(snap, before)})
             sf.append_bounded(directory / "sweep.jsonl", json.dumps(report, sort_keys=True) + "\n", LOG_MAX)
     return report
 
@@ -901,7 +1083,8 @@ def text(report: dict, quiet: bool = False) -> str:
         return "\n".join(f"slotfather sweep: {ACTIONS[i['action']]} {i['class']} pid {i['pid']} {i['kind']}: "
                          f"{i['cmd'][:120]}" for i in items if i["action"] in ("stopped", "killed", "failed"))
     when = time.strftime("%Y-%m-%d %H:%M", time.localtime(report["at"]))
-    mode = "live" + (" with dev servers" if report["dev_servers"] else "") if report["live"] else "dry run"
+    mode = "live" + (" with dev servers" if report["dev_servers"] else "") if report["live"] else \
+        ("dry run (live refused: settings)" if report.get("live_refused") else "dry run")
     found = report["found"]
     lines.append(f"slotfather sweep · {mode} · {when} · removed {found['removed']}, orphans {found['orphan']}, "
                  f"dev servers {found['dev-server']}, looping containers {found['container']}"
@@ -922,10 +1105,11 @@ def text(report: dict, quiet: bool = False) -> str:
             sessions.setdefault(item.get("session"), []).append(item)
     for session, group in sessions.items():
         lines.append(f"  under live session pid {session}: {len(group)} child(ren) reported only "
-                     f"(stopped only when their cwd has been gone {sf.duration(report['settings']['session_removed_age'])})")
+                     f"(stopped only once a sweep has seen their cwd gone {sf.duration(report['settings']['session_removed_age'])})")
         for item in group:
-            lines.append(f"    {item['class']:<10} pid {item['pid']:<6} {sf.duration(item['age']):>7}  "
-                         f"{loop_head(item['cmd'])[:110]}")
+            gone = f" cwd gone {sf.duration(item['gone_for'])}" if item.get("cwd_gone") else ""
+            lines.append(f"    {item['class']:<10} pid {item['pid']:<6} {sf.duration(item['age']):>7}{gone}  "
+                         f"{loop_head(item['cmd'])[:100]}")
     patterns = {}
     for wait in report.get("self_matching") or []:
         patterns.setdefault(wait["pattern"], []).append(wait)
@@ -1044,6 +1228,10 @@ def main(argv: list[str] | None = None) -> int:
         output = text(report, quiet)
         if output:
             print(output)
+    if report["live_refused"]:
+        print(f"slotfather sweep: {report['settings_error']}; the live sweep stopped nothing (fix it with "
+              f"`slotfather sweep config ...` or `config reset`)", file=sys.stderr)
+        return 3
     return 1 if report["failed"] else 0
 
 
