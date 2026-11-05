@@ -6,7 +6,22 @@
     "machineAt": "2026-11-04T09:59:36.700000+00:00",
     "redactions": "Home paths shortened, PIDs consistently remapped, secret-bearing commands omitted.",
     "limitations": "CPU and memory per lane are recorded run averages, not instantaneous samples. Historical process names and physical memory usage are unavailable; omitted.",
-    "machineSha256": "70d2514aa5214e8fb443c3d1852b52ee2515b040fcfed0bfcbac68f01a0084ea"
+    "machineSha256": "70d2514aa5214e8fb443c3d1852b52ee2515b040fcfed0bfcbac68f01a0084ea",
+    "laneContext": {
+      "source": "Saved lanefather records, projected to the queue scene timestamp",
+      "records": {
+        "644-build-once.json": "ce047570503b0738b79360719c0d717a615f5b36769b3d08c5b33e5f8f3b8a6f",
+        "644-build-once.receipt.json": "d945dcffe4705d4a0713f1edd6ebad9e648f9736434295b5c05c71e1bd8d97be",
+        "644-build-once.review.json": "c8d75a07e14496de952e09db2e4717ba01ff2115ad5f10b6a8e40c3d03645425",
+        "465-state-definitions-review-fixes.json": "d19fdb97bd668cddeb235a87b28188f06dd34e41a49c638e71bf993216ce1d9b",
+        "465-state-definitions-review-fixes.receipt.json": "bf03b53770a588a45ee0f53685df25cb2d8f69d6f1eeb2a1986f60d64c6c4d16",
+        "465-state-definitions-review-fixes.review.json": "b805a5309cb085c0948eee533fe2c712bb5cc99c281a12b73de51d7271573b3a",
+        "555-host-rename-names.json": "7e201522f9de9782f7da04dca0062357158478fdfaa1067f20551d6edb317f14",
+        "555-host-rename-names.receipt.json": "e5b850bed75e72a40a20a12fda4bca39351116b117023dcf4de8c51495901ee8",
+        "555-host-rename-names.review.json": "7f8e40ef5b4debf2b84918b8b91f391436f07c61fbe455a2ce3cdbd65c3d241e"
+      },
+      "limitations": "Later receipt/review outcomes are excluded. Historical receipt tree currentness and process details are unavailable. Worktree paths are shortened for public media."
+    }
   },
   "model": {
     "directory": "(frozen demo)",
@@ -29,7 +44,7 @@
         "since": "2026-11-04T09:04:55+00:00",
         "granted": "2026-11-04T09:24:29+00:00",
         "cmd": "~/straylight/.claude/worktrees/agent-afa3816b08f8cf012/verify.sh --checks desktop-tests --keep-going --jobs 1",
-        "meta": "lane=644-build-once,ticket=644,phase=check,class=normal",
+        "meta": "lane=644-build-once,phase=check",
         "cpu": 110.1,
         "rss": 2684314,
         "procs": 516,
@@ -39,7 +54,50 @@
         "passable": false,
         "asked": "",
         "yieldable": false,
-        "yields": 0
+        "yields": 0,
+        "priority": "normal",
+        "ticket": "644",
+        "context": {
+          "lane": "644-build-once",
+          "phase": "check"
+        },
+        "lane": {
+          "version": 1,
+          "id": "644-build-once",
+          "project": "Straylight",
+          "repository": "https://github.com/maxvyshniakov/straylight",
+          "ticket": {
+            "number": "644",
+            "url": "https://github.com/maxvyshniakov/straylight/issues/644"
+          },
+          "status": "active",
+          "branch": "lane/644-build-once",
+          "base": "integrate/queue-347",
+          "worktree": "~/straylight/.claude/worktrees/agent-afa3816b08f8cf012",
+          "claims": [
+            "tools/verification_plan.py",
+            "tools/verify.py",
+            "build-domain-module.sh",
+            "tools/test-build-domain-module.py",
+            "tools/app-build.py",
+            "tools/test-app-build.py",
+            "tools/cargo-test.py",
+            "docs/development.md",
+            "tools/test-cargo-build-cache.py",
+            "tools/test-heavy.py",
+            "tools/cargo_build_cache.py"
+          ],
+          "after": [],
+          "checks": {
+            "status": "in progress",
+            "current": null
+          },
+          "review": {
+            "status": "not started",
+            "findings": 0,
+            "unresolved": 0
+          }
+        }
       },
       {
         "label": "lane-465-state-definitions-review-fixes",
@@ -48,7 +106,7 @@
         "since": "2026-11-04T09:41:05+00:00",
         "granted": "2026-11-04T09:42:39+00:00",
         "cmd": "~/straylight/.claude/worktrees/agent-a604013621f30731a/verify.sh --checks syntax:build-volume-click.sh,syntax:install-control-app.sh,syntax:create-local-signing-identity.sh,syntax:build-domain-module.sh,python-syntax:routing,tools/swift-test-coverage.py,tools/file-length-ratchet.py,tools/source-map-check.py,tools/port-probe-check.py,tools/rust-layer-check.py,tools/main-hop-check.py,tools/tis-thread-check.py,tools/actions-column-check.py,tools/source-patch-check.py,release-notes,tools/perf-budget-check.py,tools/gate-triage.py,tools/owner-decisions-check.py,test-release-notes,domain-build,production-domain-tests,cargo:straylight-core,native-consumers,tools/test-compile-commands.py,test-configuration-commands.py,test-web-server.py,tools/android-tv/test_worker.py,test-media-lifecycle.py,swift-tests,ha-discovery,test-caffeinate:compile,test-caffeinate,native-input-typecheck,remote-input-build,system-media,test-native-plex-socket.py,test-media-playback:compile,test-media-playback,hid-typecheck,ble-typecheck,test-ulanzi-hid-reports:compile,test-ulanzi-hid-reports,cargo:straylight-link-linux,tools/rust-msrv-check.py,gate-vectors:compile,gate-vectors,codec-vectors:compile,codec-vectors,tools/host-journeys.py,app-build,app-signature,app-commit,app-version,desktop-tests --keep-going --jobs 1",
-        "meta": "lane=465-state-definitions-review-fixes,ticket=465,phase=check,class=normal",
+        "meta": "lane=465-state-definitions-review-fixes,phase=check",
         "cpu": 107.4,
         "rss": 1649152,
         "procs": 1062,
@@ -58,7 +116,56 @@
         "passable": false,
         "asked": "",
         "yieldable": false,
-        "yields": 0
+        "yields": 0,
+        "priority": "normal",
+        "ticket": "465",
+        "context": {
+          "lane": "465-state-definitions-review-fixes",
+          "phase": "check"
+        },
+        "lane": {
+          "version": 1,
+          "id": "465-state-definitions-review-fixes",
+          "project": "Straylight",
+          "repository": "https://github.com/maxvyshniakov/straylight",
+          "ticket": {
+            "number": "465",
+            "url": "https://github.com/maxvyshniakov/straylight/issues/465"
+          },
+          "status": "active",
+          "branch": "lane/465-state-definitions-review-fixes",
+          "base": "integrate/queue-347",
+          "worktree": "~/straylight/.claude/worktrees/agent-a604013621f30731a",
+          "claims": [
+            "rust-core-state-device.swift",
+            "remote-contexts.swift",
+            "test-states.swift",
+            "native/straylight-core/fixtures/configuration/roles/both-accept-adjustable-and-home-assistant-states.json",
+            "native/straylight-core/fixtures/configuration/roles/linux-only-dial-context.json",
+            "native/straylight-core/fixtures/configuration/roles/mac-only-agent-remote.json",
+            "native/straylight-core/src/assembly/state_tests.rs",
+            "native/straylight-core/src/assembly/states.rs",
+            "native/straylight-core/src/configuration/preparation/drafts.rs",
+            "native/straylight-core/src/configuration/preparation/revisions_tests.rs",
+            "native/straylight-core/src/configuration/validation/remotes.rs",
+            "native/straylight-core/src/configuration/validation/states.rs",
+            "native/straylight-core/src/link_executor/python_states.rs",
+            "native/straylight-core/src/state/host_definitions_tests.rs",
+            "native/straylight-core/src/state/mod.rs",
+            "native/straylight-core/src/state/remote.rs",
+            "test-remote-contexts.swift"
+          ],
+          "after": [],
+          "checks": {
+            "status": "in progress",
+            "current": null
+          },
+          "review": {
+            "status": "not started",
+            "findings": 0,
+            "unresolved": 0
+          }
+        }
       },
       {
         "label": "desktop",
@@ -77,7 +184,9 @@
         "passable": false,
         "asked": "",
         "yieldable": false,
-        "yields": 0
+        "yields": 0,
+        "priority": "normal",
+        "context": {}
       }
     ],
     "waiters": [
@@ -98,7 +207,9 @@
         "passable": false,
         "asked": "",
         "yieldable": false,
-        "yields": 0
+        "yields": 0,
+        "priority": "normal",
+        "context": {}
       },
       {
         "label": "lane-555-host-rename-names",
@@ -107,7 +218,7 @@
         "since": "2026-11-04T09:59:29+00:00",
         "granted": null,
         "cmd": "~/straylight/.claude/worktrees/agent-a1c75285bdf2cd615/verify.sh --checks syntax:build-volume-click.sh,syntax:install-control-app.sh,syntax:create-local-signing-identity.sh,syntax:build-domain-module.sh,python-syntax:routing,tools/swift-test-coverage.py,tools/file-length-ratchet.py,tools/source-map-check.py,tools/port-probe-check.py,tools/rust-layer-check.py,tools/main-hop-check.py,tools/tis-thread-check.py,tools/actions-column-check.py,tools/source-patch-check.py,release-notes,tools/perf-budget-check.py,tools/gate-triage.py,tools/owner-decisions-check.py,test-release-notes,domain-build,production-domain-tests,cargo:straylight-core,native-consumers,tools/test-compile-commands.py,test-configuration-commands.py,test-web-server.py,tools/android-tv/test_worker.py,test-media-lifecycle.py,swift-tests,ha-discovery,test-caffeinate:compile,test-caffeinate,native-input-typecheck,remote-input-build,system-media,test-native-plex-socket.py,test-media-playback:compile,test-media-playback,hid-typecheck,ble-typecheck,test-ulanzi-hid-reports:compile,test-ulanzi-hid-reports,cargo:straylight-link-linux,tools/rust-msrv-check.py,gate-vectors:compile,gate-vectors,codec-vectors:compile,codec-vectors,tools/host-journeys.py,app-build,app-signature,app-commit,app-version,desktop-tests --keep-going --jobs 1",
-        "meta": "lane=555-host-rename-names,ticket=555,phase=check,class=normal",
+        "meta": "lane=555-host-rename-names,phase=check",
         "cpu": null,
         "rss": 0,
         "procs": 0,
@@ -117,7 +228,62 @@
         "passable": false,
         "asked": "",
         "yieldable": false,
-        "yields": 0
+        "yields": 0,
+        "priority": "normal",
+        "ticket": "555",
+        "context": {
+          "lane": "555-host-rename-names",
+          "phase": "check"
+        },
+        "lane": {
+          "version": 1,
+          "id": "555-host-rename-names",
+          "project": "Straylight",
+          "repository": "https://github.com/maxvyshniakov/straylight",
+          "ticket": {
+            "number": "555",
+            "url": "https://github.com/maxvyshniakov/straylight/issues/555"
+          },
+          "status": "active",
+          "branch": "lane/555-host-rename-names",
+          "base": "integrate/queue-347",
+          "worktree": "~/straylight/.claude/worktrees/agent-a1c75285bdf2cd615",
+          "claims": [
+            "host-connections.swift",
+            "host-calls.swift",
+            "native/straylight-core/src/server/links.rs",
+            "native/straylight-core/src/access/access_links.rs",
+            "test-host-connections.swift",
+            "capture-host-lane.swift",
+            "native/straylight-core/src/assembly/peers.rs",
+            "native/straylight-core/src/host/peering.rs",
+            "native/straylight-core/src/server/links_tests.rs",
+            "native/straylight-link-linux/src/service/mod.rs",
+            "native/straylight-link-linux/src/service/route.rs",
+            "native/straylight-link-linux/tests/service_route.rs",
+            "native/straylight-link-linux/tests/support/peers.rs",
+            "remote-routes.swift",
+            "test-capture-host-lane.swift",
+            "test-remote-routes.swift",
+            "desktop/src/DraftControls.tsx",
+            "desktop/src/editor-draft.ts",
+            "desktop/tests/apply-autosave.test.mjs",
+            "desktop/tests/apply-busy.test.mjs",
+            "rust-core-state-catalogue.swift",
+            "state-domain.swift",
+            "test-rust-core-state-races.swift"
+          ],
+          "after": [],
+          "checks": {
+            "status": "unavailable",
+            "current": null
+          },
+          "review": {
+            "status": "not started",
+            "findings": 0,
+            "unresolved": 0
+          }
+        }
       }
     ],
     "used": 4,

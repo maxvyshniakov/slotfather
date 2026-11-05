@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import time
 import types
+from typing import Any
 
 ROOT=Path(__file__).resolve().parents[1]
 FIXTURE=ROOT/'tools/fixtures/navigation.json'
@@ -40,7 +41,7 @@ def load_scene(advance=False):
         event['when']=dt.datetime.fromisoformat(event['when'])
     model['updated']=dt.datetime.fromisoformat(model['updated'])
     import importlib
-    dashboard=importlib.reload(importlib.import_module('slotfather.dashboard'))
+    dashboard: Any=importlib.reload(importlib.import_module('slotfather.dashboard'))
     dashboard.HISTORY_WINDOW=60  # short demo zoom; the legend reports seconds per column
     origin=model['updated']
     started=time.monotonic()
@@ -79,6 +80,9 @@ def load_scene(advance=False):
         fresh['history'].append((history_anchor,fresh['updated'],fresh['used']))
         fresh['advice']['unleased_load']=max(0,min(fresh['averages'][:2])-fresh['used']*2)
         return fresh
+    def frozen_details(_item: dict[str, Any]) -> None:
+        pass  # frozen lane summaries; never query live lanefather
+    dashboard.enrich_details=frozen_details
     dashboard.dashboard_model=sample
     dashboard.process_cwd=lambda pid:'~/straylight' if pid in [h['pid'] for h in model['holders']] else None
     return dashboard,sample()

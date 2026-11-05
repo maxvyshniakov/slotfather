@@ -5,6 +5,9 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import subprocess
+import sys
+from typing import Any
 
 state=Path.home()/'.local/state/slotfather'
 source=state/'history.jsonl'
@@ -38,10 +41,12 @@ def clean(text):
         return '[redacted command]'
     return text
 
-def item(r,index,waiting=False):
+def item(r: dict[str, Any],index: int,waiting: bool=False) -> dict[str, Any]:
     return dict(label=clean(r['label']),count=r['count'],pid=10000+index,
       since=iso(r['_queued']),granted=None if waiting else iso(r['_granted']),
-      cmd=clean(r['cmd']),meta=','.join(f'{k}={clean(v)}' for k,v in r.get('meta',{}).items() if k in ('lane','ticket','phase','class')),
+      cmd=clean(r['cmd']),priority=r.get('priority',r.get('meta',{}).get('class','normal')),
+      ticket=r.get('ticket',r.get('meta',{}).get('ticket')),
+      meta=','.join(f'{k}={clean(v)}' for k,v in r.get('meta',{}).items() if k in ('lane','phase','kind','check')),
       cpu=None if waiting else round(r.get('cpu',0)/max(1,r.get('wall',r['ran']))*100,1),
       rss=0 if waiting else round(r.get('rss_mean_mb',0)*1024),procs=0 if waiting else r.get('processes',0),
       tree=[],queue='',kind='waiting' if waiting else 'held',passable=False,asked='',yieldable=False,yields=0)
@@ -55,7 +60,7 @@ for i,r in enumerate(rows):
    events.append(dict(when=iso(r[key]),verb=verb,count=r['count'],delta=delta,label=clean(r['label']),pid=10000+all_items.index(r) if r in all_items else 20000+i))
 events.sort(key=lambda e:e['when'])
 used=sum(h['count'] for h in held)
-fixture=dict(provenance=dict(source='Completed local Slotfather history and nearest machine sample',
+fixture: dict[str, Any]=dict(provenance=dict(source='Completed local Slotfather history and nearest machine sample',
     historySha256=hashlib.sha256(source.read_bytes()).hexdigest(),capturedAt=iso(t),machineAt=iso(machine['at']),
     redactions='Home paths shortened, PIDs consistently remapped, secret-bearing commands omitted.',
     limitations='CPU and memory per request are recorded run averages, not instantaneous samples. Historical process names and physical memory usage are unavailable; omitted.'),
@@ -71,3 +76,5 @@ fixture['machine_samples']=[dict(at=iso(m['at']),averages=m['load'],
 fixture['provenance']['machineSha256']=hashlib.sha256((state/'machine.jsonl').read_bytes()).hexdigest()
 Path('tools/fixtures/navigation.json').write_text(json.dumps(fixture,indent=2)+'\n')
 print(json.dumps({'held':[(i['label'],i['count']) for i in items[:len(held)]],'waiting':[(i['label'],i['count']) for i in items[len(held):]],'at':iso(t)}))
+
+subprocess.run([sys.executable, str(Path(__file__).with_name("capture-demo-context.py"))], check=True)

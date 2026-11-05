@@ -31,6 +31,16 @@ To replace the fixture from your own completed local queue history, run
 `python3 tools/capture-demo-fixture.py` from the checkout and review the resulting JSON
 before using it in public media. The capture tool excludes secret-bearing commands.
 
-Presentation names follow the current glossary. Caller labels, metadata, command arguments
-and recorded observations keep their source values; version-1 metrics retain the `lanes`
-collection key as a compatibility alias.
+Presentation names and request fields follow the current glossary. Caller labels,
+command arguments and measured observations retain their source values. Archived
+class/ticket tags are converted once into priority/ticket request fields; caller
+context has named rows. Version-1 metrics retain their recorded `lanes` collection key.
+
+`python3 tools/capture-demo-context.py` refreshes lane context from saved lanefather
+records without replacing the queue scene. Stage is reconstructed from dated adopted,
+landed and done transitions. Receipt/review results completed after the scene time
+are excluded; an execution already started is shown as in progress. Historical
+receipt-tree currentness and process details remain unavailable. Source record hashes
+and these limits are saved in `navigation.json` provenance. Commands and worktree
+paths have shortened home directories for public media. The demo never replaces
+frozen context with the current lane state while recording.
