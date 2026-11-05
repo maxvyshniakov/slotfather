@@ -2,6 +2,14 @@
 """What a lease used (#635): the accounting of a process tree from fake process tables, a real tree under
 `slotfather run`, the machine samples and the bounded history."""
 from __future__ import annotations
+import sys as _path_sys
+from pathlib import Path as _Path
+_path_sys.path.insert(0, str(_Path(__file__).resolve().parents[1] / "src"))
+from slotfather import config as sf_config
+from slotfather import platform as sf_platform
+from slotfather import state as sf_state
+from slotfather import usage as sf_usage
+
 
 import importlib.machinery
 import importlib.util
@@ -22,13 +30,16 @@ BURN = "import sys, time\nt = time.process_time()\nwhile time.process_time() - t
 
 
 def load(path: str, name: str):
+    import importlib
+    if pathlib.Path(path).name in ("slotfather-dashboard", "slotfather-stats", "slotfather-sweep"):
+        companion = path.rsplit("slotfather-", 1)[-1]
+        return importlib.reload(importlib.import_module("slotfather." + companion))
     loader = importlib.machinery.SourceFileLoader(name, path)
     module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
     loader.exec_module(module)
     return module
 
 
-sf = load(TOOL, "slotfather_usage_core")
 
 SINCE = 1_800_000_000.0
 HOLDER, UID = 50, 501
@@ -53,7 +64,7 @@ class TreeUsageTests(unittest.TestCase):
         def mark(pids):
             asked.append(sorted(pids))
             return set(marked(pids)) if marked else set()
-        return sf.TreeUsage(100, SINCE, mark, uid=UID), asked
+        return sf_usage.TreeUsage(100, SINCE, mark, uid=UID), asked
 
     def test_cpu_of_children_the_tree_reaps_comes_from_rusage_only(self):
         usage, _ = self.usage()
@@ -131,21 +142,21 @@ class TreeUsageTests(unittest.TestCase):
     def test_ps_cpu_times_parse(self):
         for text, value in (("0:00.05", 0.05), ("593:13.58", 35593.58), ("1:02:03.50", 3723.5),
                             ("2-01:00:00", 176400.0)):
-            self.assertAlmostEqual(value, sf.cpu_seconds(text))
-        self.assertIsNone(sf.cpu_seconds("n/a"))
+            self.assertAlmostEqual(value, sf_platform.cpu_seconds(text))
+        self.assertIsNone(sf_platform.cpu_seconds("n/a"))
 
 
 class WatchTests(unittest.TestCase):
     """The sampler thread against stand-ins for ps: it must never hold up the lease's release."""
 
     def watch(self, marked=None):
-        usage = sf.TreeUsage(100, SINCE, marked, uid=UID)
-        watch = sf.Watch(usage, pathlib.Path("/nonexistent"))
+        usage = sf_usage.TreeUsage(100, SINCE, marked, uid=UID)
+        watch = sf_usage.Watch(usage, pathlib.Path("/nonexistent"))
         watch.most = 0.01
         return watch
 
     def patch(self, name, value):
-        patcher = mock.patch.object(sf, name, value)
+        patcher = mock.patch.object(sf_usage if name == "sample_machine" else sf_platform, name, value)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -169,18 +180,18 @@ class WatchTests(unittest.TestCase):
         began = time.monotonic()
         rusage = mock.Mock(ru_utime=1.0, ru_stime=0.5, ru_maxrss=0)
         found = watch.finish(rusage, 2.0)
-        self.assertLess(time.monotonic() - began, sf.WATCH_JOIN + 2)
+        self.assertLess(time.monotonic() - began, sf_config.WATCH_JOIN + 2)
         self.assertEqual(1.5, found["cpu"], "the usage so far, without a last look")
 
     def test_ps_calls_give_up_after_their_timeout(self):
         def stalled(*args, **kwargs):
-            self.assertEqual(sf.PS_TIMEOUT, kwargs.get("timeout"))
+            self.assertEqual(sf_config.PS_TIMEOUT, kwargs.get("timeout"))
             raise subprocess.TimeoutExpired(args[0], kwargs["timeout"])
         self.patch("subprocess", mock.Mock(run=stalled, TimeoutExpired=subprocess.TimeoutExpired))
-        self.assertEqual(set(), sf.carrying([1, 2], "/lease"))
-        with self.assertRaises(sf.SlotError):
-            sf.usage_table()
-        self.assertIsNone(sf.sysctl("kern.memorystatus_level"))
+        self.assertEqual(set(), sf_platform.carrying([1, 2], "/lease"))
+        with self.assertRaises(sf_config.SlotError):
+            sf_platform.usage_table()
+        self.assertIsNone(sf_platform.sysctl("kern.memorystatus_level"))
 
     def test_the_sampler_thread_leaves_signals_to_the_holder(self):
         masks, looked = [], threading.Event()
@@ -230,7 +241,7 @@ class RunUsageTests(SlotCase):
         self.addCleanup(probe.wait)
         self.addCleanup(probe.kill)
         time.sleep(0.3)
-        if probe.pid not in sf.carrying([probe.pid], "/probe"):
+        if probe.pid not in sf_platform.carrying([probe.pid], "/probe"):
             self.skipTest(f"ps shows no environment for {sys.executable} on this host")
         result = self.tool("run", "--label", "daemon", "--", "sh", "-c", '( "$PY" -c "$BURN" 0.5 & ); sleep 1.5')
         self.assertEqual(0, result.returncode, result.stderr)
@@ -256,16 +267,16 @@ class RunUsageTests(SlotCase):
 class BoundedHistoryTests(SlotCase):
     def test_history_rotates_into_one_older_file_and_reads_across_both(self):
         self.state.mkdir(parents=True)
-        original = sf.HISTORY_MAX
-        sf.HISTORY_MAX = 2000
-        self.addCleanup(setattr, sf, "HISTORY_MAX", original)
+        original = sf_config.HISTORY_MAX
+        sf_config.HISTORY_MAX = 2000
+        self.addCleanup(setattr, sf_config, "HISTORY_MAX", original)
         for n in range(40):
-            sf.record(self.state, {"label": f"r{n}", "count": 1, "since": "2026-11-03T00:00:00Z"}, "left")
+            sf_state.record(self.state, {"label": f"r{n}", "count": 1, "since": "2026-11-03T00:00:00Z"}, "left")
         current, older = self.state / "history.jsonl", self.state / "history.jsonl.1"
         self.assertTrue(older.exists())
         self.assertLessEqual(current.stat().st_size if current.exists() else 0, 2000)
         self.assertLessEqual(older.stat().st_size, 2000 + 400, "a file rotates at the first line past the bound")
-        labels = [item["label"] for item in sf.history_items(self.state)]
+        labels = [item["label"] for item in sf_state.history_items(self.state)]
         self.assertEqual(labels, sorted(labels, key=lambda name: int(name[1:])), "oldest first across both files")
         self.assertEqual("r39", labels[-1])
         self.assertLess(len(labels), 40, "the rotated file replaced an older one")
@@ -273,21 +284,21 @@ class BoundedHistoryTests(SlotCase):
     def test_a_torn_line_does_not_swallow_the_next_one(self):
         self.state.mkdir(parents=True)
         (self.state / "history.jsonl").write_text('{"label": "torn", "cou')
-        sf.record(self.state, {"label": "whole", "count": 1}, "left")
-        self.assertEqual(["whole"], [item["label"] for item in sf.history_items(self.state)])
+        sf_state.record(self.state, {"label": "whole", "count": 1}, "left")
+        self.assertEqual(["whole"], [item["label"] for item in sf_state.history_items(self.state)])
 
     def test_a_short_listing_reads_only_the_current_file(self):
         self.state.mkdir(parents=True)
         older = self.state / "history.jsonl.1"
         older.write_text(json.dumps({"label": "older", "count": 1}) + "\n")
         for n in range(3):
-            sf.record(self.state, {"label": f"r{n}", "count": 1}, "left")
+            sf_state.record(self.state, {"label": f"r{n}", "count": 1}, "left")
         older.chmod(0)
         self.addCleanup(older.chmod, 0o644)
-        self.assertEqual(2, len(sf.history_lines(2, self.state)))
+        self.assertEqual(2, len(sf_state.history_lines(2, self.state)))
         older.chmod(0o644)
-        self.assertIn("1 slot(s) older ", sf.history_lines(4, self.state)[0])
-        self.assertEqual(4, len(sf.history_lines(0, self.state)))
+        self.assertIn("1 slot(s) older ", sf_state.history_lines(4, self.state)[0])
+        self.assertEqual(4, len(sf_state.history_lines(0, self.state)))
 
     def test_lines_written_before_version_2_still_read(self):
         self.state.mkdir(parents=True)

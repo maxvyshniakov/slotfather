@@ -3,7 +3,7 @@
 ```sh
 slotfather stats                      # every request in the history, grouped by label and command kind
 slotfather stats --since 24h --by kind
-slotfather stats --since 2026-11-02 --label 'lane-*' --json
+slotfather stats --since 2026-11-02 --label 'request-*' --json
 ```
 
 While `run`'s command runs, its holder looks at the command's process tree: first after half a second, then each interval half as long again, up to `SLOTFATHER_SAMPLE_MAX` seconds (default 10), and once more after the command exits. One `ps` over the machine per look; nothing per second.

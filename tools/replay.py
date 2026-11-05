@@ -9,7 +9,7 @@ sequence) and the live queue (holders still running count as running until --now
 requests that gave up but start in a replay, are the median of their kind). Every order runs on the same requests
 in an event simulation: arrivals, ends, give-ups (a request that left the queue gives up after the wait it had,
 and its entry says so as `run --wait` writes it)
-and a look every POLL seconds while anyone waits, as waiters do. The memory guard is ignored. `window` and
+and a look every POLL seconds while anyone waits, as waiters do. The memory policy is ignored. `window` and
 `backfill` call the queue's own plan(), and yields its yield_asks(); the other orders are written here and were
 not shipped. Recorded requests carry no class, so classify() gives one from the label and command, and yieldable()
 says whose client would yield (Straylight and Sid-Kit gates); an asked holder yields at the end of its step, a
@@ -19,6 +19,13 @@ current order's replay against the recorded waits, then per order the waits of t
 waited, and while a waiter fitted the idle slots. Reads only; run it from a checkout.
 """
 from __future__ import annotations
+import sys as _path_sys
+from pathlib import Path as _Path
+_path_sys.path.insert(0, str(_Path(__file__).resolve().parents[1] / "src"))
+from slotfather import config as sf_config
+from slotfather import schedule as sf_schedule
+from slotfather import state as sf_state
+
 
 import argparse
 import bisect
@@ -35,15 +42,7 @@ import sys
 import time
 
 
-def load_core():
-    path = Path(__file__).resolve().parent.parent / "slotfather"
-    loader = importlib.machinery.SourceFileLoader("slotfather_core", str(path))
-    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
-    loader.exec_module(module)
-    return module
 
-
-sf = load_core()
 POLL = 10  # seconds between looks while anyone waits (SLOTFATHER_POLL_MAX)
 ASSUMED_RUN = 600  # seconds a request that never ran and is like nothing else runs once the replay grants it
 
@@ -63,7 +62,7 @@ def log_requests(path: Path) -> list[dict]:
     except FileNotFoundError:
         return []
     for line in lines:
-        when, rest = sf.seconds(line[:20]), line[21:]
+        when, rest = sf_config.seconds(line[:20]), line[21:]
         if when is None:
             continue
         match = re.match(r"granted (\d+) to (.*) \(pid (\d+)\)$", rest)
@@ -96,19 +95,19 @@ def requests(directory: Path, moment: float) -> list[dict]:
     the one after it; one that was granted is taken to arrive at the latest such moment (its wait is a lower
     bound), one that left without a grant half way between."""
     found, by_pid = [], {}
-    for item in sf.journal(directory / "history.jsonl"):
-        arrival = sf.seconds(item.get("queued"))
+    for item in sf_state.journal(directory / "history.jsonl"):
+        arrival = sf_config.seconds(item.get("queued"))
         if arrival is None or not isinstance(item.get("count"), int):
             continue
-        granted = sf.seconds(item.get("granted"))
+        granted = sf_config.seconds(item.get("granted"))
         request = {"label": item.get("label"), "cmd": item.get("cmd"), "count": item["count"], "arrival": arrival,
                    "run": item.get("ran") if granted is not None else None,
                    "patience": item.get("waited") if granted is None else None,
                    "waited": item.get("waited"), "source": "history", "outcome": item.get("outcome"),
-                   "give_up": sf.seconds(item.get("until")) or (arrival + item["waited"] if granted is None and
+                   "give_up": sf_config.seconds(item.get("until")) or (arrival + item["waited"] if granted is None and
                                                                 isinstance(item.get("waited"), (int, float)) else None)}
         found.append(request)
-        by_pid.setdefault(item.get("pid"), []).append((sf.seconds(item.get("ended")), request))
+        by_pid.setdefault(item.get("pid"), []).append((sf_config.seconds(item.get("ended")), request))
     start = min((r["arrival"] for r in found), default=moment)
     arrivals, unknown = {}, []
     for left in log_requests(directory / "queue.log"):
@@ -120,11 +119,11 @@ def requests(directory: Path, moment: float) -> list[dict]:
             unknown.append(left)
     live = []
     if (directory / "queue").is_dir():
-        for path, entry in sf.entries(directory):
-            arrival = sf.seconds(entry.get("since"))
+        for path, entry in sf_state.entries(directory):
+            arrival = sf_config.seconds(entry.get("since"))
             if arrival is None:
                 continue
-            granted = sf.seconds(entry.get("granted"))
+            granted = sf_config.seconds(entry.get("granted"))
             with_seq = path.name.split("-")[0]
             if with_seq.isdigit():
                 arrivals[int(with_seq)] = arrival
@@ -179,7 +178,7 @@ def classify(request: dict, slots: int) -> str:
     gate (verify with a check list of 50 or more, a post-merge smoke, Sid-Kit's verify.mjs, a lane check of an old
     client, which ran full gates), and measurements (every slot, or a label that says so); normal otherwise."""
     label, command = request.get("label") or "", request.get("cmd") or ""
-    what = sf.kind(command)
+    what = sf_schedule.kind(command)
     if "pre-push" in command or label.startswith("publish"):
         return "interactive"
     if request["count"] >= slots or MEASURING.search(label):
@@ -195,7 +194,7 @@ def classify(request: dict, slots: int) -> str:
     checks = re.search(r"--checks \[(\d+)\]", what)
     if (checks and int(checks[1]) >= 50) or "--suites" in what or "verify.mjs" in what:
         return "batch"
-    family = sf.family(label)
+    family = sf_schedule.family(label)
     if family in ("post-merge", "post-merge-pin-ui-libs", "ci-baseline-cold", "ci-baseline-warm"):
         return "batch"
     if family.startswith("lane") and not command:
@@ -221,17 +220,17 @@ def short_first(limit: float, bonus: float):
         def short(entry):
             run = estimate(entry)
             return run is not None and run <= limit
-        ordered = sorted(waiters, key=lambda e: (sf.seconds(e["since"]) - (bonus if short(e) else 0), e["id"]))
+        ordered = sorted(waiters, key=lambda e: (sf_config.seconds(e["since"]) - (bonus if short(e) else 0), e["id"]))
         return [dict(e, meta={"class": "interactive" if short(e) else "normal"}) for e in ordered], bonus
     return order
 
 
 def plan_all_only(waiters, held, slots, moment, estimate, settings):
     """Backfill around an all-slot waiter only; any other waiter that does not fit keeps the window order."""
-    first = sf.plan(waiters, held, slots, moment, "window", settings=settings)
+    first = sf_schedule.plan(waiters, held, slots, moment, "window", settings=settings)
     if not any(e["count"] >= slots for e in waiters):
         return first
-    backfill = sf.plan(waiters, held, slots, moment, "backfill", estimate, settings=settings)
+    backfill = sf_schedule.plan(waiters, held, slots, moment, "backfill", estimate, settings=settings)
     if backfill.head is not None and backfill.head["count"] >= slots:
         return backfill
     return first
@@ -243,7 +242,7 @@ class Replay:
     def __init__(self, requests: list[dict], slots: int, policy: dict, seed: list[tuple] = (),
                  assumed: dict | None = None):
         self.requests, self.slots, self.policy = requests, slots, policy
-        self.estimates = sf.Estimates(seed)
+        self.estimates = sf_schedule.Estimates(seed)
         self.assumed = assumed or {}
         self.classes = [classify(r, slots) for r in requests]
         self.asks = self.yields = 0
@@ -268,7 +267,7 @@ class Replay:
 
     def settings(self) -> dict:
         """The queue's defaults before classes (no class moves, nobody asked), and what the policy changes."""
-        return {**sf.ORDER_DEFAULTS, "interactive": 0.0, "batch": 0.0, "yield_after": 0.0,
+        return {**sf_config.ORDER_DEFAULTS, "interactive": 0.0, "batch": 0.0, "yield_after": 0.0,
                 **self.policy.get("settings", {})}
 
     def step(self, number: int) -> float:
@@ -285,20 +284,20 @@ class Replay:
         if name.startswith("short"):
             ordered, bonus = self.policy["reorder"](waiting, self.estimate)
             inner = "backfill" if name == "short+backfill" else "window"
-            found = sf.plan(ordered, held, self.slots, moment, inner, self.estimate,
+            found = sf_schedule.plan(ordered, held, self.slots, moment, inner, self.estimate,
                             settings={**settings, "interactive": bonus, "batch": 0.0}).grants
             by_id = {e["id"]: e for e in waiting}
             return [by_id[e["id"]] for e in found]
-        return sf.plan(waiting, held, self.slots, moment, name, self.estimate, settings=settings).grants
+        return sf_schedule.plan(waiting, held, self.slots, moment, name, self.estimate, settings=settings).grants
 
     def simulate(self) -> list[dict]:
         environment = {k: os.environ.get(k) for k in self.policy.get("env", {})}
         os.environ.update(self.policy.get("env", {}))
-        askers, sf.ASKERS = sf.ASKERS, self.policy.get("askers", sf.ASKERS)
+        askers, sf_config.ASKERS = sf_config.ASKERS, self.policy.get("askers", sf_config.ASKERS)
         try:
             return self._simulate()
         finally:
-            sf.ASKERS = askers
+            sf_config.ASKERS = askers
             for key, value in environment.items():
                 if value is None:
                     os.environ.pop(key, None)
@@ -354,7 +353,7 @@ class Replay:
                     continue  # it yielded before this end
                 entry = held.pop(number)
                 asked.pop(number, None)
-                if request.get("outcome") not in sf.UNFINISHED or self.policy.get("reaped_estimates"):
+                if request.get("outcome") not in sf_config.UNFINISHED or self.policy.get("reaped_estimates"):
                     # history_estimates() leaves reaped leases out (before d9e5904 it counted them)
                     self.estimates.add(entry["label"], entry["cmd"], self.run_of(request))
                 result[number]["ended"] = moment
@@ -363,7 +362,7 @@ class Replay:
                         asked[number] not in waiting:
                     continue  # the ask was withdrawn, or it ended first, or the asker started or left meanwhile
                 entry = held.pop(number)
-                entry["rank"] = sf.rank_time(waiting[asked.pop(number)], self.settings()) + sf.YIELD_BEHIND
+                entry["rank"] = sf_schedule.rank_time(waiting[asked.pop(number)], self.settings()) + sf_config.YIELD_BEHIND
                 remaining[number] -= moment - began[number]
                 entry.update(state="waiting", yields=int(entry.get("yields") or 0) + 1, yielded_at=moment)
                 waiting[number] = entry
@@ -372,7 +371,7 @@ class Replay:
             elif kind == "tick":
                 ticking = False
             if waiting:
-                ordered = sorted(waiting.values(), key=lambda e: (sf.seconds(e["since"]), e["id"]))
+                ordered = sorted(waiting.values(), key=lambda e: (sf_config.seconds(e["since"]), e["id"]))
                 for entry in self.decide(ordered, list(held.values()), moment):
                     number = entry["id"]
                     del waiting[number]
@@ -393,9 +392,9 @@ class Replay:
                     order += 1
                 settings = self.settings()
                 if settings["yield_after"] and waiting:
-                    ordered = sorted(waiting.values(), key=lambda e: (sf.seconds(e["since"]), e["id"]))
+                    ordered = sorted(waiting.values(), key=lambda e: (sf_config.seconds(e["since"]), e["id"]))
                     holders = list(held.values())
-                    wanted = sf.yield_asks(ordered, holders, self.slots, moment, self.estimate, settings=settings,
+                    wanted = sf_schedule.yield_asks(ordered, holders, self.slots, moment, self.estimate, settings=settings,
                                            asked=[held[n] for n in asked])
                     chosen = {h["id"]: w["id"] for h, w in wanted}
                     for number in [n for n in asked if n not in chosen]:
@@ -431,7 +430,7 @@ def percentile(values: list[float], q: float) -> float:
 
 def measure(requests: list[dict], results: list[dict], start: float, until: float, replay: Replay) -> dict:
     waits, large, left = [], [], 0
-    classes = {name: {"waits": [], "delays": []} for name in sf.CLASSES}
+    classes = {name: {"waits": [], "delays": []} for name in sf_config.CLASSES}
     yielded = yields = 0.0
     for request, result in zip(requests, results):
         if request["arrival"] < start or request["arrival"] > until:
@@ -530,7 +529,7 @@ def validate(requests: list[dict], results: list[dict], start: float, until: flo
 
 
 def family_patience(found: list[dict]) -> list[dict]:
-    """Gives every request a client wait as its family's (sf.family() of its label) longest recorded give-up, where
+    """Gives every request a client wait as its family's (sf_schedule.family() of its label) longest recorded give-up, where
     any request of that family gave up and the history has no `until` for it: lines before the history recorded
     `until` do not say which requests had a wait, and taking only those that gave up as having one hides what a
     head that gives up costs when it would not have. A request that waited longer than that in fact had no such
@@ -538,10 +537,10 @@ def family_patience(found: list[dict]) -> list[dict]:
     longest = {}
     for request in found:
         if request["source"] == "history" and request["patience"] is not None:
-            name = sf.family(request["label"])
+            name = sf_schedule.family(request["label"])
             longest[name] = max(longest.get(name, 0.0), float(request["patience"]))
     for request in found:
-        patience = longest.get(sf.family(request["label"]))
+        patience = longest.get(sf_schedule.family(request["label"]))
         if request["source"] == "log" or request.get("give_up") is not None or patience is None:
             continue
         if request["waited"] is not None and request["waited"] > patience:
@@ -561,8 +560,8 @@ def compare(directory: Path, moment: float, slots: int, policies: dict = POLICIE
     start = min((r["arrival"] for r in found if r["source"] == "history"), default=moment)
     until = max((r["arrival"] for r in found), default=moment) if until is None else until
     first = start if since is None else since
-    whole = sf.Estimates((r["label"], r["cmd"], r["run"]) for r in found
-                         if r["run"] is not None and r.get("outcome") not in sf.UNFINISHED)
+    whole = sf_schedule.Estimates((r["label"], r["cmd"], r["run"]) for r in found
+                         if r["run"] is not None and r.get("outcome") not in sf_config.UNFINISHED)
     seed = seed_runs(directory, start) if seed_log else []
     table, validation = {}, None
     for name, policy in policies.items():
@@ -606,7 +605,7 @@ def report(summary: dict) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--dir", default=str(sf.state_dir()))
+    parser.add_argument("--dir", default=str(sf_config.state_dir()))
     parser.add_argument("--now", help="the moment live holders are taken to run until (ISO, UTC); default now")
     parser.add_argument("--slots", type=int, help="capacity; default the saved or automatic one")
     parser.add_argument("--since", help="count waits of requests that arrived from then (ISO, UTC)")
@@ -616,11 +615,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true")
     options = parser.parse_args(argv)
     directory = Path(options.dir).expanduser()
-    moment = sf.seconds(options.now) if options.now else time.time()
+    moment = sf_config.seconds(options.now) if options.now else time.time()
     os.environ["SLOTFATHER_DIR"] = str(directory)
-    slots = options.slots or sf.total()
-    summary = compare(directory, moment, slots, since=sf.seconds(options.since) if options.since else None,
-                      until=sf.seconds(options.until) if options.until else None, families=options.families)
+    slots = options.slots or sf_config.total()
+    summary = compare(directory, moment, slots, since=sf_config.seconds(options.since) if options.since else None,
+                      until=sf_config.seconds(options.until) if options.until else None, families=options.families)
     print(json.dumps(summary, indent=1) if options.json else report(summary))
     return 0
 

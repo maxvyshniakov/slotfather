@@ -3,6 +3,11 @@
 2026-11-02 22:10 to 2026-11-03 01:48 UTC (commands cut to their kind): the 6-slot measurements and the incident of
 #643, where one 6-slot request held back twelve others with five slots idle."""
 from __future__ import annotations
+import sys as _path_sys
+from pathlib import Path as _Path
+_path_sys.path.insert(0, str(_Path(__file__).resolve().parents[1] / "src"))
+from slotfather import config as sf_config
+
 
 import json
 import pathlib
@@ -14,11 +19,10 @@ from test_slotfather import ROOT
 from test_usage import load
 
 replay = load(str(ROOT / "tools" / "replay.py"), "slotfather_replay_under_test")
-sf = replay.sf
 
 FIXTURE = ROOT / "tests" / "fixtures" / "replay"
-NOW = sf.seconds("2026-11-03T01:48:36Z")  # when the live queue in the fixture was copied
-INCIDENT = (sf.seconds("2026-11-03T00:48:50Z"), sf.seconds("2026-11-03T01:40:00Z"))
+NOW = sf_config.seconds("2026-11-03T01:48:36Z")  # when the live queue in the fixture was copied
+INCIDENT = (sf_config.seconds("2026-11-03T00:48:50Z"), sf_config.seconds("2026-11-03T01:40:00Z"))
 SHIPPED, CURRENT = "backfill (shipped)", "window (current)"
 CLASSES = "classes + yields (#643 shipped)"
 
@@ -81,7 +85,7 @@ class YieldTraceTests(unittest.TestCase):
                   "run": 60.0}]
         for number, request in enumerate(found):
             request.update(id=number, patience=None, waited=None, source="history",
-                           arrival=sf.seconds("2026-11-02T10:00:00Z") + request["arrival"])
+                           arrival=sf_config.seconds("2026-11-02T10:00:00Z") + request["arrival"])
         return found
 
     def test_the_gate_yields_to_the_pre_push_check_and_resumes(self):
@@ -107,7 +111,7 @@ class AllSlotTraceTests(unittest.TestCase):
     it starts once those that came within both class offsets after it have run."""
 
     def test_an_all_slot_batch_request_starts_after_the_class_offsets_and_the_runs_ahead_of_it(self):
-        start = sf.seconds("2026-11-02T10:00:00Z")
+        start = sf_config.seconds("2026-11-02T10:00:00Z")
         found = [{"label": "lane-1", "cmd": "make", "count": 1, "arrival": 0.0, "run": 600.0},
                  {"label": "lane-2-measure", "cmd": "measure.sh", "count": 6, "arrival": 10.0, "run": 600.0}]
         found += [{"label": "sid-kit-wt-1", "cmd": "node scripts/pre-push.mjs origin", "count": 1,
@@ -120,10 +124,10 @@ class AllSlotTraceTests(unittest.TestCase):
         offsets = replay.CLASSES["interactive"] + replay.CLASSES["batch"]
         head = replay.Replay(found, 6, replay.POLICIES[CLASSES], seed).simulate()[1]
         waited = head["granted"] - found[1]["arrival"]
-        self.assertGreater(waited, sf.ORDER_DEFAULTS["limit"], "the limit alone no longer bounds it")
+        self.assertGreater(waited, sf_config.ORDER_DEFAULTS["limit"], "the limit alone no longer bounds it")
         self.assertLessEqual(waited, offsets + 300 + 2 * replay.POLL, "the offsets and the runs ahead of it do")
         before = replay.Replay(found, 6, replay.POLICIES[SHIPPED], seed).simulate()[1]
-        self.assertLessEqual(before["granted"] - found[1]["arrival"], sf.ORDER_DEFAULTS["limit"] + 600 + replay.POLL)
+        self.assertLessEqual(before["granted"] - found[1]["arrival"], sf_config.ORDER_DEFAULTS["limit"] + 600 + replay.POLL)
 
 
 class TraceTests(unittest.TestCase):
@@ -135,10 +139,10 @@ class TraceTests(unittest.TestCase):
 
     def history(self, label, count, queued, granted, ended, pid, outcome="released"):
         at = lambda clock: None if clock is None else f"2026-11-02T{clock}Z"
-        ran = None if granted is None else int(sf.seconds(at(ended)) - sf.seconds(at(granted)))
+        ran = None if granted is None else int(sf_config.seconds(at(ended)) - sf_config.seconds(at(granted)))
         return {"label": label, "cmd": f"make {label}", "count": count, "pid": pid, "queued": at(queued),
                 "granted": at(granted), "ended": at(ended), "outcome": outcome, "ran": ran,
-                "waited": int(sf.seconds(at(granted or ended)) - sf.seconds(at(queued)))}
+                "waited": int(sf_config.seconds(at(granted or ended)) - sf_config.seconds(at(queued)))}
 
     def test_recorded_and_unrecorded_requests_join_in_queue_order(self):
         items = [self.history("first", 1, "10:00:00", "10:00:00", "10:10:00", 11),
@@ -152,14 +156,14 @@ class TraceTests(unittest.TestCase):
             "2026-11-02T10:26:00Z released 6 (0000000003-13.json)\n"  # an old client's waiter that gave up
             "2026-11-02T10:30:00Z granted 1 to last (pid 14)\n"
             "2026-11-02T10:31:00Z released 1 (0000000004-14.json)\n")
-        found = replay.requests(self.dir, sf.seconds("2026-11-02T11:00:00Z"))
+        found = replay.requests(self.dir, sf_config.seconds("2026-11-02T11:00:00Z"))
         self.assertEqual([("first", "history", None), ("old-gate", "log", None),
                           ("(left, unrecorded)", "log", 960.0), ("last", "history", None)],
                          [(r["label"], r["source"], r["patience"]) for r in found])
         gate = found[1]
-        self.assertEqual((sf.seconds("2026-11-02T10:05:00Z"), 1200), (gate["arrival"], gate["run"]),
+        self.assertEqual((sf_config.seconds("2026-11-02T10:05:00Z"), 1200), (gate["arrival"], gate["run"]),
                          "granted before the next known arrival: taken to arrive when granted")
-        self.assertEqual(sf.seconds("2026-11-02T10:10:00Z"), found[2]["arrival"], "half way between its neighbours")
+        self.assertEqual(sf_config.seconds("2026-11-02T10:10:00Z"), found[2]["arrival"], "half way between its neighbours")
         # The gate's slots free at 10:25, before the waiter gave up: in the replay it runs (ASSUMED_RUN), and past
         # its window it held `last` back.
         replayed = replay.Replay(found, 6, replay.POLICIES[CURRENT]).simulate()
@@ -182,14 +186,14 @@ class TraceTests(unittest.TestCase):
         (self.dir / "history.jsonl").write_text("".join(json.dumps(i) + "\n" for i in items))
         logged = replay.log_requests(self.dir / "queue.log")
         self.assertEqual([("ci", 1), ("ci", None), ("orphan", None)], [(r["label"], r["seq"]) for r in logged])
-        self.assertEqual([("ci", None, 300)], replay.seed_runs(self.dir, sf.seconds("2026-11-02T09:00:00Z")))
-        found = replay.requests(self.dir, sf.seconds("2026-11-02T12:00:00Z"))
+        self.assertEqual([("ci", None, 300)], replay.seed_runs(self.dir, sf_config.seconds("2026-11-02T09:00:00Z")))
+        found = replay.requests(self.dir, sf_config.seconds("2026-11-02T12:00:00Z"))
         self.assertEqual([("orphan", "log", "reaped", 2800), ("ci", "history", "released", 300),
                           ("ci", "history", "reaped", 2800)],
                          [(r["label"], r["source"], r["outcome"], r["run"]) for r in found])
         run = replay.Replay(found, 1, replay.POLICIES[SHIPPED])
         results = run.simulate()
-        self.assertEqual(sf.seconds("2026-11-02T10:16:40Z"), results[1]["granted"], "the orphan held the slot")
+        self.assertEqual(sf_config.seconds("2026-11-02T10:16:40Z"), results[1]["granted"], "the orphan held the slot")
         self.assertEqual([300.0], run.estimates.runs[("label", "ci")])
         self.assertIsNone(run.estimates.of("orphan", None))
 
@@ -202,8 +206,8 @@ class TraceTests(unittest.TestCase):
         items.append({**self.history("post-merge-5", 1, "10:00:00", "10:00:00", "10:05:00", 36),
                       "until": "2026-11-02T10:10:00Z"})  # recorded since `until` is in the history
         (self.dir / "history.jsonl").write_text("".join(json.dumps(i) + "\n" for i in items))
-        found = replay.family_patience(replay.requests(self.dir, sf.seconds("2026-11-02T12:00:00Z")))
-        start = sf.seconds("2026-11-02T10:00:00Z")
+        found = replay.family_patience(replay.requests(self.dir, sf_config.seconds("2026-11-02T12:00:00Z")))
+        start = sf_config.seconds("2026-11-02T10:00:00Z")
         self.assertEqual({"lane-1-alone": 1800, "lane-2-tests": 600, "lane-3": 1800, "lane-4": None, "sid-kit": None,
                           "post-merge-5": 600},
                          {r["label"]: None if r.get("give_up") is None else r["give_up"] - start for r in found})
@@ -226,10 +230,10 @@ class TraceTests(unittest.TestCase):
         for item in items:
             item["cmd"] = None  # known by label, as the seed runs
         (self.dir / "history.jsonl").write_text("".join(json.dumps(i) + "\n" for i in items))
-        found = replay.requests(self.dir, sf.seconds("2026-11-02T13:00:00Z"))
+        found = replay.requests(self.dir, sf_config.seconds("2026-11-02T13:00:00Z"))
         replayed = {q["label"]: r for q, r in zip(found, replay.Replay(
             found, 6, replay.POLICIES[SHIPPED], replay.seed_runs(self.dir, found[0]["arrival"])).simulate())}
-        self.assertEqual(sf.seconds("2026-11-02T10:15:00Z"), replayed["head"]["granted"], "it starts when y ends")
+        self.assertEqual(sf_config.seconds("2026-11-02T10:15:00Z"), replayed["head"]["granted"], "it starts when y ends")
         self.assertGreaterEqual(replayed["long"]["granted"], replayed["head"]["granted"])
 
 

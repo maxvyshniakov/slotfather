@@ -16,7 +16,7 @@ container and `SLOTFATHER_TEST_USERADD=1`.
 
 ```sh
 slotfather run -n 1 -- docker run --rm --user 1000:1000 -e HOME=/tmp/h \
-  -v "$PWD:$PWD:ro" -w "$PWD/tests" python:3.12 \
+  -v "${PWD}:${PWD}:ro" -w "$PWD/tests" python:3.12 \
   sh -c 'mkdir -p "$HOME" && git config --global --add safe.directory "*" && python3 -m unittest discover -s .'
 ```
 

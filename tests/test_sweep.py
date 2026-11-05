@@ -4,6 +4,11 @@ the settings, the launchd agent and the stats; and through real short-lived proc
 (an orphan by a double fork, a process whose working directory was removed, one that ignores SIGTERM, and leased
 processes that must be spared). Every live sweep here is limited to the test's own pids with --pid."""
 from __future__ import annotations
+import sys as _path_sys
+from pathlib import Path as _Path
+_path_sys.path.insert(0, str(_Path(__file__).resolve().parents[1] / "src"))
+from slotfather import platform as sf_platform
+
 
 import json
 import os
@@ -21,7 +26,6 @@ from test_slotfather import TOOL, SlotCase
 from test_usage import load
 
 sweep = load(TOOL + "-sweep", "slotfather_sweep_under_test")
-sf = sweep.sf
 
 NOW = 1_800_000_000.0
 UID = 501
@@ -94,7 +98,7 @@ class KindTests(unittest.TestCase):
             "  102   100  1000   1024 ?        Wed Nov  4 01:00:02 2026 \n"
             "garbage\n")
         self.assertEqual(sweep.Proc(100, 1, 501, 20480, "", "Wed Nov 4 01:00:00 2026",
-                                    sf.started_at("Wed Nov 4 01:00:00 2026"), "tail -f /x/a.output"), found[100])
+                                    sf_platform.started_at("Wed Nov 4 01:00:00 2026"), "tail -f /x/a.output"), found[100])
         self.assertEqual(("pts/0", "/bin/bash"), (found[101].tty, found[101].cmd))
         self.assertEqual(("", ""), (found[102].tty, found[102].cmd))
         self.assertEqual({100, 101, 102}, set(found))
@@ -630,7 +634,7 @@ class LiveTests(SweepCase):
         self.assertTrue(self.alive(pid) and self.alive(holder.pid))
         lease = json.loads(self.tool("status", "--json").stdout)["entries"][0]["lease"]
         orphan = self.orphan("leased-orphan", {"SLOTFATHER_LEASE": lease})
-        if not sf.carrying([orphan], lease):
+        if not sf_platform.carrying([orphan], lease):
             self.skipTest("this host does not show the orphan's environment (an Apple platform python)")
         found = self.report("--live", "--pid", str(orphan))
         self.assertEqual([(orphan, "spared")], [(i["pid"], i["action"]) for i in found["items"]], found)
@@ -787,7 +791,7 @@ class CommandTests(SweepCase):
         self.assertEqual(("com.slotfather.sweep", 3600, True), (found["Label"], found["StartInterval"],
                                                                 found["RunAtLoad"]))
         self.assertEqual(["sweep", "--quiet"], found["ProgramArguments"][2:])
-        self.assertTrue(found["ProgramArguments"][1].endswith("slotfather"))
+        self.assertTrue(found["ProgramArguments"][1].endswith("__main__.py"))
         self.assertEqual(str(self.state), found["EnvironmentVariables"]["SLOTFATHER_DIR"])
         live = plistlib.loads(self.tool("sweep", "--plist", "--live", "--dev-servers", "--interval", "1800")
                               .stdout.encode())

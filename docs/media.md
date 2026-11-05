@@ -6,13 +6,13 @@ validation workloads; they are not measurements of those historical processes.
 The short chart interval preserves recorded slot heights and event spacing,
 aligned to the demo clock. Provenance is stored with the fixtures.
 
-The loop visits the third active lane, pauses, selects a waiting request, pauses,
+The loop visits the third running request, pauses, selects a waiting request, pauses,
 and returns to the beginning. The demo keeps queue membership fixed while clocks,
 resource observations and the chart viewport advance.
 
 ## Refresh after an interface change
 
-Install the private screen-kit CLI from its checkout (`bun install && bun link`).
+Install the screen-kit CLI from its checkout (`bun install && bun link`).
 It needs Python, `agg` and `gif2webp` (`brew install agg webp` on macOS).
 
 From this checkout:

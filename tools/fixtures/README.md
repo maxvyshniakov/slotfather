@@ -13,7 +13,7 @@ Refresh it with `slotfather run -n 1 -- python3 tools/capture-chart-history.py`.
 
 `metrics.json` contains measured CPU, RSS, process counts and host observations from separate
 local validation workloads. The demo replays these profiles over the historical queue; they
-are illustrative and are not measurements of the historical lane processes. CPU uses real
+are illustrative and are not measurements of the historical request processes. CPU uses real
 elapsed CPU-time deltas, including completed validation children. No synthetic CPU waveform
 or invented completion events are used. Process details are omitted because these workload
 profiles do not belong to the historical process trees.
@@ -30,3 +30,7 @@ observations and terminates its workers. It never enqueues or modifies the real 
 To replace the fixture from your own completed local queue history, run
 `python3 tools/capture-demo-fixture.py` from the checkout and review the resulting JSON
 before using it in public media. The capture tool excludes secret-bearing commands.
+
+Presentation names follow the current glossary. Caller labels, metadata, command arguments
+and recorded observations keep their source values; version-1 metrics retain the `lanes`
+collection key as a compatibility alias.

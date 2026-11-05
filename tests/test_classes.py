@@ -4,6 +4,14 @@
 through its own client (`slotfather yield` between steps). plan() and yield_asks() on fixed queues, the settings,
 the whole protocol through real processes, and the previous version on the same queue."""
 from __future__ import annotations
+import sys as _path_sys
+from pathlib import Path as _Path
+_path_sys.path.insert(0, str(_Path(__file__).resolve().parents[1] / "src"))
+from slotfather import config as sf_config
+from slotfather import leases as sf_leases
+from slotfather import schedule as sf_schedule
+from slotfather import state as sf_state
+
 
 import json
 import os
@@ -17,7 +25,6 @@ from test_order import M, PlanCase, holder, runs, stamp, waiter
 from test_slotfather import ROOT, TOOL, WORK, SlotCase
 from test_usage import load
 
-sf = load(TOOL, "slotfather_classes_core")
 
 # A client that keeps the protocol: between steps (every 50 ms) it looks for its yield request and yields.
 YIELDER = ('echo "start $1" >> "$LOG"; while [ ! -e "$RELEASE/$1" ]; do if [ -e "$SLOTFATHER_YIELD" ]; then '
@@ -61,17 +68,17 @@ class RankTests(PlanCase):
 
     def test_a_yielded_lease_queues_behind_the_waiter_it_yielded_to(self):
         test = classed(waiter("test", 1, -10), "interactive")
-        back = classed(waiter("gate", 1, -3000), "batch", rank=sf.rank_time(test, self.settings) + sf.YIELD_BEHIND)
+        back = classed(waiter("gate", 1, -3000), "batch", rank=sf_schedule.rank_time(test, self.settings) + sf_config.YIELD_BEHIND)
         self.assertEqual(["test"], self.started([back, test], self.held))
 
     def test_a_pinned_rank_wins_alone_so_later_arrivals_queue_behind_the_yielded_lease(self):
         # review P2-1: a batch lease granted at once and asked soon after would otherwise rank at since + 1800,
         # behind every normal request of the next half hour, while its job sits half done.
         test = classed(waiter("test", 1, -150), "interactive")
-        back = classed(waiter("gate", 1, -200), "batch", rank=sf.rank_time(test, self.settings) + sf.YIELD_BEHIND)
+        back = classed(waiter("gate", 1, -200), "batch", rank=sf_schedule.rank_time(test, self.settings) + sf_config.YIELD_BEHIND)
         later = waiter("later", 1, -10)
         self.assertEqual(["gate"], self.started([back, later], self.held))
-        self.assertLess(sf.rank_time(back, self.settings), sf.rank_time(later, self.settings))
+        self.assertLess(sf_schedule.rank_time(back, self.settings), sf_schedule.rank_time(later, self.settings))
 
     def test_a_yielded_head_counts_its_limit_from_when_it_yielded(self):
         # review P3-5: by its first arrival the limit is long past, and nothing could pass it at all.
@@ -83,8 +90,8 @@ class RankTests(PlanCase):
                                           one=3600, short=60))
 
     def test_an_unknown_class_is_normal(self):
-        self.assertEqual("normal", sf.class_of({"meta": {"class": "urgent"}}))
-        self.assertEqual("normal", sf.class_of({}))
+        self.assertEqual("normal", sf_schedule.class_of({"meta": {"class": "urgent"}}))
+        self.assertEqual("normal", sf_schedule.class_of({}))
 
 
 class YieldAskTests(PlanCase):
@@ -99,7 +106,7 @@ class YieldAskTests(PlanCase):
         self.estimates = runs(gate=3600, other=3600)
 
     def asks(self, waiters, held, **estimates):
-        found = sf.yield_asks(waiters, held, 6, M, runs(**{"gate": 3600, "other": 3600, **estimates}),
+        found = sf_schedule.yield_asks(waiters, held, 6, M, runs(**{"gate": 3600, "other": 3600, **estimates}),
                               settings=self.settings)
         return [(h["label"], w["label"]) for h, w in found]
 
@@ -113,7 +120,7 @@ class YieldAskTests(PlanCase):
             "the holder did not opt in": ([self.test], {"yieldable": False}),
             "the holder is not of a lower class": ([self.test], {"meta": {"class": "interactive"}}),
             "the holder was granted less than yield_after ago": ([self.test], {"granted": stamp(-60)}),
-            "the holder yielded YIELDS_MAX times": ([self.test], {"yields": sf.YIELDS_MAX}),
+            "the holder yielded YIELDS_MAX times": ([self.test], {"yields": sf_config.YIELDS_MAX}),
         }
         for why, (waiters, change) in cases.items():
             with self.subTest(why):
@@ -151,7 +158,7 @@ class YieldAskTests(PlanCase):
 
     def test_a_holder_already_asked_is_asked_again_before_another(self):
         a, b = (classed(holder(n, 3, -600), "batch", yieldable=True) for n in ("a", "b"))
-        found = sf.yield_asks([self.test], [a, b], 6, M, runs(a=1800, b=7200), settings=self.settings, asked=[a])
+        found = sf_schedule.yield_asks([self.test], [a, b], 6, M, runs(a=1800, b=7200), settings=self.settings, asked=[a])
         self.assertEqual(["a"], [h["label"] for h, _ in found])
 
 
@@ -169,31 +176,31 @@ class SettingsTests(unittest.TestCase):
         loose = {"SLOTFATHER_PRIORITY_INTERACTIVE": "3600", "SLOTFATHER_PRIORITY_BATCH": "3600",
                  "SLOTFATHER_YIELD_AFTER": "30"}
         with mock.patch.dict(os.environ, loose):
-            found = sf.order_settings()
+            found = sf_schedule.order_settings()
         self.assertEqual((1800, 1800, 120), (found["interactive"], found["batch"], found["yield_after"]))
         tight = {"SLOTFATHER_PRIORITY_INTERACTIVE": "600", "SLOTFATHER_PRIORITY_BATCH": "0",
                  "SLOTFATHER_YIELD_AFTER": "300"}
         with mock.patch.dict(os.environ, tight):
-            found = sf.order_settings()
+            found = sf_schedule.order_settings()
         self.assertEqual((600, 0, 300), (found["interactive"], found["batch"], found["yield_after"]))
         with mock.patch.dict(os.environ, {"SLOTFATHER_YIELD_AFTER": "0"}):
-            self.assertEqual(0, sf.order_settings()["yield_after"])
-        sf.save_order({**sf.ORDER_DEFAULTS, "yield_after": 0})
+            self.assertEqual(0, sf_schedule.order_settings()["yield_after"])
+        sf_state.save_order({**sf_config.ORDER_DEFAULTS, "yield_after": 0})
         with mock.patch.dict(os.environ, {"SLOTFATHER_YIELD_AFTER": "60"}):
-            self.assertEqual(0, sf.order_settings()["yield_after"], "nothing asks earlier than never")
+            self.assertEqual(0, sf_schedule.order_settings()["yield_after"], "nothing asks earlier than never")
 
     def test_the_saved_settings_alone_are_every_clients_view_for_asking(self):
         with mock.patch.dict(os.environ, {"SLOTFATHER_YIELD_AFTER": "0", "SLOTFATHER_QUEUE": "window"}):
-            self.assertEqual((0, "window"), (sf.order_settings()["yield_after"], sf.order_settings()["order"]))
-            saved = sf.order_settings(environment=False)
+            self.assertEqual((0, "window"), (sf_schedule.order_settings()["yield_after"], sf_schedule.order_settings()["order"]))
+            saved = sf_schedule.order_settings(environment=False)
         self.assertEqual((120, "backfill"), (saved["yield_after"], saved["order"]))
 
     def test_class_knobs_are_saved_only_when_they_differ_from_their_defaults(self):
-        sf.save_order(dict(sf.ORDER_DEFAULTS))
-        self.assertEqual(set(sf.ORDER_BASE), set(json.loads((self.dir / "order.json").read_text())))
-        sf.save_order({**sf.ORDER_DEFAULTS, "batch": 600})
+        sf_state.save_order(dict(sf_config.ORDER_DEFAULTS))
+        self.assertEqual(set(sf_config.ORDER_BASE), set(json.loads((self.dir / "order.json").read_text())))
+        sf_state.save_order({**sf_config.ORDER_DEFAULTS, "batch": 600})
         self.assertEqual(600, json.loads((self.dir / "order.json").read_text())["batch"])
-        self.assertEqual(600, sf.order_settings()["batch"])
+        self.assertEqual(600, sf_schedule.order_settings()["batch"])
 
 
 class ProtocolTests(SlotCase):
@@ -303,14 +310,14 @@ class ProtocolTests(SlotCase):
         asker.write_text(json.dumps({"pid": asker_pid, "start": asker_start, "count": 4, "label": "quick",
                                      "cmd": "fake", "since": "2026-11-03T00:10:00Z", "state": "waiting",
                                      "meta": {"class": "interactive"}}))
-        sf.write(sf.marker(gate), {"by": asker.stem, "label": "quick", "class": "interactive", "count": 4,
+        sf_state.write(sf_state.marker(gate), {"by": asker.stem, "label": "quick", "class": "interactive", "count": 4,
                                    "at": "2026-11-03T00:12:00Z"})
         with mock.patch.dict(os.environ, {"SLOTFATHER_DIR": str(self.state), "SLOTFATHER_LEGACY_DIRS": "",
                                           "SLOTFATHER_CORES": "12", "SLOTFATHER_MEMORY_GIB": "64",
                                           "SLOTFATHER_MEMORY_FILE": str(self.memory)}):
-            self.assertFalse(sf.yield_lease(gate))
+            self.assertFalse(sf_leases.yield_lease(gate))
         self.assertEqual("held", json.loads(gate.read_text())["state"])
-        self.assertFalse(sf.marker(gate).exists(), "the request is withdrawn")
+        self.assertFalse(sf_state.marker(gate).exists(), "the request is withdrawn")
 
     def test_yield_returns_at_once_when_nothing_asked_and_needs_a_lease(self):
         result = self.tool("run", "--yieldable", "--", TOOL, "yield")
@@ -330,7 +337,7 @@ class ProtocolTests(SlotCase):
                                     "granted": "2026-11-03T00:20:00Z", "first_granted": "2026-11-03T00:01:00Z",
                                     "yielded_at": "2026-11-03T00:10:00Z", "yields": 1, "rank": 1.0}))
         with mock.patch.dict(os.environ, {"SLOTFATHER_DIR": str(self.state), "SLOTFATHER_LEGACY_DIRS": ""}):
-            sf.held_again(path)
+            sf_leases.held_again(path)
         entry = json.loads(path.read_text())
         self.assertEqual(("2026-11-03T00:01:00Z", "2026-11-03T00:20:00Z", 600), (entry["granted"], entry["resumed"],
                                                                                entry["yielded"]))

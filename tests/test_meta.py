@@ -3,6 +3,11 @@
 for programs such as a guard that must tell whose lease a process belongs to), the dashboard and `stats --by
 meta.KEY`; an older slotfather on the same queue."""
 from __future__ import annotations
+import sys as _path_sys
+from pathlib import Path as _Path
+_path_sys.path.insert(0, str(_Path(__file__).resolve().parents[1] / "src"))
+from slotfather import config as sf_config
+
 
 import json
 import os
@@ -13,7 +18,6 @@ import unittest
 from test_slotfather import ROOT, TOOL, WORK, SlotCase
 from test_usage import load
 
-sf = load(TOOL, "slotfather_meta_core")
 
 # Work that writes its own pid, its lease and its process group before it waits for its release file.
 TELL = 'echo "$$ $SLOTFATHER_LEASE $(ps -o pgid= -p $$)" > "$RELEASE/$1.who"; ' + WORK
@@ -107,8 +111,8 @@ class MetaTests(SlotCase):
         result = self.tool("run", "--meta", "ticket=1", "--meta", "ticket=2", "--", "true")
         self.assertEqual(0, result.returncode, "a later key replaces an earlier one")
         self.assertEqual({"ticket": "2"}, json.loads((self.state / "history.jsonl").read_text())["meta"])
-        with self.assertRaises(sf.SlotError):
-            sf.checked_meta({f"k{n}": "v" for n in range(17)})
+        with self.assertRaises(sf_config.SlotError):
+            sf_config.checked_meta({f"k{n}": "v" for n in range(17)})
 
     def test_status_json_options_are_checked(self):
         for args in (("--json", "--pid"), ("--json", "--pid", "x"), ("--json", "extra"), ("--pid", "1")):
@@ -121,8 +125,8 @@ class MetaTests(SlotCase):
         self.queue_entry(self.state, pid, start, 1, "old")
         self.assertRegex(self.status(), r"held: 1 slot\(s\) old pid=\d+ since=- cmd=fake\n")
         self.assertEqual([{}], [e["meta"] for e in json.loads(self.tool("status", "--json").stdout)["entries"]])
-        self.assertEqual({}, sf.meta_of({"meta": ["not", "a", "mapping"]}))
-        self.assertEqual({"ticket": "1"}, sf.meta_of({"meta": {"ticket": "1", "Bad Key\x1b": "x", "": "y"}}),
+        self.assertEqual({}, sf_config.meta_of({"meta": ["not", "a", "mapping"]}))
+        self.assertEqual({"ticket": "1"}, sf_config.meta_of({"meta": {"ticket": "1", "Bad Key\x1b": "x", "": "y"}}),
                          "keys a foreign writer left that --meta would refuse are dropped")
 
     def test_the_dashboard_shows_the_selected_lease_meta(self):

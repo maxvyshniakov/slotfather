@@ -3,6 +3,11 @@
 
 Run through slotfather with three slots. The queue itself is never read or changed.
 """
+
+import sys as _path_sys
+from pathlib import Path as _Path
+_path_sys.path.insert(0, str(_Path(__file__).resolve().parents[1] / "src"))
+from slotfather import platform as sf_platform
 import importlib.machinery
 import importlib.util
 import json
@@ -15,9 +20,7 @@ import tempfile
 import time
 
 ROOT=Path(__file__).resolve().parents[1]
-loader=importlib.machinery.SourceFileLoader('record_dashboard',str(ROOT/'slotfather-dashboard'))
-dashboard=importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name,loader))
-loader.exec_module(dashboard)
+from slotfather import dashboard as dashboard
 worker='''import subprocess,sys,time,resource,json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -58,7 +61,7 @@ try:
  for second in range(16):
   if second:time.sleep(1)
   own,descendants=dashboard.process_usage()
-  lanes=[]
+  requests=[]
   for index,child in enumerate(children):
    if child.poll() is not None:
     raise RuntimeError(f'Validation workload {index} exited before recording finished: {child.returncode}')
@@ -67,10 +70,10 @@ try:
    before=previous.get(index,usage)
    cpu=max(0,usage['cpu']-before['cpu'])/max(.001,usage['at']-before['at'])*100
    previous[index]=usage
-   lanes.append(dict(cpu=round(cpu,1),rss=sum(p[2] for p in tree),
+   requests.append(dict(cpu=round(cpu,1),rss=sum(p[2] for p in tree),
                      procs=len(tree),tree=[[10000+i,p[1],p[2],Path(p[3]).name] for i,p in enumerate(tree)]))
   machine=dashboard.memory_facts()
-  samples.append(dict(offset=second,lanes=lanes,averages=list(dashboard.sf.loads()),memory=machine))
+  samples.append(dict(offset=second,lanes=requests,averages=list(sf_platform.loads()),memory=machine))
 finally:
  for child in children:
   if child.poll() is None:
@@ -90,7 +93,7 @@ result=dict(provenance=dict(source='Real CPU/RSS/process and host samples from l
  capturedAt=__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),
  commands=[[argument.replace(str(Path.home()),'~') for argument in command]
            for group in commands for command in group],
- limitations='Illustrative workload profiles are replayed over the separate historical queue scene; they are not measurements of those historical lane processes.'),samples=samples)
+ limitations='Illustrative workload profiles are replayed over the separate historical queue scene; they are not measurements of those historical request processes.'),samples=samples)
 path=ROOT/'tools/fixtures/metrics.json'
 path.write_text(json.dumps(result,indent=2)+'\n')
 print(path)

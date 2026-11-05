@@ -3,7 +3,7 @@
 One queue for expensive work on a shared machine. Builds, tests and agents take
 slots before they start, so separate projects share one capacity budget.
 
-![Slotfather dashboard: navigating active and waiting tasks](assets/dashboard.webp)
+![Slotfather dashboard: navigating running and waiting requests](assets/dashboard.webp)
 
 ## Install
 
@@ -57,9 +57,9 @@ Run `slotfather` in a terminal to open the live dashboard.
 
 | Widget | Shows |
 | --- | --- |
-| SLOTS | Occupied and free capacity; colours identify active tasks. |
-| LANES | Active tasks, then waiting requests. Select either to see details. |
-| LANE DETAILS | Command, status, resource use and the busiest processes. |
+| SLOTS | Occupied and free capacity; colours identify running requests. |
+| REQUESTS | Running and waiting requests. Select either to see details. |
+| REQUEST DETAILS | Command, status, resource use and the busiest processes. |
 | MACHINE | Admission status, load, memory, swap and occupied-slot history. |
 | EVENTS | Recent grants, releases and abandoned requests. |
 
@@ -69,6 +69,7 @@ freeze updates for native text selection, **?** for help and **q** to quit.
 ```sh
 slotfather status                  # a plain-text queue summary
 slotfather status --json --pid 4242 # find a process’s lease
+slotfather procs --json --pid 4242  # read-only process, lease and session ancestry
 slotfather dashboard --once         # a dashboard snapshot for scripts
 ```
 
@@ -85,18 +86,30 @@ slotfather advise --max 4
 slotfather sweep
 ```
 
-`available` reports slots a new request can get now. `advise` suggests a worker
-budget from observed load; it does not reserve capacity. `sweep` is a dry run by
+`available` reports queue space before memory checks. Dashboard admission also
+applies memory policy. `advise` recommends a worker budget; it does not reserve slots. `sweep` is a dry run by
 default. Only `sweep --live` stops eligible leftover processes.
 
 [Statistics](docs/statistics.md) · [Sweep](docs/sweep.md) ·
 [Linux and cgroups](docs/linux.md)
+
+[Domain glossary](GLOSSARY.md) · [Naming and compatibility](docs/terminology.md)
+
+## Architecture
+
+The commands are thin entry points into `src/slotfather/`: queue files, leases,
+scheduling, OS inspection and views have separate modules. State upgrades preserve
+active leases and old clients. [Modules, state versions and safe changes](docs/architecture.md).
+`slotfather version` identifies the installed source; [remote installation](docs/installation.md)
+uses the same verified source snapshot.
 
 ## Development
 
 ```sh
 slotfather run -n 1 -- python3 -m unittest discover -s tests -v
 ```
+
+[Lint and strict type checks](docs/agents/checks.md) use a baseline that can only shrink.
 
 The animation uses the real dashboard and input handling, a historical queue,
 and separately recorded workload metrics. It is an illustrative demo, not a

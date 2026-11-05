@@ -41,7 +41,7 @@ class InstallTests(unittest.TestCase):
         (self.source / "slotfather-sweep").write_bytes(SWEEP)
         self.env = {**os.environ, "HOME": str(self.home)}
 
-    def run_install(self, *options):
+    def run_install(self, *options: str) -> subprocess.CompletedProcess[str]:
         # A test runner inside a virtual environment names its own interpreter, which the installer then accepts.
         if sys.prefix != sys.base_prefix and not options:
             options = ("--python", sys.executable)
@@ -214,6 +214,8 @@ class SharedQueueInstallTests(unittest.TestCase):
     def setUp(self):
         InstallTests.setUp(self)
         shutil.copyfile(ROOT / "slotfather", self.source / "slotfather")
+        if (ROOT / "src/slotfather").is_dir():
+            shutil.copytree(ROOT / "src", self.source / "src", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
         self.system_bin = self.tmp / "usr-local-bin"
 
     def installer(self):
@@ -233,7 +235,9 @@ class SharedQueueInstallTests(unittest.TestCase):
         module = self.installer()
         module.install(self.home, self.source / "slotfather", sys.executable, self.system_bin, pinned=True)
         installed = (self.system_bin / "slotfather").read_text()
-        self.assertIn(f'DEFAULT_DIR = {json.dumps(str(self.new))}\n', installed)
+        configs = list((self.system_bin.parent / "lib/slotfather/releases").glob("*/slotfather/config.py"))
+        defaults = configs[0].read_text() if configs else installed
+        self.assertIn(f'DEFAULT_DIR = {json.dumps(str(self.new))}\n', defaults)
         self.assertTrue(installed.startswith(f"#!{sys.executable}\n"))
         self.assertFalse((self.bin / "slotfather").exists(), "--bin replaces ~/.local/bin")
         self.assertTrue(self.new.is_dir())
@@ -248,13 +252,19 @@ class SharedQueueInstallTests(unittest.TestCase):
                          json.loads((self.new / "capacity.json").read_text()))
         self.assertFalse((self.tmp / "elsewhere").exists())
         stats = subprocess.run([str(self.system_bin / "slotfather-stats")], env=env, capture_output=True, text=True)
-        self.assertEqual("stats fixture\n", stats.stdout, "the companions are installed beside it")
+        self.assertEqual(0, stats.returncode, stats.stderr)
+        if configs:
+            self.assertIn("slotfather stats · 0 requests", stats.stdout)
+        else:
+            self.assertEqual("stats fixture\n", stats.stdout, "the companions are installed beside it")
 
     def test_the_cgroup_the_leases_share_is_written_in_for_every_client(self):
         module = self.installer()
         module.install(self.home, self.source / "slotfather", sys.executable, self.system_bin, pinned=True,
                        cgroup="/ci.slice/ci-runners.slice")
-        self.assertIn('DEFAULT_CGROUP = "/ci.slice/ci-runners.slice"  #', (self.system_bin / "slotfather").read_text())
+        configs = list((self.system_bin.parent / "lib/slotfather/releases").glob("*/slotfather/config.py"))
+        defaults = configs[0].read_text() if configs else (self.system_bin / "slotfather").read_text()
+        self.assertIn('DEFAULT_CGROUP = "/ci.slice/ci-runners.slice"  #', defaults)
         # A shell outside the slice (no limited cgroup of its own) counts the slice's 10 GiB.
         fixtures = ROOT / "tests" / "fixtures"
         env = {k: v for k, v in os.environ.items() if not k.startswith("SLOTFATHER")}
@@ -269,7 +279,11 @@ class SharedQueueInstallTests(unittest.TestCase):
                 self.assertIn("--cgroup takes", self.run_install("--cgroup", bad).stderr)
 
     def test_a_source_without_the_state_line_is_refused(self):
-        (self.source / "slotfather").write_bytes(PAYLOAD)
+        config = self.source / "src/slotfather/config.py"
+        if config.is_file():
+            config.write_text(config.read_text().replace('DEFAULT_DIR = "~/.local/state/slotfather"\n', ''))
+        else:
+            (self.source / "slotfather").write_bytes(PAYLOAD)
         module = self.installer()
         with self.assertRaises(module.InstallError):
             module.install(self.home, self.source / "slotfather", sys.executable, self.system_bin, pinned=True)
@@ -326,3 +340,178 @@ class SharedQueueInstallTests(unittest.TestCase):
         self.assertEqual(0, run.returncode, run.stdout + run.stderr)
         self.assertIn("1 of", run.stdout)
         self.assertEqual(user.pw_uid, (queue / "history.jsonl").stat().st_uid)
+
+
+class PackageInstallTests(unittest.TestCase):
+    """Installed entry points must keep working after their source checkout disappears."""
+
+    tmp: Path
+    home: Path
+    state: Path
+    old: Path
+    legacy: Path
+    new: Path
+    bin: Path
+    source: Path
+    env: dict[str, str]
+
+    setUp = InstallTests.setUp
+    run_install = InstallTests.run_install
+
+    def package(self) -> Path:
+        package = self.source / 'src' / 'slotfather'
+        package.mkdir(parents=True)
+        (package / '__init__.py').write_text('')
+        (package / 'config.py').write_text('DEFAULT_DIR = "~/.local/state/slotfather"\nDEFAULT_CGROUP = None  # installer default\n')
+        (package / 'cli.py').write_text(
+            'from pathlib import Path\nimport json\nfrom . import config\n'
+            'def main():\n'
+            '    print(json.dumps({"state": config.DEFAULT_DIR, "cgroup": config.DEFAULT_CGROUP, '
+            '"version": json.loads(Path(__file__).with_name("version.json").read_text())}))\n'
+            '    return 0\n')
+        for name in ('dashboard', 'stats', 'sweep'):
+            (package / (name + '.py')).write_text('def main():\n    print("package ' + name + '")\n    return 0\n')
+        return package
+
+    def test_package_install_is_self_contained_and_reports_identical_source_identity(self):
+        self.package()
+        result = self.run_install('--python', sys.executable)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        shutil.rmtree(self.source)
+        run = subprocess.run([str(self.bin / 'slotfather'), 'version', '--json'], env=self.env,
+                             capture_output=True, text=True, timeout=20)
+        self.assertEqual(0, run.returncode, run.stderr)
+        info = json.loads(run.stdout)
+        self.assertEqual('~/.local/state/slotfather', info['state'])
+        self.assertEqual(64, len(info['version']['source_sha256']))
+        self.assertIn('commit', info['version'])
+        self.assertNotIn(str(self.source), (self.bin / 'slotfather').read_text())
+        for name in ('dashboard', 'stats', 'sweep'):
+            companion = subprocess.run([str(self.bin / ('slotfather-' + name))], env=self.env,
+                                       capture_output=True, text=True, timeout=20)
+            self.assertEqual('package ' + name + '\n', companion.stdout, companion.stderr)
+
+    def test_ssh_install_streams_the_same_source_and_quotes_remote_paths(self):
+        self.package()
+        local = self.run_install('--python', sys.executable)
+        self.assertEqual(0, local.returncode, local.stdout + local.stderr)
+        read = subprocess.run([str(self.bin / 'slotfather')], env=self.env,
+                              capture_output=True, text=True, check=True)
+        identity = json.loads(read.stdout)['version']
+        remote_home = self.tmp / 'remote home'
+        remote_home.mkdir()
+        remote_bin = remote_home / 'custom bin'
+        commands = self.tmp / 'ssh-bin'
+        commands.mkdir()
+        fake_ssh = commands / 'ssh'
+        fake_ssh.write_text(f'#!{sys.executable}\n'
+                            'import os, subprocess, sys\n'
+                            'assert sys.argv[1:3] == ["--", "fixture-host"]\n'
+                            f'env = {{**os.environ, "HOME": {str(remote_home)!r}, "TMPDIR": {str(remote_home)!r}}}\n'
+                            'sys.exit(subprocess.run(["sh", "-c", sys.argv[3]], env=env).returncode)\n')
+        fake_ssh.chmod(0o755)
+        self.env['PATH'] = str(commands) + os.pathsep + self.env.get('PATH', '')
+        result = self.run_install('--host', 'fixture-host', '--python', sys.executable, '--bin', str(remote_bin))
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        remote = subprocess.run([str(remote_bin / 'slotfather')], env=self.env,
+                                capture_output=True, text=True, check=True)
+        self.assertEqual(identity, json.loads(remote.stdout)['version'])
+        self.assertEqual([], list(remote_home.glob('slotfather-install.*')), 'remote transport cleans its own temporary tree')
+
+    def test_ssh_options_or_shell_syntax_are_refused_before_launching_ssh(self):
+        self.package()
+        for host in ('-oProxyCommand=bad', 'host;echo bad', 'host with space'):
+            with self.subTest(host=host):
+                result = self.run_install('--host', host)
+                self.assertEqual(2, result.returncode)
+                self.assertIn('--host takes', result.stderr)
+
+    def test_a_real_pre_package_client_keeps_its_lease_through_upgrade(self):
+        import gzip
+        import hashlib
+        import time
+        payload = gzip.decompress((ROOT / 'tests/fixtures/upgrade/slotfather-556f912.py.gz').read_bytes())
+        self.assertEqual('c320a2ca95e4da03fa73b5b86c836264b5a9716de0d6fbbcfacc5d8cd57be8b8', hashlib.sha256(payload).hexdigest())
+        old = self.tmp / 'old-slotfather'
+        old.write_bytes(payload)
+        old.chmod(0o755)
+        for name in ('slotfather', 'slotfather-dashboard', 'slotfather-stats', 'slotfather-sweep'):
+            shutil.copyfile(ROOT / name, self.source / name)
+        shutil.copytree(ROOT / 'src', self.source / 'src', ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+        memory = self.tmp / 'memory'
+        memory.write_text('8000 1\n')
+        env = {key: value for key, value in self.env.items() if not key.startswith('SLOTFATHER')}
+        env.update(SLOTFATHER_DIR=str(self.new), SLOTFATHER_LEGACY_DIRS='', SLOTFATHER_CORES='12',
+                   SLOTFATHER_MEMORY_GIB='64', SLOTFATHER_MEMORY_FILE=str(memory), SLOTFATHER_LOADAVG='0',
+                   SLOTFATHER_POLL='0.05', SLOTFATHER_POLL_MAX='0.1')
+        release = self.tmp / 'release-old'
+        command = 'import pathlib,sys,time; p=pathlib.Path(sys.argv[1]);\nwhile not p.exists(): time.sleep(0.02)'
+        holder = subprocess.Popen([sys.executable, str(old), 'run', '-n', '1', '--label', 'old-client', '--',
+                                   sys.executable, '-c', command, str(release)], env=env,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+        try:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                entries = list((self.new / 'queue').glob('*.json'))
+                if entries and json.loads(entries[0].read_text()).get('state') == 'held':
+                    break
+                if holder.poll() is not None:
+                    self.fail('old holder exited: ' + str(holder.communicate()))
+                time.sleep(0.02)
+            else:
+                self.fail('old client did not acquire its lease')
+            before = {p.name: p.read_bytes() for p in (self.new / 'queue').glob('*.json')}
+            result = self.run_install('--python', sys.executable)
+            self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+            self.assertEqual(before, {p.name: p.read_bytes() for p in (self.new / 'queue').glob('*.json')})
+            current = subprocess.run([str(self.bin / 'slotfather'), 'status', '--json'], env=env,
+                                     capture_output=True, text=True, timeout=10)
+            self.assertEqual(0, current.returncode, current.stderr)
+            self.assertEqual(['old-client'], [entry['label'] for entry in json.loads(current.stdout)['entries']])
+            blocked = subprocess.run([str(self.bin / 'slotfather'), 'run', '-n', 'all', '--wait', '0.1', '--',
+                                      sys.executable, '-c', 'pass'], env=env, capture_output=True, text=True, timeout=10)
+            self.assertEqual(75, blocked.returncode, blocked.stdout + blocked.stderr)
+            release.touch()
+            output, error = holder.communicate(timeout=10)
+            self.assertEqual(0, holder.returncode, output + error)
+            current = subprocess.run([str(self.bin / 'slotfather'), 'status', '--json'], env=env,
+                                     capture_output=True, text=True, timeout=10)
+            self.assertEqual([], json.loads(current.stdout)['entries'])
+            history = [json.loads(line) for line in (self.new / 'history.jsonl').read_text().splitlines()]
+            old_history = next(row for row in history if row.get('label') == 'old-client')
+            self.assertEqual('released', old_history['outcome'])
+        finally:
+            release.touch()
+            if holder.poll() is None:
+                import signal
+                os.killpg(holder.pid, signal.SIGTERM)
+            holder.communicate(timeout=10)
+
+    def test_installing_identical_runtime_after_commit_refreshes_identity_without_rewriting_old_release(self):
+        self.package()
+        first = self.run_install('--python', sys.executable)
+        self.assertEqual(0, first.returncode, first.stdout + first.stderr)
+        read = subprocess.run([str(self.bin / 'slotfather')], env=self.env,
+                              capture_output=True, text=True, check=True)
+        original = json.loads(read.stdout)['version']
+        supplied = {**original, 'commit': 'a' * 40, 'dirty': False}
+        (self.source / '.slotfather-source.json').write_text(json.dumps(supplied))
+        installed = self.run_install('--python', sys.executable)
+        self.assertEqual(0, installed.returncode, installed.stdout + installed.stderr)
+        read = subprocess.run([str(self.bin / 'slotfather')], env=self.env,
+                              capture_output=True, text=True, check=True)
+        self.assertEqual(supplied, json.loads(read.stdout)['version'])
+        versions = [json.loads(path.read_text()) for path in
+                    (self.home / '.local/lib/slotfather/releases').glob('*/slotfather/version.json')]
+        self.assertCountEqual([original, supplied], versions)
+
+    def test_system_release_is_readable_by_the_service_user_and_not_writable_by_other_users(self):
+        self.package()
+        result = self.run_install('--python', sys.executable, '--bin', str(self.tmp / 'system-bin'))
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        releases = self.tmp / 'lib/slotfather/releases'
+        release = next(releases.iterdir())
+        self.assertEqual(0o755, release.stat().st_mode & 0o777)
+        for path in release.rglob('*'):
+            self.assertEqual(0o755 if path.is_dir() else 0o644, path.stat().st_mode & 0o777,
+                             f'{path}: service users must read code but cannot replace it')

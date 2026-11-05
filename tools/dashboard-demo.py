@@ -3,6 +3,10 @@
 
 Capture/export belongs to screen-kit; this file only supplies product-owned data.
 """
+
+import sys as _path_sys
+from pathlib import Path as _Path
+_path_sys.path.insert(0, str(_Path(__file__).resolve().parents[1] / "src"))
 import argparse
 import copy
 import datetime as dt
@@ -35,9 +39,8 @@ def load_scene(advance=False):
     for event in model['events']:
         event['when']=dt.datetime.fromisoformat(event['when'])
     model['updated']=dt.datetime.fromisoformat(model['updated'])
-    loader=importlib.machinery.SourceFileLoader('slotfather_demo',str(ROOT/'slotfather-dashboard'))
-    dashboard=importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name,loader))
-    loader.exec_module(dashboard)
+    import importlib
+    dashboard=importlib.reload(importlib.import_module('slotfather.dashboard'))
     dashboard.HISTORY_WINDOW=60  # short demo zoom; the legend reports seconds per column
     dashboard.MACHINE_HEIGHT-=1  # five chart rows expose eighth-cell heights for six slots
     origin=model['updated']
@@ -93,7 +96,7 @@ def main():
     args=parser.parse_args()
     if args.screenshot or args.animation:
         tool=shutil.which('screen-kit')
-        if not tool:parser.error('Install the private screen-kit CLI first (bun link in its checkout).')
+        if not tool:parser.error('Install the screen-kit CLI first (bun link in its checkout).')
         name='dashboard-navigation' if args.animation else 'dashboard'
         destination=ROOT/'assets/screens'/name
         result=subprocess.run([tool,'capture','--config',str(ROOT/'tools/screens.mjs'),'--only',name,

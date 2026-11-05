@@ -63,7 +63,7 @@ class StatsTests(SlotCase):
         self.assertEqual(4, recent["overall"]["requests"])
         text = self.stats()
         self.assertRegex(text, r"lane +verify\.sh --checks \[3\] +3 +20s +36s +3m20s +4m40s +2 +2\.0 +1\.0 +100")
-        self.assertIn("measured leases used 0.98 cores per slot held", text)
+        self.assertIn("measured requests used 0.98 cores per slot held", text)
 
     def test_machine_time_over_and_under_the_cores(self):
         base = 1_800_000_000.0

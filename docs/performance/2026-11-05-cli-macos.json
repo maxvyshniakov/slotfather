@@ -1,0 +1,85 @@
+{
+  "baselineCommit": "556f912dd1354e6142b1204db9e0ca220495430e",
+  "baselineFileSha256": "c320a2ca95e4da03fa73b5b86c836264b5a9716de0d6fbbcfacc5d8cd57be8b8",
+  "python": "3.13.14",
+  "machine": "arm64",
+  "sources": {
+    "slotfather": "9f3f07d65866274507fafdebdb7b16327217b6c1f47190452c1897f732b6f785",
+    "src/slotfather/__init__.py": "a124cb3da9653a0f9c6de0bb7feaf0e6a00073c6dc477c89bf02a7a649fd6de9",
+    "src/slotfather/__main__.py": "c217c85db1b1e3c58449ab6db0b21ada1b59193c7dedf0bb57244ea28ca7379c",
+    "src/slotfather/cli.py": "04975622325f348e00b23090a162d4939e28d768b519c61dac188458f41cb58c",
+    "src/slotfather/config.py": "1d4ef1e5f53f9f9b3046803e6f1e6c7aec8233383019f42a0c34dfc6437d86d8",
+    "src/slotfather/dashboard.py": "fede8b35a18acb327901a6f0654587eca0e1bf93ea43594e9df0a2ecf00434ab",
+    "src/slotfather/leases.py": "e40658f894ea5f50f97c412e1c0f582ed9f4491379f9fa853f6ccc4de347e9d4",
+    "src/slotfather/macos_process.py": "dea88afb3da7fb31866e80f9d7f77454b601bf688d5ff9cc890b70d3c65cc08a",
+    "src/slotfather/platform.py": "e48a5af577b7dd4cd99673b74f5022b1d07500754b75cb9015491188b9e69959",
+    "src/slotfather/procs.py": "2d9b310e6116842dea3f56db3cbcc75fddd7cd6aa9a1dffc991b5b5887a73b67",
+    "src/slotfather/query.py": "af29d293f7f73cc2fc6ee7063312360fbe4a3796c44addb208c1b6a59dbfedee",
+    "src/slotfather/schedule.py": "e60679ad0c183e267a236ae2bd956ff25788464040fabbe967c352b44db02ac1",
+    "src/slotfather/state.py": "4fd192d4a2cfbf8d110d90e073305284d2b71de705c9c27fcc280d36b4f6f1c2",
+    "src/slotfather/stats.py": "9aff836f5240476992b2c463735fbda1c81386f9f9d1ef6f71506ca79019b807",
+    "src/slotfather/sweep.py": "a02c251bb4ea1e66de7f1db883322cecd59f10f50922d4be3588435afc1da4da",
+    "src/slotfather/usage.py": "1562abef9144c5b9f39d78a3955a82d094d96a3f8a6acaab0af3d58745c13d29",
+    "src/slotfather/version.py": "c9d68bb8ea2f8716d6c8d9879d5fab4faa48cbe3b7328e892a8d0af96581f0c4"
+  },
+  "before_startup": {
+    "n": 20,
+    "median_ms": 46.25,
+    "p95_ms": 49.04,
+    "min_ms": 44.13,
+    "max_ms": 92.26
+  },
+  "before_status_pid": {
+    "n": 20,
+    "median_ms": 75.14,
+    "p95_ms": 76.9,
+    "min_ms": 71.52,
+    "max_ms": 77.31
+  },
+  "after_startup": {
+    "n": 20,
+    "median_ms": 30.5,
+    "p95_ms": 31.97,
+    "min_ms": 28.11,
+    "max_ms": 32.21
+  },
+  "after_status_pid": {
+    "n": 20,
+    "median_ms": 39.62,
+    "p95_ms": 41.77,
+    "min_ms": 37.55,
+    "max_ms": 42.52
+  },
+  "after_startup_S": {
+    "n": 20,
+    "median_ms": 30.06,
+    "p95_ms": 31.02,
+    "min_ms": 27.87,
+    "max_ms": 31.9
+  },
+  "after_status_pid_S": {
+    "n": 20,
+    "median_ms": 38.51,
+    "p95_ms": 40.35,
+    "min_ms": 35.97,
+    "max_ms": 41.02
+  },
+  "after_procs_pid_S": {
+    "n": 20,
+    "median_ms": 48.8,
+    "p95_ms": 51.43,
+    "min_ms": 47.17,
+    "max_ms": 52.15
+  },
+  "after_procs_pid": {
+    "n": 20,
+    "median_ms": 50.29,
+    "p95_ms": 56.05,
+    "min_ms": 48.25,
+    "max_ms": 100.25
+  },
+  "profile_import_ms": 6.92,
+  "profile_native_ms": 14.29,
+  "profile_basic_ms": 3.35,
+  "profile_ps_ms": 59.16
+}

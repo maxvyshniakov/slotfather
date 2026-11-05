@@ -1,0 +1,7 @@
+{
+  "include": ["src", "install.py", "tests", "tools"],
+  "exclude": ["**/__pycache__", "assets", ".venv"],
+  "extraPaths": ["src", "tests"],
+  "pythonVersion": "3.9",
+  "typeCheckingMode": "strict"
+}

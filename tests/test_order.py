@@ -2,6 +2,13 @@
 """Queue order (#643): which waiters start now. plan() on fixed queues, the run-time estimates it reads from the
 history, the order through real processes, and an older slotfather sharing the queue."""
 from __future__ import annotations
+import sys as _path_sys
+from pathlib import Path as _Path
+_path_sys.path.insert(0, str(_Path(__file__).resolve().parents[1] / "src"))
+from slotfather import config as sf_config
+from slotfather import state as sf_state
+from slotfather import schedule as sf_schedule
+
 
 import json
 import os
@@ -11,11 +18,11 @@ import tempfile
 import time
 import unittest
 from unittest import mock
+from typing import cast
 
 from test_slotfather import ROOT, TOOL, SlotCase, WORK
 from test_usage import load
 
-sf = load(TOOL, "slotfather_order_core")
 
 M = 1_800_000_000.0  # the moment plan() decides at
 SETTINGS = {"SLOTFATHER_OVERTAKE_WINDOW": "600", "SLOTFATHER_MEMORY_GIB": "64"}  # every other knob at its default unless a test sets it
@@ -47,10 +54,10 @@ class PlanCase(unittest.TestCase):
         self.addCleanup(patcher.stop)
         for key in [k for k in os.environ if k.startswith("SLOTFATHER_") and k not in SETTINGS]:
             os.environ.pop(key)
-        self.settings = dict(sf.ORDER_DEFAULTS)  # what `slotfather order` saves
+        self.settings = dict(sf_config.ORDER_DEFAULTS)  # what `slotfather order` saves
 
     def started(self, waiters, held, order=None, slots=6, **estimates):
-        found = sf.plan(waiters, held, slots, M, order, runs(**estimates), settings=self.settings)
+        found = sf_schedule.plan(waiters, held, slots, M, order, runs(**estimates), settings=self.settings)
         return [e["label"] for e in found.grants]
 
 
@@ -61,9 +68,9 @@ class WindowOrderTests(PlanCase):
         self.assertEqual([], self.started([waiter("gate", 6, -700), waiter("small", 1, -50)], held, "window"))
 
     def test_its_reason_names_the_waiter_and_the_end_of_the_window(self):
-        found = sf.plan([waiter("gate", 6, -100)], [holder("one", 1, -60)], 6, M, "window")
+        found = sf_schedule.plan([waiter("gate", 6, -100)], [holder("one", 1, -60)], 6, M, "window")
         self.assertIn("5 of 6 slots free; requests that fit may pass gate until", found.reason)
-        found = sf.plan([waiter("gate", 6, -700)], [holder("one", 1, -60)], 6, M, "window")
+        found = sf_schedule.plan([waiter("gate", 6, -700)], [holder("one", 1, -60)], 6, M, "window")
         self.assertEqual("5 of 6 slots free", found.reason)
 
 
@@ -105,14 +112,14 @@ class BackfillTests(PlanCase):
         self.assertEqual([], self.started(queue, held, one=600, short=10), "it could end any moment")
 
     def test_the_head_starts_when_the_held_lease_it_waits_for_ends_whatever_passes_it(self):
-        found = sf.plan([waiter("gate", 6, -700), waiter("short", 1, -10)], self.held, 6, M, None,
+        found = sf_schedule.plan([waiter("gate", 6, -700), waiter("short", 1, -10)], self.held, 6, M, None,
                         runs(one=3600, short=60), reserve_head=True, settings=self.settings)
         self.assertEqual(("gate", M + 3000), (found.head["label"], found.start))
         self.assertIn("gate is next, and a later request that fits starts first only if it ends before gate can",
                       found.reason)
 
     def test_nothing_passes_a_head_that_has_waited_the_limit_and_a_pass_must_end_before_it(self):
-        self.settings["limit"] = sf.ORDER_DEFAULTS["limit"]  # 2700 s
+        self.settings["limit"] = sf_config.ORDER_DEFAULTS["limit"]  # 2700 s
         queue = [waiter("gate", 6, -2700), waiter("short", 1, -10)]
         self.assertEqual([], self.started(queue, self.held, one=3600, short=1))
         queue = [waiter("gate", 6, -2000), waiter("short", 1, -10)]  # 700 s to the limit
@@ -122,7 +129,7 @@ class BackfillTests(PlanCase):
         self.assertEqual(["short"], self.started(queue, self.held, one=3600, short=900))
 
     def test_past_the_limit_not_even_slots_the_head_will_not_need_are_given(self):
-        self.settings["limit"] = sf.ORDER_DEFAULTS["limit"]
+        self.settings["limit"] = sf_config.ORDER_DEFAULTS["limit"]
         held = [holder("a", 2, -10), holder("b", 2, -10)]
         queue = [waiter("head", 3, -2800), waiter("long", 1, -10)]
         self.assertEqual([], self.started(queue, held, a=600, b=6000, long=99999))
@@ -146,11 +153,11 @@ class BackfillTests(PlanCase):
         gate = dict(waiter("gate", 6, -700), until=stamp(1000))  # its client gives up in 1000 s; one ends in 3000
         queue = [gate, waiter("smoke", 1, -10)]
         self.assertEqual(["smoke"], self.started(queue, self.held, one=3600, smoke=1200))
-        found = sf.plan(queue, self.held, 6, M, None, runs(one=3600, smoke=99999), settings=self.settings)
+        found = sf_schedule.plan(queue, self.held, 6, M, None, runs(one=3600, smoke=99999), settings=self.settings)
         self.assertEqual((["smoke"], None), ([e["label"] for e in found.grants], found.head))
-        self.assertIsNone(sf.plan([gate], self.held, 6, M, None, runs(one=3600), reserve_head=True,
+        self.assertIsNone(sf_schedule.plan([gate], self.held, 6, M, None, runs(one=3600), reserve_head=True,
                                   settings=self.settings).head)
-        self.assertIn("gate gives up at", sf.plan([gate], self.held, 6, M, None, runs(one=3600),
+        self.assertIn("gate gives up at", sf_schedule.plan([gate], self.held, 6, M, None, runs(one=3600),
                                                   settings=self.settings).reason)
         later = dict(gate, until=stamp(3000))  # it still waits when one is expected to end: it is the head
         self.assertEqual([], self.started([later, waiter("smoke", 1, -10)], self.held, one=3600, smoke=1200))
@@ -159,7 +166,7 @@ class BackfillTests(PlanCase):
         gate = dict(waiter("gate", 6, -800), until=stamp(1000))
         queue = [gate, waiter("pair", 3, -700), waiter("smoke", 1, -10)]
         held = [holder("one", 4, -600)]  # 3000 s left: pair (3) does not fit either, and it waits
-        found = sf.plan(queue, held, 6, M, None, runs(one=3600, smoke=1200), reserve_head=True,
+        found = sf_schedule.plan(queue, held, 6, M, None, runs(one=3600, smoke=1200), reserve_head=True,
                         settings=self.settings)
         self.assertEqual(("pair", M + 3000), (found.head["label"], found.start))
         self.assertEqual(["smoke"], [e["label"] for e in found.grants], "slots pair will not need at its start")
@@ -167,7 +174,7 @@ class BackfillTests(PlanCase):
     def test_a_head_past_its_limit_keeps_its_head_whatever_its_wait(self):
         # Review of d1cccbe: past the limit nothing passes, as it always did; a 7200 s job must not take the slot of
         # a lease that, unknown to the history, really ends in five minutes.
-        self.settings["limit"] = sf.ORDER_DEFAULTS["limit"]
+        self.settings["limit"] = sf_config.ORDER_DEFAULTS["limit"]
         held = [holder("one", 1, -300)]  # no history: the fallback
         big = dict(waiter("big", 6, -2800), until=stamp(1000))
         self.assertEqual([], self.started([big, waiter("long", 1, -10)], held, long=7200))
@@ -202,21 +209,21 @@ class BackfillTests(PlanCase):
         self.assertEqual(["a", "b"], self.started(queue, self.held))
 
     def test_slots_held_in_an_earlier_queue_have_no_known_end_and_nothing_passes(self):
-        found = sf.plan([waiter("gate", 6, -700), waiter("short", 1, -10)], [], 6, M, None, runs(short=1), other=2,
+        found = sf_schedule.plan([waiter("gate", 6, -700), waiter("short", 1, -10)], [], 6, M, None, runs(short=1), other=2,
                         settings=self.settings)
         self.assertEqual([], found.grants)
 
     def test_a_new_request_gets_no_slots_behind_the_head_unless_its_run_is_known_to_be_short(self):
         waiters = [waiter("gate", 6, -700)]
-        with mock.patch.object(sf, "now", return_value=stamp(0)), mock.patch.object(sf.time, "time", return_value=M):
-            self.assertEqual(0, sf.room(waiters, 5, self.held, runs(one=3600), settings=self.settings))
-            self.assertEqual(0, sf.room(waiters, 5))
-            self.assertEqual(5, sf.room([waiter("gate", 6, -100)], 5, self.held, runs(one=3600),
+        with mock.patch.object(sf_config, "now", return_value=stamp(0)), mock.patch.object(time, "time", return_value=M):
+            self.assertEqual(0, sf_schedule.room(waiters, 5, self.held, runs(one=3600), settings=self.settings))
+            self.assertEqual(0, sf_schedule.room(waiters, 5))
+            self.assertEqual(5, sf_schedule.room([waiter("gate", 6, -100)], 5, self.held, runs(one=3600),
                                         settings=self.settings))
-            self.assertEqual(5, sf.room(waiters, 5, self.held, runs(one=3600, mine=60), settings=self.settings,
+            self.assertEqual(5, sf_schedule.room(waiters, 5, self.held, runs(one=3600, mine=60), settings=self.settings,
                                         label="mine", command="make mine"))
             self.settings["fallback"] = 60
-            self.assertEqual(5, sf.room(waiters, 5, self.held, runs(one=3600), settings=self.settings))
+            self.assertEqual(5, sf_schedule.room(waiters, 5, self.held, runs(one=3600), settings=self.settings))
 
 
 class SettingsTests(unittest.TestCase):
@@ -233,42 +240,42 @@ class SettingsTests(unittest.TestCase):
             os.environ.pop(key)
 
     def test_the_defaults_hold_until_something_is_saved(self):
-        self.assertEqual({**sf.ORDER_DEFAULTS, "saved": False}, sf.order_settings())
+        self.assertEqual({**sf_config.ORDER_DEFAULTS, "saved": False}, sf_schedule.order_settings())
 
     def test_saved_settings_are_every_clients(self):
-        sf.save_order({"order": "backfill", "safety": 4, "limit": 1800, "fallback": 7200, "overrun": 0.25})
-        self.assertEqual({**sf.ORDER_DEFAULTS, "order": "backfill", "safety": 4, "limit": 1800, "fallback": 7200,
-                          "overrun": 0.25, "saved": True}, sf.order_settings())
+        sf_state.save_order({"order": "backfill", "safety": 4, "limit": 1800, "fallback": 7200, "overrun": 0.25})
+        self.assertEqual({**sf_config.ORDER_DEFAULTS, "order": "backfill", "safety": 4, "limit": 1800, "fallback": 7200,
+                          "overrun": 0.25, "saved": True}, sf_schedule.order_settings())
 
     def test_the_environment_can_only_tighten_them(self):
-        sf.save_order(dict(sf.ORDER_DEFAULTS))
+        sf_state.save_order(dict(sf_config.ORDER_DEFAULTS))
         loose = {"SLOTFATHER_BACKFILL_SAFETY": "1", "SLOTFATHER_BACKFILL_LIMIT": "0",
                  "SLOTFATHER_BACKFILL_FALLBACK": "60", "SLOTFATHER_BACKFILL_OVERRUN": "5",
                  "SLOTFATHER_QUEUE": "backfill"}
         with mock.patch.dict(os.environ, loose):
-            found = sf.order_settings()
-        self.assertEqual({**sf.ORDER_DEFAULTS, "saved": True}, found)
+            found = sf_schedule.order_settings()
+        self.assertEqual({**sf_config.ORDER_DEFAULTS, "saved": True}, found)
         tight = {"SLOTFATHER_BACKFILL_SAFETY": "5", "SLOTFATHER_BACKFILL_LIMIT": "600",
                  "SLOTFATHER_BACKFILL_FALLBACK": "7200", "SLOTFATHER_BACKFILL_OVERRUN": "0.1"}
         with mock.patch.dict(os.environ, tight):
-            found = sf.order_settings()
+            found = sf_schedule.order_settings()
         self.assertEqual((5, 600, 7200, 0.1), (found["safety"], found["limit"], found["fallback"], found["overrun"]))
 
     def test_the_environment_may_fall_back_to_the_window_order_but_not_leave_it(self):
         with mock.patch.dict(os.environ, {"SLOTFATHER_QUEUE": "window"}):
-            self.assertEqual("window", sf.order_settings()["order"])
-        sf.save_order({**sf.ORDER_DEFAULTS, "order": "window"})
+            self.assertEqual("window", sf_schedule.order_settings()["order"])
+        sf_state.save_order({**sf_config.ORDER_DEFAULTS, "order": "window"})
         with mock.patch.dict(os.environ, {"SLOTFATHER_QUEUE": "backfill"}):
-            self.assertEqual("window", sf.order_settings()["order"])
+            self.assertEqual("window", sf_schedule.order_settings()["order"])
 
     def test_a_limit_from_the_environment_counts_where_none_is_saved(self):
-        sf.save_order({**sf.ORDER_DEFAULTS, "limit": 0})
+        sf_state.save_order({**sf_config.ORDER_DEFAULTS, "limit": 0})
         with mock.patch.dict(os.environ, {"SLOTFATHER_BACKFILL_LIMIT": "900"}):
-            self.assertEqual(900, sf.order_settings()["limit"])
+            self.assertEqual(900, sf_schedule.order_settings()["limit"])
 
     def test_an_unreadable_file_is_the_window_order(self):
         (self.dir / "order.json").write_text("{not json")
-        self.assertEqual("window", sf.order_settings()["order"])
+        self.assertEqual("window", sf_schedule.order_settings()["order"])
 
 
 class EstimateTests(unittest.TestCase):
@@ -277,11 +284,11 @@ class EstimateTests(unittest.TestCase):
                                 ("agent-a17b708a4e705e421", "agent"), ("sid-kit-wt-646", "sid-kit-wt"),
                                 ("sid-kit-wt-button-spinner", "sid-kit-wt-button-spinner"), ("", ""), (None, "")):
             with self.subTest(label=label):
-                self.assertEqual(expected, sf.family(label))
+                self.assertEqual(expected, sf_schedule.family(label))
 
     def test_the_closest_kind_that_ran_gives_the_median_of_its_recent_runs(self):
         checks = lambda n: "/w/verify.sh --checks " + ",".join(f"c{i}" for i in range(n)) + " --jobs 1"
-        found = sf.Estimates([("lane-1-a", checks(140), 4000), ("lane-1-a", checks(140), 5000),
+        found = sf_schedule.Estimates([("lane-1-a", checks(140), 4000), ("lane-1-a", checks(140), 5000),
                               ("lane-2-b", checks(130), 4600), ("lane-3-c", checks(4), 60),
                               ("post-merge-1-a", checks(140), 700), ("sid-kit", "bun x.mjs", 30)])
         self.assertEqual(4500, found.of("lane-1-a", checks(140)), "same label and kind")
@@ -295,7 +302,7 @@ class EstimateTests(unittest.TestCase):
         self.assertIsNone(found.of("unheard", "make all"))
 
     def test_only_the_last_runs_of_a_kind_count(self):
-        found = sf.Estimates([("a", "make x", 1000)] * 30 + [("a", "make x", 10)] * sf.ESTIMATE_RUNS)
+        found = sf_schedule.Estimates([("a", "make x", 1000)] * 30 + [("a", "make x", 10)] * sf_config.ESTIMATE_RUNS)
         self.assertEqual(10, found.of("a", "make x"))
 
     def test_the_history_gives_every_run_and_skips_requests_that_never_ran(self):
@@ -308,7 +315,7 @@ class EstimateTests(unittest.TestCase):
             v2 = {**v1, "v": 2, "label": "new", "ran": 30, "cpu": 12.0}
             (path / "history.jsonl.1").write_text(json.dumps(v1) + "\n")
             (path / "history.jsonl").write_text(json.dumps(left) + "\n" + "torn {\n" + json.dumps(v2) + "\n")
-            found = sf.history_estimates(path)
+            found = sf_schedule.history_estimates(path)
             self.assertEqual((600, 30, None), (found.of("old", "make build"), found.of("new", "other"),
                                                found.of("gave-up", "x y")))
 
@@ -324,10 +331,10 @@ class EstimateTests(unittest.TestCase):
             left = {**ran, "outcome": "left", "ran": 1500}  # granted and left: not a run either, whatever wrote it
             (path / "history.jsonl").write_text("".join(json.dumps(item) + "\n" for item in
                                                         (ran, orphan, orphan, left, ran)))
-            for found in (sf.history_estimates(path), sf.cached_estimates(path)):
+            for found in (sf_schedule.history_estimates(path), sf_schedule.cached_estimates(path)):
                 self.assertEqual(300, found.of("ci", "sh heavy.sh check"))
-                self.assertEqual([300.0, 300.0], found.runs[("label", "ci", sf.kind("sh heavy.sh check"))])
-            self.assertEqual(sf.ESTIMATES_VERSION, json.loads((path / "estimates.json").read_text())["v"])
+                self.assertEqual([300.0, 300.0], found.runs[("label", "ci", sf_schedule.kind("sh heavy.sh check"))])
+            self.assertEqual(sf_config.ESTIMATES_VERSION, json.loads((path / "estimates.json").read_text())["v"])
 
     def test_estimates_kept_by_an_earlier_version_are_worked_out_again(self):
         """estimates.json written by a version that counted reaped leases, for the same history: not used."""
@@ -337,27 +344,27 @@ class EstimateTests(unittest.TestCase):
                     "outcome": "released"}
             (path / "history.jsonl").write_text(json.dumps(line) + "\n" +
                                                 json.dumps({**line, "ran": 2800, "outcome": "reaped"}) + "\n")
-            self.assertEqual(600, sf.cached_estimates(path).of("a", "make a"))
+            self.assertEqual(600, sf_schedule.cached_estimates(path).of("a", "make a"))
             saved = json.loads((path / "estimates.json").read_text())
-            old = {"stamp": saved["stamp"], "runs": sf.Estimates([("a", "make a", 600), ("a", "make a", 2800)]).save()}
+            old = {"stamp": saved["stamp"], "runs": sf_schedule.Estimates([("a", "make a", 600), ("a", "make a", 2800)]).save()}
             (path / "estimates.json").write_text(json.dumps(old))
-            sf._estimates.clear()  # another process
-            self.assertEqual(600, sf.cached_estimates(path).of("a", "make a"))
-            self.assertEqual(sf.ESTIMATES_VERSION, json.loads((path / "estimates.json").read_text()).get("v"))
+            sf_schedule._estimates.clear()  # another process
+            self.assertEqual(600, sf_schedule.cached_estimates(path).of("a", "make a"))
+            self.assertEqual(sf_config.ESTIMATES_VERSION, json.loads((path / "estimates.json").read_text()).get("v"))
 
     def test_the_estimates_are_kept_beside_the_history_until_it_changes(self):
         with tempfile.TemporaryDirectory() as directory:
             path = pathlib.Path(directory)
             line = {"label": "a", "cmd": "make a", "count": 1, "granted": "2026-11-02T10:01:00Z", "ran": 600}
             (path / "history.jsonl").write_text(json.dumps(line) + "\n")
-            self.assertEqual(600, sf.cached_estimates(path).of("a", "make a"))
+            self.assertEqual(600, sf_schedule.cached_estimates(path).of("a", "make a"))
             self.assertTrue((path / "estimates.json").is_file())
-            sf._estimates.clear()  # another process
-            with mock.patch.object(sf, "history_estimates", side_effect=AssertionError("read the history again")):
-                self.assertEqual(600, sf.cached_estimates(path).of("a", "make a"))
+            sf_schedule._estimates.clear()  # another process
+            with mock.patch.object(sf_schedule, "history_estimates", side_effect=AssertionError("read the history again")):
+                self.assertEqual(600, sf_schedule.cached_estimates(path).of("a", "make a"))
             with open(path / "history.jsonl", "a") as handle:
                 handle.write(json.dumps({**line, "ran": 60}) + "\n")
-            self.assertEqual(330, sf.cached_estimates(path).of("a", "make a"))
+            self.assertEqual(330, sf_schedule.cached_estimates(path).of("a", "make a"))
 
 
 class KindTests(unittest.TestCase):
@@ -370,7 +377,7 @@ class KindTests(unittest.TestCase):
                                   ("python3 -m unittest discover", "python3 -m unittest"),
                                   ("npx vitest --config vitest.config.ts run", "npx vitest")):
             with self.subTest(command=command):
-                self.assertEqual(expected, sf.kind(command))
+                self.assertEqual(expected, sf_schedule.kind(command))
 
 
 class OrderTests(SlotCase):
@@ -421,7 +428,7 @@ class OrderTests(SlotCase):
         gate = self.request("gate", "all", options=("--wait", "600"))
         self.wait_for(lambda: "waiting: 4 slot(s) gate" in self.status(), "the gate to queue")
         entries = [json.loads(path.read_text()) for path in (self.state / "queue").glob("*.json")]
-        until = [sf.seconds(e.get("until")) for e in entries if e["label"] == "gate"][0]
+        until = [sf_config.seconds(e.get("until")) for e in entries if e["label"] == "gate"][0]
         self.assertAlmostEqual(time.time() + 600, until, delta=5)
         short = self.request("short", 1)  # 3 x 1200 s would not end before one, but gate gives up first
         self.started("short")
@@ -433,7 +440,7 @@ class OrderTests(SlotCase):
         self.release("gate")
         self.finish(gate)
         lines = [json.loads(line) for line in (self.state / "history.jsonl").read_text().splitlines()]
-        self.assertEqual([until], [sf.seconds(line.get("until")) for line in lines if line["label"] == "gate"])
+        self.assertEqual([until], [sf_config.seconds(line.get("until")) for line in lines if line["label"] == "gate"])
         self.assertEqual([None], [line.get("until") for line in lines if line["label"] == "short" and line.get("v")])
 
     def test_available_and_advise_answer_for_the_callers_command_when_it_is_given(self):
@@ -554,11 +561,11 @@ class DashboardOrderTests(SlotCase):
         lines=canvas.render(False).splitlines()
         details=lines[0].index("╭",1)
         values={}
-        for name in ("start est","backfill by","pass until"):
+        for name in ("start est","pass until"):
             line=next(line for line in lines if name in line[details:])
             values[name]=line[details:].split(name,1)[1].strip().split()[0]
             self.assertRegex(values[name],r"^\d\d:\d\d:\d\d$")
-        self.assertEqual(values["start est"],values["backfill by"])
+        self.assertNotIn("backfill by", "\n".join(cast(list[str], lines)))
         self.assertIn("▶gate",canvas.render(False))
         for label in ("one", "gate"):
             self.release(label)

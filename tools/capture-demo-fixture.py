@@ -58,10 +58,10 @@ used=sum(h['count'] for h in held)
 fixture=dict(provenance=dict(source='Completed local Slotfather history and nearest machine sample',
     historySha256=hashlib.sha256(source.read_bytes()).hexdigest(),capturedAt=iso(t),machineAt=iso(machine['at']),
     redactions='Home paths shortened, PIDs consistently remapped, secret-bearing commands omitted.',
-    limitations='CPU and memory per lane are recorded run averages, not instantaneous samples. Historical process names and physical memory usage are unavailable; omitted.'),
+    limitations='CPU and memory per request are recorded run averages, not instantaneous samples. Historical process names and physical memory usage are unavailable; omitted.'),
   model=dict(directory='(frozen demo)',slots=6,saved=True,cores=12,averages=machine['load'],
     advice=dict(unleased_load=max(0,min(machine['load'][:2])-used*2)),holders=items[:len(held)],waiters=items[len(held):],
-    used=used,free=6-used,guard=None,admission=0,order='backfill',start=None,limit=2700,
+    used=used,free=6-used,memory_block=None,admission=0,order='backfill',start=None,limit=2700,
     memory=dict(level=machine['pressure'],total=None,used=None,swap_total=machine['swap_total_mb'],swap_free=machine['swap_free_mb']),
     events=events,updated=iso(t)))
 baseline=max((m for m in machines if m['at']<=t),key=lambda m:m['at'])

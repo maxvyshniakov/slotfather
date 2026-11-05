@@ -1,0 +1,7 @@
+[tool.ruff]
+target-version = "py39"
+extend-include = ["slotfather", "slotfather-dashboard", "slotfather-stats", "slotfather-sweep"]
+exclude = [".git", "__pycache__", ".venv", "assets"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "B"]

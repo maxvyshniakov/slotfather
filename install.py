@@ -19,22 +19,31 @@ shell outside it, such as root's through the guest agent, counts the same capaci
 
     sudo python3 install.py --user runner --bin /usr/local/bin --cgroup /ci.slice/ci-runners.slice
 """
+from __future__ import annotations
+
 from contextlib import ExitStack, contextmanager
 import ctypes
 import fcntl
+import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import pwd
+import re
+import shlex
+import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import uuid
+from typing import Any
 
 MIN_PYTHON = (3, 9)
 ENV_SHEBANG = b"#!/usr/bin/env python3\n"
 COMMANDS = ("slotfather", "slotfather-dashboard", "slotfather-stats", "slotfather-sweep")
-USAGE = "usage: python3 install.py [--python /path/to/python3] [--user NAME] [--bin DIR] [--cgroup /A.slice/B.slice]"
+USAGE = "usage: python3 install.py [--python /path/to/python3] [--user NAME] [--bin DIR] [--cgroup /A.slice/B.slice] [--host SSH_ALIAS]"
 STATE_LINE = b'DEFAULT_DIR = "~/.local/state/slotfather"\n'  # in slotfather; --user replaces it
 CGROUP_LINE = b"DEFAULT_CGROUP = None  "  # in slotfather; --cgroup replaces the None
 GUARD = b"Retired queue: use slotfather with ~/.local/state/slotfather. Update this checkout before running heavy work.\n"
@@ -109,17 +118,17 @@ def make_guard(path):
     return path.stat().st_ino
 
 
-def options(argv):
-    """--python, --user, --bin and --cgroup, each at most once with a value."""
-    found = {}
+def options(argv: list[str]) -> dict[str, str]:
+    """Local install options and an optional SSH destination, each once with a value."""
+    found: dict[str, str] = {}
     while argv:
-        if argv[0] not in ("--python", "--user", "--bin", "--cgroup") or len(argv) < 2 or argv[0] in found:
+        if argv[0] not in ("--python", "--user", "--bin", "--cgroup", "--host") or len(argv) < 2 or argv[0] in found:
             raise InstallError(USAGE)
         found[argv[0]], argv = argv[1], argv[2:]
     return found
 
 
-def interpreter(python=None):
+def interpreter(python: str | None = None) -> str:
     """The interpreter the commands will name: --python PATH, else this one unless it belongs to a virtual
     environment, whose interpreter disappears with the project. It must exist and be Python 3.9 or later."""
     if python:
@@ -167,7 +176,130 @@ def install_binary(source, target, python, state=None, cgroup=None):
             pending.unlink(missing_ok=True)
 
 
-def install(home, source, python, bin_dir=None, pinned=False, cgroup=None):
+def source_files(root: Path) -> list[Path]:
+    """The portable runtime payload, excluding bytecode, git data and unrelated checkout files."""
+    files = [root / "install.py", *(root / name for name in COMMANDS)]
+    package = root / "src" / "slotfather"
+    if package.is_dir():
+        files.extend(sorted(package.rglob("*.py")))
+    return files
+
+
+def source_digest(root: Path) -> str:
+    digest = hashlib.sha256()
+    for path in source_files(root):
+        if not path.is_file():
+            raise InstallError(f"source file missing: {path}")
+        name = str(path.relative_to(root)).encode()
+        payload = path.read_bytes()
+        digest.update(len(name).to_bytes(8, "big") + name)
+        digest.update(len(payload).to_bytes(8, "big") + payload)
+    return digest.hexdigest()
+
+
+def source_identity(root: Path) -> dict[str, Any]:
+    """Installed and streamed checkouts identify exactly the same runtime bytes."""
+    digest = source_digest(root)
+    supplied = root / ".slotfather-source.json"
+    if supplied.is_file():
+        data = json.loads(supplied.read_text())
+        if data.get("source_sha256") != digest:
+            raise InstallError("streamed source does not match its recorded digest")
+        return data
+    result = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True)
+    commit = result.stdout.strip() if result.returncode == 0 else None
+    changed = subprocess.run(["git", "-C", str(root), "status", "--porcelain", "--untracked-files=normal", "--",
+                              "install.py", *COMMANDS, "src"], capture_output=True, text=True)
+    return {"v": 1, "commit": commit, "dirty": bool(changed.stdout.strip()) or commit is None,
+            "source_sha256": digest}
+
+
+def install_package(home: Path, root: Path, state: Path | None = None, cgroup: str | None = None,
+                    bin_dir: Path | None = None) -> Path:
+    """Prepare a complete immutable release before any command can reference it."""
+    identity = source_identity(root)
+    defaults = {"state": str(state) if state is not None else None, "cgroup": cgroup}
+    descriptor = {"identity": identity, "defaults": defaults}
+    suffix = hashlib.sha256(json.dumps(descriptor, sort_keys=True).encode()).hexdigest()[:12]
+    # System entry points must never load runner-writable modules during a root status query.
+    prefix = home / ".local" if bin_dir is None or home in bin_dir.parents else bin_dir.parent
+    releases = prefix / "lib/slotfather/releases"
+    releases.mkdir(parents=True, exist_ok=True)
+    releases.parent.chmod(0o755)
+    releases.chmod(0o755)
+    release = releases / (identity["source_sha256"] + "-" + suffix)
+    pending = Path(tempfile.mkdtemp(prefix=".pending-", dir=releases))
+    try:
+        package = pending / "slotfather"
+        package.mkdir()
+        source_package = root / "src/slotfather"
+        for path in sorted(source_package.rglob("*.py")):
+            target = package / path.relative_to(source_package)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(path, target)
+        config = package / "config.py"
+        payload = config.read_bytes()
+        if state is not None:
+            if payload.count(STATE_LINE) != 1:
+                raise InstallError(f"cannot pin the state directory in {config}: unexpected DEFAULT_DIR")
+            payload = payload.replace(STATE_LINE, b"DEFAULT_DIR = " + json.dumps(str(state)).encode() + b"\n")
+        if cgroup is not None:
+            if payload.count(CGROUP_LINE) != 1:
+                raise InstallError(f"cannot pin the cgroup in {config}: unexpected DEFAULT_CGROUP")
+            payload = payload.replace(CGROUP_LINE, b"DEFAULT_CGROUP = " + json.dumps(cgroup).encode() + b"  ")
+        config.write_bytes(payload)
+        (package / "version.json").write_text(json.dumps(identity, sort_keys=True) + "\n")
+        # mkdtemp is private while preparing; published root-owned code must be readable by runner.
+        for path in pending.rglob("*"):
+            path.chmod(0o755 if path.is_dir() else 0o644)
+        pending.chmod(0o755)
+        if source_digest(root) != identity["source_sha256"]:
+            raise InstallError("source changed during install; retry from a stable checkout")
+        if release.exists():
+            expected = {str(p.relative_to(pending)): p.read_bytes() for p in pending.rglob("*") if p.is_file()}
+            actual = {str(p.relative_to(release)): p.read_bytes() for p in release.rglob("*")
+                      if p.is_file() and "__pycache__" not in p.parts}
+            if actual != expected:
+                raise InstallError(f"immutable installed release differs from source: {release}")
+        else:
+            os.replace(pending, release)
+        return release
+    finally:
+        if pending.exists():
+            shutil.rmtree(pending)
+
+
+def package_wrapper(release: Path, name: str) -> bytes:
+    module = "cli" if name == "slotfather" else name.removeprefix("slotfather-")
+    return ("#!/usr/bin/env python3\nimport sys\nsys.path.insert(0, " + repr(str(release)) + ")\n"
+            "from slotfather." + module + " import main\nif __name__ == '__main__':\n    sys.exit(main())\n").encode()
+
+
+def install_remote(root: Path, host: str, argv: list[str]) -> None:
+    """Send one verified runtime snapshot to the named SSH destination; no remote git checkout needed."""
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.@:-]*", host):
+        raise InstallError("--host takes an SSH alias or user@hostname, not options or shell syntax")
+    identity = source_identity(root)
+    data = io.BytesIO()
+    with tarfile.open(fileobj=data, mode="w") as archive:
+        for path in source_files(root):
+            archive.add(path, arcname=str(path.relative_to(root)), recursive=False)
+        payload = (json.dumps(identity, sort_keys=True) + "\n").encode()
+        info = tarfile.TarInfo(".slotfather-source.json")
+        info.size = len(payload)
+        info.mode = 0o600
+        archive.addfile(info, io.BytesIO(payload))
+    command = 'python3 "$staging/install.py"' + "".join(" " + shlex.quote(part) for part in argv)
+    script = ('set -eu; staging=$(mktemp -d "${TMPDIR:-/tmp}/slotfather-install.XXXXXXXX"); '
+              "trap 'rm -rf -- \"$staging\"' EXIT HUP INT TERM; "
+              'tar -xf - -C "$staging"; ' + command)
+    result = subprocess.run(["ssh", "--", host, script], input=data.getvalue())
+    if result.returncode:
+        raise InstallError(f"remote install on {host} failed (exit {result.returncode})")
+
+
+def install(home: Path, source: Path, python: str, bin_dir: Path | None = None,
+            pinned: bool = False, cgroup: str | None = None) -> None:
     """Install into `bin_dir` (default HOME/.local/bin) for the queue in HOME/.local/state/slotfather; `pinned`
     writes that queue into slotfather as its default, `cgroup` the cgroup v2 path its leases share."""
     bin_dir = bin_dir or home / ".local/bin"
@@ -180,6 +312,7 @@ def install(home, source, python, bin_dir=None, pinned=False, cgroup=None):
             raise InstallError(f"source executable missing: {source.with_name(name)}")
     if old_command.is_dir() and not old_command.is_symlink():
         raise InstallError(f"old command is a directory; leaving it unchanged: {old_command}")
+    release = None
     created_guards = []
     changing = False
     with lock(state / ".slotfather-install.lock"), ExitStack() as locks:
@@ -222,6 +355,8 @@ def install(home, source, python, bin_dir=None, pinned=False, cgroup=None):
                     pass
             if not new_guard and not destination.is_dir():
                 raise InstallError(f"new queue path is not a directory; preserve it and recover before retrying: {destination}")
+            if (source.parent / "src/slotfather").is_dir():
+                release = install_package(home, source.parent, destination if pinned else None, cgroup, bin_dir)
             backup = state / "slotfather-migrations" / uuid.uuid4().hex
             for old in old_directories:
                 if new_guard and old == old_paths[0]:
@@ -246,8 +381,17 @@ def install(home, source, python, bin_dir=None, pinned=False, cgroup=None):
             # mismatch.
             for name in reversed(COMMANDS):
                 main_command = name == "slotfather"
-                install_binary(source.with_name(name), bin_dir / name, python,
-                               destination if pinned and main_command else None, cgroup if main_command else None)
+                if release is None:
+                    install_binary(source.with_name(name), bin_dir / name, python,
+                                   destination if pinned and main_command else None, cgroup if main_command else None)
+                else:
+                    with tempfile.NamedTemporaryFile(dir=release, prefix=".wrapper-", delete=False) as handle:
+                        wrapper = Path(handle.name)
+                        handle.write(package_wrapper(release, name))
+                    try:
+                        install_binary(wrapper, bin_dir / name, python)
+                    finally:
+                        wrapper.unlink(missing_ok=True)
             old_command.unlink(missing_ok=True)
             print(f"Installed {bin_dir / 'slotfather'}, slotfather-dashboard, slotfather-stats and slotfather-sweep for "
                   f"{python}; old queue paths are file guards" + (f"; queue {destination}" if pinned else "")
@@ -271,6 +415,10 @@ def give(home, user, bin_dir, owner_of=lambda path: os.lstat(path).st_uid, chown
         paths.append(top)
         if top.is_dir() and not top.is_symlink():
             paths += sorted(top.rglob("*"))
+    library = home / ".local/lib/slotfather"
+    paths.extend([home / ".local/lib", library])
+    if library.is_dir() and not library.is_symlink():
+        paths.extend(sorted(library.rglob("*")))
     if home in bin_dir.parents or bin_dir == home:
         paths += [bin_dir] + [bin_dir / name for name in COMMANDS]
     for path in paths:
@@ -284,6 +432,11 @@ def main():
         return 0
     try:
         found = options(sys.argv[1:])
+        if "--host" in found:
+            host = found.pop("--host")
+            forwarded = [value for pair in found.items() for value in pair]
+            install_remote(Path(__file__).resolve().parent, host, forwarded)
+            return 0
         python = interpreter(found.get("--python"))
         home, user = Path.home(), None
         if "--user" in found:

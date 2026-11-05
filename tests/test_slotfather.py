@@ -5,6 +5,11 @@ Fake work records its start in a log and holds its lease until the test creates 
 in which requests start is observable without timing guesses. Each test has its own state directory.
 """
 from __future__ import annotations
+import sys as _path_sys
+from pathlib import Path as _Path
+_path_sys.path.insert(0, str(_Path(__file__).resolve().parents[1] / "src"))
+from slotfather import platform as sf_platform
+
 
 import importlib.machinery
 import importlib.util
@@ -63,7 +68,7 @@ class SlotCase(unittest.TestCase):
         self.processes.append(process)
         return process
 
-    def tool(self, *args, **env):
+    def tool(self, *args: str, **env: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run([TOOL, *args], env={**self.env, **env}, capture_output=True, text=True, timeout=20)
 
     def release(self, label):
@@ -471,13 +476,10 @@ class MemoryGuardTests(SlotCase):
         self.finish(guarded)
 
     def test_a_host_with_swap_turned_off_has_no_swap_floor(self):
-        loader = importlib.machinery.SourceFileLoader("slotfather_tool", TOOL)
-        tool = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
-        loader.exec_module(tool)
-        self.assertIsNone(tool.swap_free_mb("total = 0.00M  used = 0.00M  free = 0.00M  (encrypted)"))
-        self.assertEqual(148.0, tool.swap_free_mb("total = 2048.00M  used = 1900.00M  free = 148.00M  (encrypted)"))
-        self.assertEqual(1536.0, tool.swap_free_mb("total = 2.00G  used = 512.00M  free = 1.50G  (encrypted)"))
-        self.assertIsNone(tool.swap_free_mb(""))
+        self.assertIsNone(sf_platform.swap_free_mb("total = 0.00M  used = 0.00M  free = 0.00M  (encrypted)"))
+        self.assertEqual(148.0, sf_platform.swap_free_mb("total = 2048.00M  used = 1900.00M  free = 148.00M  (encrypted)"))
+        self.assertEqual(1536.0, sf_platform.swap_free_mb("total = 2.00G  used = 512.00M  free = 1.50G  (encrypted)"))
+        self.assertIsNone(sf_platform.swap_free_mb(""))
 
     def test_with_nothing_running_a_short_swap_does_not_block(self):
         self.memory.write_text("0 4\n")

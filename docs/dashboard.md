@@ -12,23 +12,28 @@ slotfather dashboard --once --width 156 --height 43 --color
 
 | Input | Action |
 | --- | --- |
-| ↑ / ↓ or j / k | Select an active or waiting lane. |
-| Click a lane | Select that row. |
+| ↑ / ↓ or j / k | Select a running or waiting request. |
+| Click a request | Select that row. |
 | Mouse wheel | Scroll the table under the pointer. |
-| g / G, Home / End | First or last lane. |
+| g / G, Home / End | First or last request. |
 | p or Space | Pause/resume updates. |
 | r | Refresh. |
 | m | Toggle native text selection; copying freezes updates and disables app mouse handling. |
-| ? | Help. |
+| ? | Open scrollable help. |
 | q | Quit. |
 
-Only the selected lane has a triangle and a soft background. The blank separator
-between active and waiting lanes is not selectable. Overflow counts appear in
+Only the selected request has a triangle and a soft background. The blank separator
+between running and waiting requests is not selectable. Overflow counts appear in
 the tables’ top and bottom padding rows.
 
-## Lanes and details
+With help open, arrows / j / k and the wheel scroll its text; PgUp / PgDown or
+Space scroll a page, and Home / End or g / G jump to the ends. `?` / Esc close
+help; q still quits the dashboard. Help navigation preserves request selection and
+the tables' scroll positions.
 
-Time is elapsed run time for an active lane and elapsed wait time for a pending
+## Requests and details
+
+Time is elapsed run time for a running request and elapsed wait time for a pending
 one. CPU use/share is **cores used / cores represented by the lease’s slots**;
 it is an observation, not a hard CPU limit. Yellow indicates a nearly idle
 holder; red indicates use well above its share. After sustained low activity,
@@ -39,19 +44,29 @@ owner and its descendants, busiest first. Each row’s CPU is a percentage:
 100% means one core. Memory is summed resident memory, so shared pages can be
 counted in more than one process.
 
-For the waiting head, `start est` is an estimate, `backfill by` says when work
-must finish to pass it, and `pass until` is the deadline for passing. These fields
-appear only when the scheduler has the corresponding estimate.
+For the first waiting request:
+
+- `start est` is its estimated start. Later work may backfill only if its
+  predicted finish, including the safety margin, is before this time, or it
+  uses only slots the protected request will not need.
+- `pass until` is the end of the current overtaking window. With `start est`
+  shown, no later request may pass after this deadline. Without it, stricter
+  backfill rules may follow the initial window.
+
+For example, `start est 10:30` and `pass until 10:20` allow a later request at
+10:10 only if it is expected to finish before 10:30 with the safety margin.
+At 10:21 it cannot pass. These are policy deadlines and estimates, not a promised
+start. The help explains them alongside CPU, load, memory, admission and history.
 
 ## Machine
 
 - **memory / swap status:** white is normal, red is a condition that can block
   additional leases. The memory bar also reflects memory health.
-- **unleased cores:** estimated load not explained by the CPU share of held slots.
+- **unleased load:** estimated load not explained by the CPU share of held slots.
   It uses the lower of the one- and five-minute load averages.
 - **admission:** slots a generic new request can get immediately, considering
   queue order and memory checks. It is not a count of worker processes.
-- **loaded … of … cores:** one-minute load average relative to the core count.
+- **load 1m:** one-minute system load, shown beside the core count.
   Load counts runnable and waiting tasks; it is not CPU busy percentage and can
   exceed the number of cores.
 - **memory / swap bars:** observed used capacity. Missing observations are shown
