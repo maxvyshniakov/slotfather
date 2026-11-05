@@ -25,10 +25,12 @@ import textwrap
 import time
 import tty
 import unicodedata
+from urllib.parse import urlsplit
 from typing import Any, NamedTuple, cast
 
 
 from . import config as _config
+from . import lane_context as _lane_context
 from . import platform as _platform
 from . import query as _query
 from . import schedule as _schedule
@@ -38,7 +40,7 @@ from . import schedule as _schedule
 # and --once write that canvas as the same escape sequences, so they are the same picture.
 
 SPARK = "▁▂▃▄▅▆▇█"
-CHART_ROWS = 6
+CHART_ROWS = 5
 MACHINE_HEIGHT = 12 + CHART_ROWS  # status, resource bars, gaps, legend and frame
 HISTORY_WINDOW = 3600  # seconds of queue.log the utilisation strip rebuilds
 LOG_TAIL = 262144  # bytes of queue.log read per refresh
@@ -146,6 +148,7 @@ class Canvas:
     def __init__(self, width: int, height: int):
         self.scroll: dict[str, int] = {}
         self.tables = {}
+        self.links: dict[tuple[int, int], str] = {}
         self.help_view: HelpViewport | None = None
         self.width, self.height = max(0, width), max(0, height)
         self.cells = [[[" ", "text", False] for _ in range(self.width)] for _ in range(self.height)]
@@ -163,10 +166,18 @@ class Canvas:
                 break
             if x >= 0:
                 self.cells[y][x][:2] = [char, style]
+                self.links.pop((y, x), None)
                 if size == 2:
                     self.cells[y][x + 1][:2] = ["", style]
+                    self.links.pop((y, x + 1), None)
             x += size
         return x
+
+    def hyperlink(self, y: int, x: int, text: str, url: str, width: int, style: str = "accent") -> None:
+        end = self.put(y, x, text, style, width)
+        if safe_link(url):
+            for column in range(max(0, x), min(self.width, end)):
+                self.links[y, column] = url
 
     def right(self, y: int, end: int, value, style: str = "text") -> int:
         """Writes value ending just before column `end`; the column it starts at."""
@@ -187,6 +198,7 @@ class Canvas:
         for row in range(max(0, y), min(self.height, y + height)):
             for column in range(max(0, x), min(self.width, x + width)):
                 self.cells[row][column] = [" ", "text", False]
+                self.links.pop((row, column), None)
 
     def select(self, y: int, start: int, end: int) -> None:
         if 0 <= y < self.height:
@@ -220,7 +232,16 @@ class Canvas:
         found = []
         for y in range(self.height):
             if colour:
-                line = "".join(sgr(style, selected) + text + "\x1b[0m" for text, style, selected in self.runs(y))
+                runs: list[list[Any]] = []
+                for column, (char, style, selected) in enumerate(cast(list[tuple[str, str, bool]], self.cells[y])):
+                    url = self.links.get((y, column), "")
+                    if runs and runs[-1][1:] == [style, selected, url]:
+                        runs[-1][0] += char
+                    else:
+                        runs.append([char, style, selected, url])
+                line = "".join(sgr(style, selected) +
+                               (f"\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\" if url else text) + "\x1b[0m"
+                               for text, style, selected, url in runs)
             else:
                 line = "".join(char for char, _, _ in self.cells[y])
             found.append(line.translate(ASCII) if ascii_only else line)
@@ -228,6 +249,16 @@ class Canvas:
 
     def render(self, colour: bool, ascii_only: bool = False) -> str:
         return "\n".join(line if colour else line.rstrip() for line in self.lines(colour, ascii_only))
+
+
+def safe_link(url: str) -> bool:
+    try:
+        parsed = urlsplit(url)
+        local_file = parsed.scheme == "file" and parsed.netloc in ("", "localhost") and parsed.path.startswith("/")
+        return ((local_file or (parsed.scheme == "https" and bool(parsed.hostname) and not parsed.username))
+                and all(char.isprintable() and not char.isspace() for char in url))
+    except ValueError:
+        return False
 
 
 def sgr(style: str, selected: bool) -> str:
@@ -432,27 +463,29 @@ def dashboard_model() -> dict:
         with contextlib.suppress(OSError, ValueError, AttributeError):
             asks[int(place.stem.split("-")[-1])] = str(json.loads(place.read_text()).get("label") or "?")
 
-    def item(entry: dict, kind: str, count: int, queue: str = "") -> dict:
+    def item(entry: dict[str, Any], kind: str, count: int, queue: str = "") -> dict[str, Any]:
         tree = process_tree(entry.get("pid"), own, children) if kind != "waiting" else []
         return {"tree": sorted(tree, key=lambda process: -process[1]), "cpu": sum(p[1] for p in tree),
                 "rss": sum(p[2] for p in tree), "procs": len(tree),"key": (entry.get("pid"), entry.get("since")), "kind": kind, "count": count, "queue": queue,
                 "label": dashboard_text(entry.get("label", "")), "pid": entry.get("pid"),
                 "cmd": dashboard_text(entry.get("cmd", "")), "since": parse_utc(entry.get("since")),
                 "meta": dashboard_text(_config.meta_text(_config.meta_of(entry))),
+                "context": _config.meta_of(entry), "workdir": entry.get("cwd") or "",
+                "priority": _config.priority_of(entry), "ticket": _config.ticket_of(entry),
                 "yieldable": bool(entry.get("yieldable")), "yields": int(entry.get("yields") or 0),
                 "asked": dashboard_text(asks.get(entry.get("pid"), "")),
                 "granted": parse_utc(entry.get("granted")), "passable": kind == "waiting" and _schedule.overtakable(entry),
                 "style": "warn" if kind == "waiting" else "legacy"}
 
-    holders = [item(e, "held", e["count"]) for e in live if e["state"] == "held"]
-    holders += [item(e, "legacy", count, str(path.parent.parent)) for path, e, count in legacy]
+    holders = [item(cast(dict[str, Any], e), "held", e["count"]) for e in live if e["state"] == "held"]
+    holders += [item(cast(dict[str, Any], e), "legacy", count, str(path.parent.parent)) for path, e, count in legacy]
     settings, start = _schedule.order_settings(directory), None
     order = settings["order"]
     live_waiters = [e for e in live if e["state"] != "held"]
     _schedule.fit(live_waiters, slots)  # as the queue grants them when the capacity shrank under them
     if order == "backfill":
         live_waiters = _schedule.ranked(live_waiters, settings)  # the order the queue serves them in
-    waiters = [item(e, "waiting", e["count"]) for e in live_waiters]
+    waiters = [item(cast(dict[str, Any], e), "waiting", e["count"]) for e in live_waiters]
     used = sum(h["count"] for h in holders)
     if order == "backfill" and live_waiters:
         with contextlib.suppress(Exception):  # an estimate that cannot be read leaves the sentence without a time
@@ -736,15 +769,37 @@ def queue_policy(model: dict) -> dict[str, str]:
 
 
 
+def detail_ticket(item: dict[str, Any], lane: dict[str, Any], context: dict[str, str]) -> tuple[str, str]:
+    source: dict[str, Any] = {}
+    if item.get("ticket") is not None:
+        source["ticket"] = item["ticket"]
+    ticket: dict[str, Any] = lane.get("ticket") or {}
+    value = _config.ticket_of(source) or _config.ticket_of({"ticket": ticket.get("number")})
+    if not value:
+        return "", ""
+    url = value if value.startswith("https://") and safe_link(value) else ""
+    repository = str(lane.get("repository") or "")
+    if value.isdigit() and repository.startswith("https://") and safe_link(repository):
+        url = repository.rstrip("/") + "/issues/" + value
+    elif value == str(ticket.get("number")):
+        candidate = str(ticket.get("url") or "")
+        if candidate.startswith("https://") and safe_link(candidate):
+            url = candidate
+    return ("#" + value if value.isdigit() else value), url
+
+
 def draw_detail(canvas: Canvas, y: int, x: int, height: int, width: int, model: dict, selected: int,
                 cwd: str | None, moment: datetime.datetime) -> None:
     canvas.box(y, x, height, width, "REQUEST DETAILS")
-    items = model["holders"] + model["waiters"]
-    inner, bottom = width - 6, y + height - 2
+    items = cast(list[dict[str, Any]], model["holders"] + model["waiters"])
+    inner = width - 6
     if not items:
         canvas.put(y + 2, x + 3, "Nothing to select · the queue is idle", "dim", inner)
         return
     item = items[selected]
+    lane: dict[str, Any] = item.get("lane") or {}
+    context: dict[str, str] = item.get("context") or {}
+    ticket_text, ticket_url = detail_ticket(item, lane, context)
     if item["kind"] == "waiting":
         position = selected - len(model["holders"])
         heading = f"waiting · #{position + 1} · wants {item['count']}"
@@ -754,7 +809,15 @@ def draw_detail(canvas: Canvas, y: int, x: int, height: int, width: int, model: 
         minutes, seconds = divmod(max(0, int((moment - item["idle_since"]).total_seconds())), 60)
         duration = f"{minutes}m {seconds:02}s" if minutes else f"{seconds}s"
         heading += f" · idle for {duration}"
-    facts = [("label", [(item["label"] or "(no label)", "bold")]), ("status", [(heading, "text")])]
+    facts: list[tuple[str, list[tuple[str, str]]]] = [("label", [(item["label"] or "(no label)", "bold")]), ("status", [(heading, "text")])]
+    priority = _config.priority_of({"priority": item.get("priority")})
+    facts.append(("priority", [(priority, "text")]))
+    if ticket_text:
+        facts.append(("ticket", [(ticket_text, "accent" if ticket_url else "text")]))
+    for key, label in (("phase", "phase"), ("kind", "kind"), ("check", "check"), ("sha", "revision"),
+                       ("on", "run on"), ("session", "session")):
+        if context.get(key):
+            facts.append((label, [(dashboard_text(context[key]), "dim" if key in ("sha", "session") else "text")]))
     if item["kind"] == "waiting":
         facts.append(("queued", [(f"{clock(item['since'])} · waiting "
                                   f"{span((moment - item['since']).total_seconds()) if item['since'] else '?'}", "text")]))
@@ -787,42 +850,90 @@ def draw_detail(canvas: Canvas, y: int, x: int, height: int, width: int, model: 
     value_width = max(1, inner - label_width)
     if text_width(where) > value_width:
         where = "…" + where[-max(0, value_width - 1):]
+    worktree_rows: set[int] = set()
+    worktree_url = ""
+    if lane.get("worktree"):
+        folder = Path(str(lane["worktree"]))
+        if folder.is_absolute():
+            worktree_url = folder.as_uri()
+        for index, line in enumerate(textwrap.wrap(tilde(dashboard_text(lane["worktree"])), value_width,
+                                                   break_on_hyphens=False)):
+            worktree_rows.add(len(facts))
+            facts.append(("worktree" if index == 0 else "", [(line, "dim")]))
     blocks = [("command", item["cmd"] or "—")]
-    if item.get("meta"):
-        blocks.append(("meta", item["meta"]))
-    available = max(0, bottom - (y + 2) - len(facts) - bool(where))
-    process_room = 5 if item["tree"] and available >= len(blocks) + 5 else 0
-    budget = max(len(blocks), available - process_room)
+    metadata: str = item.get("meta", "")
+    if context:
+        builtin = {"class", "priority", "ticket", "lane", "phase", "kind", "check", "sha", "on", "session", "lanefather.state"}
+        metadata = dashboard_text(_config.meta_text({key: value for key, value in context.items() if key not in builtin}))
+    if metadata:
+        blocks.append(("meta", metadata))
     wrapped = [textwrap.wrap(text, value_width, break_on_hyphens=False) or ["—"] for _, text in blocks]
-    sizes = [1] * len(blocks)
-    # Expand command and metadata together, each to at most three rows.
-    for _ in range(2):
-        for index, lines in enumerate(wrapped):
-            if sum(sizes) < budget and sizes[index] < min(3, len(lines)):
-                sizes[index] += 1
-    for (name, _), lines, count in zip(blocks, wrapped, sizes):
-        for index, line in enumerate(lines[:count]):
-            if index == count - 1 and len(lines) > count:
+    for (name, _), lines in zip(blocks, wrapped):
+        for index, line in enumerate(lines[:3]):
+            if index == 2 and len(lines) > 3:
                 line = clip(line + " …", value_width)
             facts.append((name if index == 0 else "", [(line, "dim")]))
     if where:
         facts.append(("cwd", [(where, "dim")]))
-    row = y + 2
-    for name, parts in facts:
-        if row >= bottom:
-            break
-        canvas.put(row, x + 3, name, "dim")
-        canvas.segments(row, x + 3 + label_width, parts, value_width)
-        row += 1
-    if item["tree"] and bottom - row >= 5:
+    if context.get("lane"):
+        facts.extend([("", []), ("lane", [(dashboard_text(context["lane"]), "bold")])])
+        if lane.get("error") or not lane:
+            facts.append(("details", [("unavailable" + (f" · {lane['error']}" if lane.get("error") else ""), "dim")]))
+        else:
+            for name in ("project", "status", "branch", "base"):
+                text = dashboard_text(lane.get(name) or "—")
+                for index, line in enumerate(textwrap.wrap(text, value_width, break_on_hyphens=False)):
+                    label = "stage" if name == "status" else name
+                    facts.append((label if index == 0 else "", [(line, "text")]))
+            checks: dict[str, Any] = lane.get("checks") or {}
+            check_text = str(checks.get("status") or "unknown")
+            if checks.get("current") is not None:
+                check_text += " · current" if checks["current"] else " · stale"
+            facts.append(("receipt", [(dashboard_text(check_text), "text")]))
+            review: dict[str, Any] = lane.get("review") or {}
+            review_text = str(review.get("status") or "unknown")
+            if review.get("findings"):
+                review_text += f" · {review.get('unresolved', '?')} unresolved of {review['findings']}"
+            facts.append(("review", [(dashboard_text(review_text), "text")]))
+            for name in ("claims", "after"):
+                text = ", ".join(dashboard_text(value) for value in lane.get(name, [])) or "—"
+                for index, line in enumerate(textwrap.wrap(text, value_width)):
+                    facts.append((name if index == 0 else "", [(line, "dim")]))
+    content_height = len(facts) + (3 + len(item["tree"]) if item["tree"] else 0)
+    document = Canvas(width, content_height)
+    for row, (name, parts) in enumerate(facts):
+        document.put(row, 3, name, "dim")
+        if row in worktree_rows and worktree_url:
+            document.hyperlink(row, 3 + label_width, str(parts[0][0]), worktree_url, value_width, "dim")
+        elif name == "ticket" and ticket_url:
+            document.hyperlink(row, 3 + label_width, str(parts[0][0]), ticket_url, value_width)
+        else:
+            document.segments(row, 3 + label_width, parts, value_width)
+    if item["tree"]:
+        row = len(facts)
         placed = columns(inner, [("name", "process", 0, False, 0), ("cpu", "cpu", 6, True, 1),
                                  ("rss", "memory", 8, True, 2), ("pid", "pid", 6, True, 0)])
-        draw_row(canvas, row + 1, x + 3, placed, {key: (title, "dim") for key, title, *_ in placed})
-        offset, visible = table_view(canvas, "processes", row + 1, x, bottom - row, width,
-                                     row + 3, bottom - row - 3, len(item["tree"]))
-        for process_row, (pid, cpu, rss, name) in enumerate(item["tree"][offset:offset + visible], row + 3):
-            draw_row(canvas, process_row, x + 3, placed, {"pid": str(pid), "cpu": f"{cpu:.0f}%",
+        draw_row(document, row + 1, 3, placed, {key: (title, "dim") for key, title, *_ in placed})
+        for process_row, (pid, cpu, rss, name) in enumerate(item["tree"], row + 3):
+            draw_row(document, process_row, 3, placed, {"pid": str(pid), "cpu": f"{cpu:.0f}%",
                      "rss": megabytes(rss / 1024), "name": name})
+    offset, visible = table_view(canvas, "details", y, x, height, width, y + 2,
+                                 max(0, height - 4), content_height)
+    for row in range(min(visible, content_height - offset)):
+        for column in range(3, max(3, width - 3)):
+            target_y, target_x = y + 2 + row, x + column
+            if 0 <= target_y < canvas.height and 0 <= target_x < canvas.width:
+                canvas.cells[target_y][target_x] = document.cells[offset + row][column][:]
+                url = document.links.get((offset + row, column))
+                canvas.links.pop((target_y, target_x), None)
+                if url:
+                    canvas.links[target_y, target_x] = url
+
+
+def enrich_details(item: dict[str, Any]) -> None:
+    context: dict[str, str] = item.get("context") or {}
+    if context.get("lane"):
+        item["lane"] = _lane_context.fetch(context, item.get("workdir") or "")
 
 
 def machine_memory_status(memory: dict) -> tuple[str, str]:
@@ -980,7 +1091,10 @@ HELP_CONTENT: list[tuple[str, str]] = [
     ("label is the caller-supplied name. status gives the run or wait state and slot count. idle for means sustained near-zero observed CPU while still holding slots.", "text"),
     ("For running work, cpu uses the same core scale as REQUESTS. granted shows when the lease started, how long it waited and how long it has run. memory is the process tree's resident memory.", "text"),
     ("owner pid is the process holding the lease. The process table includes it and its descendants, busiest first. Process CPU uses percent: 100% is one core.", "text"),
-    ("command is the launched work; meta is caller-supplied context; cwd is its working directory.", "text"),
+    ("priority is interactive, normal or batch; omitted priority is normal. Ticket is optional. Known caller context such as phase, kind, check, revision and session is shown separately; meta contains only custom fields.", "text"),
+    ("receipt is the saved verification result: green or red, and current or stale relative to the lane branch. Green can include accepted failure classifications. Review is independent code review; unresolved counts findings without a recorded disposition.", "text"),
+    ("command is the launched work; meta is caller-supplied context; cwd is its working directory. Wheel anywhere in REQUEST DETAILS scrolls the whole panel, including its process table.", "text"),
+    ("Lane fields show optional context from lanefather: project, stage, branch, receipt and review. Stage is the lane lifecycle; phase describes this particular run. Ticket numbers are terminal hyperlinks; use your terminal's link gesture (usually Cmd-click on macOS). Missing or older lanefather versions leave request inspection available.", "text"),
     ("For waiting work, queued shows when the request joined and how long it has waited. free is currently unused slot capacity; ahead counts earlier waiting requests and their requested slots.", "text"),
     ("start est is the first waiting request's estimated start. Later work may backfill if its predicted finish, including a safety margin, is before this time, or if it uses only slots the protected request will not need.", "text"),
     ("pass until: end of the current overtaking window. With start est shown, no later request may pass after this time. Without start est, stricter backfill rules may follow.", "text"),
@@ -1277,8 +1391,10 @@ def dashboard_live(interval: float) -> None:
             index = keys.index(selected_key) if selected_key in keys else max(0, min(index, len(items) - 1))
             next_key = keys[index] if items else None
             if next_key != selected_key:
-                scroll.pop("processes", None)
+                scroll.pop("details", None)
             selected_key = next_key
+            if items and not paused and mouse_enabled:
+                enrich_details(cast(dict[str, Any], items[index]))
             if items and items[index]["kind"] != "waiting" and items[index]["pid"] not in cwds:
                 cwds[items[index]["pid"]] = process_cwd(items[index]["pid"])
             size = os.get_terminal_size(fd_out)  # read each pass: at most 0.25 s behind a resize
@@ -1309,7 +1425,7 @@ def dashboard_live(interval: float) -> None:
                         previous = index
                         index = mouse_action(canvas, key, scroll, index)
                         if index != previous:
-                            scroll.pop("processes", None)
+                            scroll.pop("details", None)
                         selected_key = keys[index] if items else None
                     continue
                 if help_open:
@@ -1322,7 +1438,7 @@ def dashboard_live(interval: float) -> None:
                     continue
                 if key in ("j", "down", "k", "up", "g", "home", "G", "end", "page_up", "page_down"):
                     scroll.pop("requests", None)
-                    scroll.pop("processes", None)
+                    scroll.pop("details", None)
                 if key in ("q", "Q"):
                     return
                 if key == "esc":
@@ -1384,6 +1500,8 @@ def dashboard_command(argv: list[str]) -> int:
         model = dashboard_model()
         dashboard_colours(model, {})
         items = model["holders"] + model["waiters"]
+        if items:
+            enrich_details(cast(dict[str, Any], items[0]))
         size_now = shutil.get_terminal_size((120, 40))
         canvas = Canvas(width or size_now.columns, height or size_now.lines)
         dashboard_draw(canvas, model, cwd=process_cwd(items[0]["pid"]) if items and items[0]["kind"] != "waiting"

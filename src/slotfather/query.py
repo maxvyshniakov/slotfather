@@ -4,7 +4,7 @@ from __future__ import annotations
 import math
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from . import config as _config
 from . import leases as _leases
@@ -80,11 +80,13 @@ def status_json(directory: Path | None = None, pid: int | None = None) -> dict:
     entries_found: list[dict[str, Any]] = []
     for path, entry in live:
         tree = _platform.descendants(table, entry.get("pid"))
+        priority = _config.priority_of(cast(dict[str, Any], entry))
         item: dict[str, Any] = {"id": path.stem, "lease": str(path), "state": entry.get("state"), "count": entry.get("count"),
                 "label": entry.get("label"), "pid": entry.get("pid"), "pgid": _platform.process_group(entry.get("pid")),
                 "start": entry.get("start"), "since": entry.get("since"), "granted": entry.get("granted"),
                 "cmd": entry.get("cmd"), "cwd": entry.get("cwd"), "meta": _config.meta_of(entry), "tree": tree,
-                "class": _schedule.class_of(entry), "yieldable": bool(entry.get("yieldable")),
+                "priority": priority, "ticket": _config.ticket_of(cast(dict[str, Any], entry)),
+                "yieldable": bool(entry.get("yieldable")),
                 "yields": int(entry.get("yields") or 0), "yield_asked": _state.asked(path), "position": None}
         entries_found.append(item)
     settings = _schedule.order_settings(directory)
@@ -114,7 +116,7 @@ def status_json(directory: Path | None = None, pid: int | None = None) -> dict:
         legacy = [dict(e, via="tree") for e in legacy if pid in e["tree"]]
         found["query"] = {"pid": pid, "start": table[pid][1] if pid in table else None}
     slots = _config.total()
-    return {"v": 1, "slots": slots, "held": held, "free": max(0, slots - held), "entries": entries_found,
+    return {"v": 2, "slots": slots, "held": held, "free": max(0, slots - held), "entries": entries_found,
             "legacy": legacy, **found}
 
 

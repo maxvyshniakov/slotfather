@@ -39,7 +39,7 @@ class ProcsTests(unittest.TestCase):
                          "52 51 501 ?? S Wed Nov  4 10:00:01 2026 python3 test.py")
         with mock.patch("subprocess.run", return_value=output) as run:
             found = self.procs.query(pid=52)
-        self.assertEqual(1, found["v"])
+        self.assertEqual(2, found["v"])
         self.assertEqual({"pid": 52, "cwd": None, "start": "Wed Nov 4 10:00:01 2026"}, found["query"])
         self.assertEqual([52], [item["pid"] for item in found["processes"]])
         item = found["processes"][0]
@@ -54,7 +54,7 @@ class ProcsTests(unittest.TestCase):
         queue.mkdir(parents=True, exist_ok=True)
         path = queue / f"{name}.json"
         path.write_text(json.dumps({"pid": pid, "start": start, "state": "held", "count": 2,
-                                    "label": name, "meta": {"class": "batch", "session": "session-a"}, **extra}))
+                                    "label": name, "priority": "batch", "meta": {"session": "session-a"}, **extra}))
         return path
 
     def test_live_leases_join_by_ancestry_and_reused_holders_are_excluded_without_reaping(self):
@@ -68,7 +68,7 @@ class ProcsTests(unittest.TestCase):
         leases = found["processes"][0]["leases"]
         self.assertEqual(["active"], [item["id"] for item in leases])
         self.assertEqual((51, "batch", "tree", "session-a"),
-                         (leases[0]["pid"], leases[0]["class"], leases[0]["via"], leases[0]["meta"]["session"]))
+                         (leases[0]["pid"], leases[0]["priority"], leases[0]["via"], leases[0]["meta"]["session"]))
         self.assertEqual(before, {path: path.read_bytes() for path in before})
         self.assertEqual({"queue"}, {path.name for path in self.directory.iterdir()})
 

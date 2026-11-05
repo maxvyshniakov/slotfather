@@ -1,6 +1,6 @@
 """slotfather: one queue of requests for the machine's capacity, shared by every project and agent (#599).
 
-  slotfather run [-n N|all] [--label L] [--meta K=V]... [--class C] [--yieldable] [--wait S] [--] COMMAND...
+  slotfather run [-n N|all] [--label L] [--meta K=V]... [--priority P] [--ticket ID] [--yieldable] [--wait S] [--] COMMAND...
                                                                      run COMMAND holding N slots (default 1)
   slotfather yield                                                   inside a yieldable lease: yield if asked
   slotfather status [--json [--pid PID]]                             running and waiting requests, in queue order
@@ -35,7 +35,7 @@ most the limit plus the overrun of what passed it, or, with classes, once what r
 requests that came within the class offsets after it (up to 3600 s for a batch one), and their overrun. `slotfather order` shows and saves the order and these numbers
 for every client (order.json beside the queue); a client's environment can only tighten them, and
 SLOTFATHER_QUEUE=window falls back to the earlier order, where the head holds back everyone behind it. Classes
-(`--class interactive|normal|batch`, normal by default): an interactive waiter queues as if it came 1800 s earlier,
+(`--priority interactive|normal|batch`, normal by default): an interactive waiter queues as if it came 1800 s earlier,
 a batch one 1800 s later; an interactive waiter that has waited 120 s asks holders of a lower class that took
 `--yieldable` to yield, by a marker file their client checks between steps (SLOTFATHER_YIELD) before it runs
 `slotfather yield`; nothing ever stops a holder. A process
@@ -100,7 +100,7 @@ def dashboard(argv: list[str]) -> int:
 
 
 USAGE = ("usage: slotfather                     (in a terminal: the live dashboard)\n"
-         "       slotfather run [-n N|all] [--label L] [--meta KEY=VALUE]... [--class interactive|normal|batch]\n"
+         "       slotfather run [-n N|all] [--label L] [--meta KEY=VALUE]... [--priority interactive|normal|batch] [--ticket ID]\n"
          "                      [--yieldable] [--wait SECONDS] [--] COMMAND...      (inside a lease: slotfather yield)\n"
          "       slotfather status [--json [--pid PID]] | history [N] | available [--label L] [-- COMMAND...]\n"
          "       slotfather advise [--max N] [--exclusive] [--label L] [-- COMMAND...]\n"
@@ -125,6 +125,8 @@ def parse_count(value: str) -> int:
 def run_command(argv: list[str]) -> int:
     from . import leases as _leases
     count, label, wait, pairs, yieldable = 1, os.path.basename(os.getcwd()), None, [], False
+    priority: str | None = None
+    ticket: str | None = None
     while argv:
         if argv[0] in ("-n", "--slots") and len(argv) > 1:
             count, argv = ("all" if argv[1] == "all" else parse_count(argv[1])), argv[2:]
@@ -132,10 +134,12 @@ def run_command(argv: list[str]) -> int:
             label, argv = argv[1], argv[2:]
         elif argv[0] == "--meta" and len(argv) > 1:
             pairs, argv = pairs + [argv[1]], argv[2:]
-        elif argv[0] == "--class" and len(argv) > 1:
-            if argv[1] not in _config.CLASSES:
-                raise _config.SlotError(f"--class takes {', '.join(_config.CLASSES)}, not {argv[1]!r}")
-            pairs, argv = pairs + [f"class={argv[1]}"], argv[2:]
+        elif argv[0] == "--priority" and len(argv) > 1:
+            if argv[1] not in _config.PRIORITIES:
+                raise _config.SlotError(f"--priority takes {', '.join(_config.PRIORITIES)}, not {argv[1]!r}")
+            priority, argv = argv[1], argv[2:]
+        elif argv[0] == "--ticket" and len(argv) > 1:
+            ticket, argv = argv[1], argv[2:]
         elif argv[0] == "--yieldable":
             yieldable, argv = True, argv[1:]
         elif argv[0] == "--wait" and len(argv) > 1:
@@ -153,7 +157,7 @@ def run_command(argv: list[str]) -> int:
             break
     if not argv:
         raise _config.SlotError("no command to run")
-    return _leases.run(count, label, argv, wait, _config.parse_meta(pairs), yieldable)
+    return _leases.run(count, label, argv, wait, _config.parse_meta(pairs), yieldable, priority=priority, ticket=ticket)
 
 
 def request_options(argv: list[str], what: str, flags: dict) -> tuple[dict, str, str]:

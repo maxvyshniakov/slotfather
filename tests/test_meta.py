@@ -15,7 +15,7 @@ import subprocess
 import sys
 import unittest
 
-from test_slotfather import ROOT, TOOL, WORK, SlotCase
+from test_slotfather import TOOL, WORK, SlotCase
 from test_usage import load
 
 
@@ -32,13 +32,13 @@ class MetaTests(SlotCase):
 
     def test_meta_rides_on_the_entry_the_status_and_the_history(self):
         process = self.request("lane-650", 1, "sh", "-c", TELL, "work", "lane-650",
-                               options=("--meta", "ticket=650", "--meta", "lane=lane-650", "--meta",
+                               options=("--ticket", "650", "--meta", "lane=lane-650", "--meta",
                                         "phase=verify checks", "--meta", "model=opus"))
         self.started("lane-650")
         child, lease, pgid = self.told("lane-650")
-        meta = {"ticket": "650", "lane": "lane-650", "phase": "verify checks", "model": "opus"}
+        meta = {"lane": "lane-650", "phase": "verify checks", "model": "opus"}
         self.assertEqual(meta, json.loads(pathlib_read(lease))["meta"])
-        self.assertIn('meta=ticket=650,lane=lane-650,phase="verify checks",model=opus cmd=sh -c', self.status())
+        self.assertIn('meta=lane=lane-650,phase="verify checks",model=opus cmd=sh -c', self.status())
 
         found = json.loads(self.tool("status", "--json").stdout)
         self.assertEqual((4, 1, 3), (found["slots"], found["held"], found["free"]))
@@ -60,7 +60,7 @@ class MetaTests(SlotCase):
         self.finish(process)
         [line] = [json.loads(line) for line in (self.state / "history.jsonl").read_text().splitlines()]
         self.assertEqual(meta, line["meta"])
-        self.assertIn("meta=ticket=650,", self.tool("history").stdout)
+        self.assertIn("meta=lane=lane-650,", self.tool("history").stdout)
 
     def test_a_process_that_left_the_tree_is_found_by_the_lease_in_its_environment(self):
         # review P2-3: a double fork reparents the process to launchd; by the tree alone it is in no lease.
@@ -90,17 +90,17 @@ class MetaTests(SlotCase):
         self.finish(process)
 
     def test_a_nested_run_inherits_the_lease_and_adds_no_meta(self):
-        nested = f'{TOOL} run --meta ticket=999 --meta lane=other -- sh -c "$WORK" work "$1"'
+        nested = f'{TOOL} run --ticket 999 --meta lane=other -- sh -c "$WORK" work "$1"'
         self.env["WORK"] = WORK
         process = self.request("outer", 1, "sh", "-c", nested, "outer", "outer",
-                               options=("--meta", "ticket=650"))
+                               options=("--ticket", "650"))
         self.started("outer")
         found = json.loads(self.tool("status", "--json").stdout)
-        self.assertEqual([{"ticket": "650"}], [e["meta"] for e in found["entries"]])
+        self.assertEqual([{}], [e["meta"] for e in found["entries"]])
         self.release("outer")
         self.finish(process)
         lines = (self.state / "history.jsonl").read_text().splitlines()
-        self.assertEqual([{"ticket": "650"}], [json.loads(line).get("meta") for line in lines])
+        self.assertEqual([None], [json.loads(line).get("meta") for line in lines])
 
     def test_meta_that_is_not_a_short_key_and_printable_value_is_refused(self):
         for pair in ("ticket", "Ticket=1", "=1", "t" * 33 + "=1", "ticket=a\x1bb", "ticket=" + "x" * 201):
@@ -108,9 +108,9 @@ class MetaTests(SlotCase):
             self.assertEqual(2, result.returncode, pair)
             self.assertIn("--meta", result.stderr)
         self.assertFalse((self.state / "history.jsonl").exists(), "nothing queued")
-        result = self.tool("run", "--meta", "ticket=1", "--meta", "ticket=2", "--", "true")
+        result = self.tool("run", "--meta", "custom=1", "--meta", "custom=2", "--", "true")
         self.assertEqual(0, result.returncode, "a later key replaces an earlier one")
-        self.assertEqual({"ticket": "2"}, json.loads((self.state / "history.jsonl").read_text())["meta"])
+        self.assertEqual({"custom": "2"}, json.loads((self.state / "history.jsonl").read_text())["meta"])
         with self.assertRaises(sf_config.SlotError):
             sf_config.checked_meta({f"k{n}": "v" for n in range(17)})
 
@@ -118,7 +118,7 @@ class MetaTests(SlotCase):
         for args in (("--json", "--pid"), ("--json", "--pid", "x"), ("--json", "extra"), ("--pid", "1")):
             self.assertEqual(2, self.tool("status", *args).returncode, args)
         found = json.loads(self.tool("status", "--json").stdout)
-        self.assertEqual({"v": 1, "slots": 4, "held": 0, "free": 4, "entries": [], "legacy": []}, found)
+        self.assertEqual({"v": 2, "slots": 4, "held": 0, "free": 4, "entries": [], "legacy": []}, found)
 
     def test_entries_without_meta_read_as_before(self):
         pid, start = self.holder()
@@ -129,11 +129,12 @@ class MetaTests(SlotCase):
         self.assertEqual({"ticket": "1"}, sf_config.meta_of({"meta": {"ticket": "1", "Bad Key\x1b": "x", "": "y"}}),
                          "keys a foreign writer left that --meta would refuse are dropped")
 
-    def test_the_dashboard_shows_the_selected_lease_meta(self):
-        process = self.request("lane-650", 1, options=("--meta", "ticket=650"))
+    def test_the_dashboard_promotes_the_selected_request_ticket_from_legacy_meta(self):
+        process = self.request("lane-650", 1, options=("--ticket", "650"))
         self.started("lane-650")
         text = self.tool("dashboard", "--once", "--width", "160", "--height", "40").stdout
-        self.assertRegex(text, r"meta +ticket=650")
+        self.assertRegex(text, r"ticket +#650")
+        self.assertNotIn("ticket=650", text)
         self.release("lane-650")
         self.finish(process)
 
@@ -144,55 +145,20 @@ class MetaStatsTests(SlotCase):
         line = {"v": 2, "label": "x", "cmd": "make", "count": 1, "granted": "2026-11-02T11:00:00Z",
                 "ended": "2026-11-02T11:10:00Z", "outcome": "released", "waited": 10, "ran": 600, "status": 0,
                 "cpu": 300.0, "wall": 600}
-        lines = [{**line, "meta": {"ticket": "650"}}, {**line, "meta": {"ticket": "650", "lane": "a"}},
+        lines = [{**line, "meta": {"experiment": "650"}}, {**line, "meta": {"experiment": "650", "lane": "a"}},
                  {**line, "meta": {"lane": "a"}}, line]
         (self.state / "history.jsonl").write_text("".join(json.dumps(i) + "\n" for i in lines))
-        result = self.tool("stats", "--json", "--by", "meta.ticket")
+        result = self.tool("stats", "--json", "--by", "meta.experiment")
         self.assertEqual(0, result.returncode, result.stderr)
-        groups = {g["meta"]["ticket"]: g["requests"] for g in json.loads(result.stdout)["groups"]}
+        groups = {g["meta"]["experiment"]: g["requests"] for g in json.loads(result.stdout)["groups"]}
         self.assertEqual({"650": 2, None: 2}, groups)
-        text = self.tool("stats", "--by", "meta.ticket").stdout
-        self.assertRegex(text, r"META\.TICKET +RUNS")
+        text = self.tool("stats", "--by", "meta.experiment").stdout
+        self.assertRegex(text, r"META\.EXPERIMENT +RUNS")
         self.assertRegex(text, r"\n650 +2 ")
         self.assertRegex(text, r"\n- +2 ")
         self.assertEqual(2, self.tool("stats", "--by", "meta.Bad").returncode)
 
 
-@unittest.skipUnless((ROOT / ".git").exists(), "needs the git history for the previous slotfather")
-class MixedMetaTests(SlotCase):
-    """3e3a621, the slotfather before #650, on the same queue as this one."""
-
-    OLD = "3e3a621"
-
-    def setUp(self):
-        super().setUp()
-        found = subprocess.run(["git", "-C", str(ROOT), "show", f"{self.OLD}:slotfather"], capture_output=True)
-        if found.returncode:
-            self.skipTest(f"{self.OLD} is not in this checkout")
-        self.old = self.tmp / "slotfather-old"
-        self.old.write_bytes(found.stdout)
-        self.old.chmod(0o755)
-
-    def test_an_old_client_reads_entries_with_meta_and_keeps_it_when_it_grants(self):
-        first = subprocess.Popen([str(self.old), "run", "-n", "all", "--label", "old-gate", "--", "sh", "-c", WORK,
-                                  "work", "old-gate"], env=self.env, stdout=subprocess.PIPE,
-                                 stderr=subprocess.STDOUT, text=True, start_new_session=True)
-        self.processes.append(first)
-        self.started("old-gate")
-        new = self.request("new", 1, options=("--meta", "ticket=650"))
-        self.wait_for(lambda: "waiting: 1 slot(s) new" in self.status(), "the new request to queue")
-        listing = subprocess.run([str(self.old), "status"], env=self.env, capture_output=True, text=True).stdout
-        self.assertRegex(listing, r"waiting: 1 slot\(s\) new pid=\d+ since=\S+ cmd=sh -c")
-        self.release("old-gate")  # the old holder's release grants the new waiter
-        self.started("new")
-        self.assertIn("meta=ticket=650", self.status(), "the old client's grant kept the meta")
-        self.release("new")
-        for process in (first, new):
-            self.finish(process)
-        history = {json.loads(line)["label"]: json.loads(line) for line in
-                   (self.state / "history.jsonl").read_text().splitlines()}
-        self.assertEqual({"ticket": "650"}, history["new"]["meta"])
-        self.assertNotIn("meta", history["old-gate"])
 
 
 def pathlib_read(path: str) -> str:

@@ -78,7 +78,7 @@ ORDER_KNOBS = {"safety": ("BACKFILL_SAFETY", 1.0, "up"), "limit": ("BACKFILL_LIM
 ORDER_BASE = ("order", "safety", "limit", "fallback", "overrun")  # always saved; the rest only when not the default
 
 
-CLASSES = ("interactive", "normal", "batch")  # `run --class`, or the lease metadata's `class`; normal by default
+PRIORITIES = ("interactive", "normal", "batch")
 
 
 YIELDS_MAX = 2  # times one lease is asked to yield
@@ -323,8 +323,9 @@ def checked_meta(meta: object) -> dict[str, str]:
             raise SlotError(f"--meta key {key!r} must be a lowercase word (a-z, 0-9, _ . -), at most 32 characters")
         if not isinstance(value, str) or len(value) > META_VALUE_MAX or not value.isprintable():
             raise SlotError(f"--meta {key} takes printable text of at most {META_VALUE_MAX} characters")
-        if key == "class" and value not in CLASSES:
-            raise SlotError(f"the class is one of {', '.join(CLASSES)}, not {value!r}")
+        if key in ("class", "priority", "ticket"):
+            option = "priority" if key == "class" else key
+            raise SlotError(f"{key} is a request field; use --{option}, not --meta")
         found[key] = value
     return found
 
@@ -350,7 +351,37 @@ def meta_of(entry: Mapping[str, object]) -> dict[str, str]:
             if isinstance(k, str) and META_KEY.fullmatch(k) and isinstance(v, (str, int, float))}
 
 
-def meta_text(meta: dict) -> str:
+def priority_of(entry: Mapping[str, object]) -> str:
+    value = entry.get("priority")
+    if isinstance(value, str) and value in PRIORITIES:
+        return value
+    return "normal"
+
+
+def checked_ticket(value: object) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, int) and not isinstance(value, bool):
+        value = str(value)
+    if not isinstance(value, str):
+        raise SlotError("ticket must be a short printable identifier")
+    if len(value) > META_VALUE_MAX or not value.isprintable():
+        raise SlotError("ticket must be short printable text")
+    value = value.strip()
+    if not value or value.lower() == "none":
+        return None
+    return value[1:] if value.startswith("#") and value[1:].isdigit() else value
+
+
+def ticket_of(entry: Mapping[str, object]) -> str | None:
+    value = entry.get("ticket")
+    try:
+        return checked_ticket(value)
+    except SlotError:
+        return None
+
+
+def meta_text(meta: dict[str, str]) -> str:
     """Metadata for one line: key=value pairs joined by commas, a value quoted where it holds a space, comma, quote
     or equals sign."""
     plain = re.compile(r'[^\s,="]+')

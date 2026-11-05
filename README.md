@@ -25,7 +25,7 @@ so a project’s virtual environment does not change their Python.
 ## Run work
 
 ```sh
-slotfather run -n 1 --label tests -- python3 -m unittest discover
+slotfather run -n 1 --label tests --priority interactive -- python3 -m unittest discover
 slotfather run -n 2 -- make build
 slotfather run -n all -- ./benchmark.sh
 ```
@@ -33,6 +33,8 @@ slotfather run -n all -- ./benchmark.sh
 A request waits until it can start, holds its slots while the command runs, then
 returns the command’s exit status. Nested calls reuse the ancestor’s lease.
 Use `--wait 60` to give up after a minute with exit code 75.
+`--priority` is `interactive`, `normal` (the default) or `batch`; `--ticket ID`
+optionally associates the request with an issue.
 
 A slot is a scheduling budget, **not a CPU or memory limit**. By default, capacity
 is the lower of one slot per three cores and one per 4 GiB of memory, with a

@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+from typing import Any, cast
 
 from . import config as _config
 from . import platform as _platform
@@ -81,7 +82,7 @@ def ask(directory: Path, live: list[tuple[Path, dict]], held: list[dict], waiter
             who = asks[id(entry)]
             if place.exists():
                 continue
-            _state.write(place, {"by": paths[id(who)].stem, "label": who.get("label"), "class": _schedule.class_of(who),
+            _state.write(place, {"by": paths[id(who)].stem, "label": who.get("label"), "priority": _config.priority_of(cast(dict[str, Any], who)),
                           "count": who["count"], "at": _config.now()})
             _state.log(directory, f"asked {entry['label']} (pid {entry['pid']}) to yield {entry['count']} for "
                            f"{who.get('label')}")
@@ -285,7 +286,8 @@ def policy() -> str:
 
 
 def acquire(count: int | str, label: str, command: str = "", out=sys.stderr, wait: float | None = None,
-            note: str = "", meta: dict | None = None, yieldable: bool = False) -> Lease:
+            note: str = "", meta: dict[str, str] | None = None, yieldable: bool = False, *,
+            priority: str | None = None, ticket: str | int | None = None) -> Lease:
     """Wait in the queue for `count` slots (at most the total); the lease is held by this process until released.
     Raises SlotTimeout, having left the queue, when `wait` seconds pass first. `note` follows the first word that
     the request waits. `meta` (key -> text) goes on the queue entry and the history line; a process that inherits
@@ -294,6 +296,10 @@ def acquire(count: int | str, label: str, command: str = "", out=sys.stderr, wai
     if count != "all" and (type(count) is not int or count < 1):
         raise _config.SlotError("count must be a positive integer or all")
     meta = _config.checked_meta(meta)
+    if priority is not None and priority not in _config.PRIORITIES:
+        raise _config.SlotError(f"priority is one of {', '.join(_config.PRIORITIES)}")
+    selected_priority = priority if priority is not None else "normal"
+    selected_ticket = _config.checked_ticket(ticket)
     if policy() == "bypass":
         return Lease(_config.total())
     directory = _config.state_dir()
@@ -320,8 +326,10 @@ def acquire(count: int | str, label: str, command: str = "", out=sys.stderr, wai
             sequence = 1
         sequence_file.write_text(str(sequence))
         path = directory / "queue" / f"{sequence:010d}-{me}.json"
-        entry = {"pid": me, "start": table.get(me, (0, ""))[1], "count": count, "label": label, "cmd": command,
-                 "cwd": cwd, "since": _config.now(), "state": "waiting"}
+        entry: dict[str, Any] = {"pid": me, "start": table.get(me, (0, ""))[1], "count": count, "label": label, "cmd": command,
+                 "cwd": cwd, "since": _config.now(), "state": "waiting", "priority": selected_priority}
+        if selected_ticket is not None:
+            entry["ticket"] = selected_ticket
         if whole:
             entry["all"] = True  # the capacity at the grant; older clients read past fields they do not know
         if meta:
@@ -386,14 +394,14 @@ def terminate(signum, _frame):
     raise SystemExit(128 + signum)
 
 
-def run(count: int | str, label: str, argv: list[str], wait: float | None = None, meta: dict | None = None,
-        yieldable: bool = False) -> int:
+def run(count: int | str, label: str, argv: list[str], wait: float | None = None, meta: dict[str, str] | None = None,
+        yieldable: bool = False, *, priority: str | None = None, ticket: str | int | None = None) -> int:
     """Run argv under a lease of `count` slots; the command's exit status."""
     from . import usage as _usage
     try:
         background = policy() == "background"
         lease = acquire(count, label, " ".join(argv), wait=wait, note=_config.ALL_NOTE if count == "all" else "", meta=meta,
-                        yieldable=yieldable)
+                        yieldable=yieldable, priority=priority, ticket=ticket)
     except _config.SlotTimeout as error:
         print(f"slot: {label}: {error}", file=sys.stderr)
         return _config.TIMED_OUT

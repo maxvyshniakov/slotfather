@@ -48,20 +48,20 @@ class InstallTests(unittest.TestCase):
         return subprocess.run([sys.executable, str(self.source / "install.py"), *options], env=self.env,
                               capture_output=True, text=True, timeout=20)
 
-    def queue(self, path, *, state="held", pid=99999999, start="gone"):
+    def queue(self, path: Path, *, state: str = "held", pid: int = 99999999, start: str = "gone") -> Path:
         (path / "queue").mkdir(parents=True, exist_ok=True)
         (path / ".lock").touch()
         (path / "queue/0000000001-fixture.json").write_text(json.dumps(
-            {"pid": pid, "start": start, "count": 4, "label": "fixture", "state": state}))
+            {"pid": pid, "start": start, "count": 4, "label": "fixture", "state": state, "priority": "normal"}))
         return path
 
-    def live_process(self):
+    def live_process(self) -> tuple[int, str]:
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
         self.addCleanup(lambda: (child.terminate(), child.wait()))
         start = subprocess.check_output(["ps", "-o", "lstart=", "-p", str(child.pid)], text=True).strip()
         return child.pid, start
 
-    def contents(self, root):
+    def contents(self, root: Path) -> dict[str, bytes]:
         return {str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*") if p.is_file()}
 
     def test_migrate_preserves_old_queue_and_capacity_and_retires_both_paths(self):
@@ -140,6 +140,146 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(1, len(backups), result.stdout)
         self.assertEqual(old_before, self.contents(backups[0]))
         self.assertIn("preserved", result.stdout)
+
+    def test_live_old_format_current_queue_refuses_before_guards_or_commands_change(self):
+        pid, start = self.live_process()
+        variants: tuple[dict[str, object], ...] = ({}, {"priority": "normal", "meta": {"class": "normal"}},
+                    {"priority": "normal", "meta": {"priority": "normal"}},
+                    {"priority": "normal", "meta": {"ticket": "42"}})
+        for fields in variants:
+            for state in ("held", "waiting"):
+                with self.subTest(fields=fields, state=state):
+                    self.queue(self.new, pid=pid, start=start, state=state)
+                    path = self.new / "queue/0000000001-fixture.json"
+                    entry = json.loads(path.read_text())
+                    entry.pop("priority")
+                    path.write_text(json.dumps({**entry, **fields}))
+                    (self.new / "history.jsonl").write_text('{"meta":{"class":"batch","ticket":"42"},"ran":5}\n')
+                    before = self.contents(self.new)
+                    result = self.run_install()
+                    self.assertEqual(2, result.returncode, result.stdout + result.stderr)
+                    self.assertIn("live old-format", result.stderr)
+                    self.assertIn("drain", result.stderr)
+                    self.assertEqual(before, self.contents(self.new))
+                    self.assertFalse(self.old.exists())
+                    self.assertFalse(self.legacy.parent.exists())
+                    self.assertFalse((self.bin / "slotfather").exists())
+                    self.assertFalse((self.home / ".local/lib").exists())
+                    self.assertEqual("old command", (self.bin / "machine-slot").read_text())
+
+    def test_missing_start_identity_is_not_treated_as_safe_current_format(self):
+        pid, _ = self.live_process()
+        self.queue(self.new, pid=pid, start="")
+        before = self.contents(self.new)
+        result = self.run_install()
+        self.assertEqual(2, result.returncode, result.stdout + result.stderr)
+        self.assertIn("cannot establish process identity", result.stderr)
+        self.assertEqual(before, self.contents(self.new))
+        self.assertFalse(self.old.exists())
+        self.assertFalse(self.legacy.parent.exists())
+        self.assertFalse((self.bin / "slotfather").exists())
+
+    def test_reused_pid_does_not_make_a_stale_old_format_entry_live(self):
+        pid, start = self.live_process()
+        self.queue(self.new, pid=pid, start=start + " stale")
+        path = self.new / "queue/0000000001-fixture.json"
+        entry = json.loads(path.read_text())
+        entry.pop("priority")
+        path.write_text(json.dumps(entry))
+        before = self.contents(self.new)
+        result = self.run_install()
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertEqual(before, self.contents(self.new))
+
+    def test_failed_process_inspection_refuses_before_touching_retired_paths(self):
+        self.queue(self.new)
+        commands = self.tmp / "commands"
+        commands.mkdir()
+        ps = commands / "ps"
+        ps.write_text("#!/bin/sh\nexit 1\n")
+        ps.chmod(0o755)
+        self.env["PATH"] = str(commands) + os.pathsep + self.env.get("PATH", "")
+        before = self.contents(self.new)
+        result = self.run_install()
+        self.assertEqual(2, result.returncode, result.stdout + result.stderr)
+        self.assertIn("ps failed", result.stderr)
+        self.assertEqual(before, self.contents(self.new))
+        self.assertFalse(self.old.exists())
+        self.assertFalse(self.legacy.parent.exists())
+        self.assertFalse((self.bin / "slotfather").exists())
+
+    def test_a_locked_current_queue_refuses_before_touching_retired_paths(self):
+        self.queue(self.new)
+        before = self.contents(self.new)
+        with (self.new / ".lock").open("a") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            result = self.run_install()
+        self.assertEqual(2, result.returncode, result.stdout + result.stderr)
+        self.assertIn("operation in progress", result.stderr)
+        self.assertEqual(before, self.contents(self.new))
+        self.assertFalse(self.old.exists())
+        self.assertFalse(self.legacy.parent.exists())
+        self.assertFalse((self.bin / "slotfather").exists())
+
+    def test_history_request_fields_migrate_once_with_original_backups(self):
+        pid, start = self.live_process()
+        self.queue(self.new, pid=pid, start=start)
+        records = [
+            {"label": "old", "ran": 5.25, "cpu": 1.5, "peak_rss": 128, "meta": {"class": "batch", "ticket": "#42", "scenario": "keep"}},
+            {"label": "current", "priority": "normal", "ticket": "CURRENT-99", "ran": 9,
+             "meta": {"class": "interactive", "priority": "batch", "ticket": "old", "custom": "preserved"}},
+        ]
+        current = self.new / "history.jsonl"
+        rotated = self.new / "history.jsonl.1"
+        original = ("\n".join(json.dumps(row) for row in records) + "\n").encode()
+        archived = b'{"label":"rotated","ran":3,"meta":{"priority":"interactive","ticket":7,"other":"kept"}}\n'
+        current.write_bytes(original)
+        rotated.write_bytes(archived)
+        result = self.run_install()
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        rows = [json.loads(row) for row in current.read_text().splitlines()]
+        self.assertEqual({**records[0], "priority": "batch", "ticket": "42", "meta": {"scenario": "keep"}}, rows[0])
+        self.assertEqual({**records[1], "meta": {"custom": "preserved"}}, rows[1])
+        archived_row = json.loads(rotated.read_text())
+        self.assertEqual({"label": "rotated", "ran": 3, "priority": "interactive", "ticket": "7", "meta": {"other": "kept"}}, archived_row)
+        backups = list((self.state / "slotfather-migrations").glob("*/history"))
+        self.assertEqual(1, len(backups), result.stdout)
+        self.assertEqual(original, (backups[0] / "history.jsonl").read_bytes())
+        self.assertEqual(0o600, (backups[0] / "history.jsonl").stat().st_mode & 0o777)
+        self.assertEqual(archived, (backups[0] / "history.jsonl.1").read_bytes())
+        before = self.contents(self.new)
+        result = self.run_install()
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertEqual(before, self.contents(self.new), "repeat installation keeps canonical bytes")
+        self.assertEqual(backups, list((self.state / "slotfather-migrations").glob("*/history")))
+
+    def test_history_symlink_is_refused_without_reading_or_replacing_its_target(self):
+        self.queue(self.new)
+        target = self.tmp / "outside-history"
+        original = b'{"meta":{"class":"batch"},"ran":2}\n'
+        target.write_bytes(original)
+        history = self.new / "history.jsonl"
+        history.symlink_to(target)
+        result = self.run_install()
+        self.assertEqual(2, result.returncode, result.stdout + result.stderr)
+        self.assertIn("symlink", result.stderr)
+        self.assertTrue(history.is_symlink())
+        self.assertEqual(original, target.read_bytes())
+        self.assertFalse((self.state / "slotfather-migrations").exists())
+        self.assertFalse((self.bin / "slotfather").exists())
+
+    def test_invalid_rotated_history_refuses_before_converting_any_file(self):
+        self.queue(self.new)
+        (self.new / "history.jsonl").write_text('{"meta":{"class":"batch"},"ran":5}\n')
+        (self.new / "history.jsonl.1").write_text('not-json\n')
+        before = self.contents(self.new)
+        result = self.run_install()
+        self.assertEqual(2, result.returncode, result.stdout + result.stderr)
+        self.assertIn("history.jsonl.1", result.stderr)
+        self.assertEqual(before, self.contents(self.new))
+        self.assertFalse((self.state / "slotfather-migrations").exists())
+        self.assertFalse((self.home / ".local/lib").exists())
+        self.assertFalse((self.bin / "slotfather").exists())
 
     def test_repeated_install_keeps_guards_and_existing_state(self):
         first = self.run_install()
@@ -426,7 +566,7 @@ class PackageInstallTests(unittest.TestCase):
                 self.assertEqual(2, result.returncode)
                 self.assertIn('--host takes', result.stderr)
 
-    def test_a_real_pre_package_client_keeps_its_lease_through_upgrade(self):
+    def test_a_real_old_client_finishes_before_the_breaking_format_upgrade(self):
         import gzip
         import hashlib
         import time
@@ -462,18 +602,20 @@ class PackageInstallTests(unittest.TestCase):
                 self.fail('old client did not acquire its lease')
             before = {p.name: p.read_bytes() for p in (self.new / 'queue').glob('*.json')}
             result = self.run_install('--python', sys.executable)
-            self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+            self.assertEqual(2, result.returncode, result.stdout + result.stderr)
+            self.assertIn('live old-format', result.stderr)
+            self.assertIn('drain', result.stderr)
             self.assertEqual(before, {p.name: p.read_bytes() for p in (self.new / 'queue').glob('*.json')})
-            current = subprocess.run([str(self.bin / 'slotfather'), 'status', '--json'], env=env,
-                                     capture_output=True, text=True, timeout=10)
-            self.assertEqual(0, current.returncode, current.stderr)
-            self.assertEqual(['old-client'], [entry['label'] for entry in json.loads(current.stdout)['entries']])
-            blocked = subprocess.run([str(self.bin / 'slotfather'), 'run', '-n', 'all', '--wait', '0.1', '--',
-                                      sys.executable, '-c', 'pass'], env=env, capture_output=True, text=True, timeout=10)
-            self.assertEqual(75, blocked.returncode, blocked.stdout + blocked.stderr)
+            self.assertFalse((self.bin / 'slotfather').exists())
+            self.assertFalse((self.home / '.local/lib').exists())
+            self.assertFalse(self.old.exists())
+            self.assertFalse(self.legacy.exists())
+            self.assertIsNone(holder.poll(), 'the refused upgrade must not stop the old client')
             release.touch()
             output, error = holder.communicate(timeout=10)
             self.assertEqual(0, holder.returncode, output + error)
+            result = self.run_install('--python', sys.executable)
+            self.assertEqual(0, result.returncode, result.stdout + result.stderr)
             current = subprocess.run([str(self.bin / 'slotfather'), 'status', '--json'], env=env,
                                      capture_output=True, text=True, timeout=10)
             self.assertEqual([], json.loads(current.stdout)['entries'])

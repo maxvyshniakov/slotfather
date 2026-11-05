@@ -13,6 +13,7 @@ from slotfather import platform as sf_platform
 
 import importlib.machinery
 import importlib.util
+import fcntl
 import json
 import os
 import pathlib
@@ -435,7 +436,12 @@ class PollingTests(SlotCase):
         waiter = self.request("waiter", 1)
         self.wait_for(lambda: "waiting: 1 slot(s) waiter" in self.status(), "the waiter to queue")
         # A stopped waiter takes no look of its own, so only the release can grant it.
-        os.kill(waiter.pid, signal.SIGSTOP)
+        # Stop only outside its critical section; otherwise the test freezes the
+        # queue lock and neither release nor status can make progress.
+        with (self.state / ".lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            os.kill(waiter.pid, signal.SIGSTOP)
+            os.waitpid(waiter.pid, os.WUNTRACED)
         try:
             self.release("holder")
             self.wait_for(lambda: "held: 1 slot(s) waiter" in self.status(), "the release to grant the waiter",

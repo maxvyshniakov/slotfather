@@ -81,3 +81,35 @@ differ. Historical over-capacity values are retained in the legend.
 
 Refreshing can reap dead queue entries, like `status`. Selecting, pausing and
 scrolling never grants a lease, cancels work or kills a process.
+
+## Lane context and details scrolling
+
+REQUEST DETAILS has one scroll position for its facts, lane context and process
+rows. Wheel anywhere inside the widget to scroll; the process table has no
+independent viewport. Selecting another request resets the details to the top.
+
+When the caller supplies `meta.lane` and `meta.lanefather.state`, the selected
+request can show lane fields: project, phase, lane stage, branch, base,
+ticket, receipt, review, claims and dependencies. Lane stage and request
+status describe different lifecycles. Ticket numbers use OSC 8 hyperlinks;
+open them with the terminal's link gesture, usually Cmd-click on macOS.
+The worktree path appears before command as a muted folder link. Wrapped path
+lines share the same destination. Plain-text snapshots contain labels and paths
+without escape sequences.
+
+Slotfather queries the installed `lanefather show ID --state-dir DIR --json`
+only for selected work and caches the response for five seconds. The state
+directory and lane ID together identify the lane. Older requests with only a
+lane ID can resolve their project from the recorded working directory; lanefather
+verifies that the resulting lane belongs to that repository. Missing references, an older
+CLI, timeouts and unsupported responses appear as unavailable lane details;
+they do not prevent viewing the request or its processes. No GitHub network
+request is needed: ticket URLs come from the repository's GitHub origin.
+
+Priority and optional ticket are request fields, displayed separately from caller
+metadata. Known context gets named rows: phase, kind, check, revision, run on,
+and session. Only custom fields remain in `meta`. A lane's `stage` is its
+workflow lifecycle; a request's `phase` describes the current execution.
+`receipt` shows the saved verification result and whether its tree is current;
+`review` is the independent code review and its unresolved findings. The
+occupancy histogram is five terminal rows high.

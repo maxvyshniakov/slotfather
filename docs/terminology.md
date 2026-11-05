@@ -14,6 +14,7 @@ choices and compatibility aliases; it does not define a second vocabulary.
 | loaded … of … cores | system load | Load average and CPU utilization are different observations. The display presents the load value and core count separately. |
 | `backfill by` alongside `start est` | `start est` | Both displayed the same instant; the backfill constraint is explained with that estimate. |
 | job count for command parallelism | worker budget | Internal command parallelism is different from a request's slot budget. |
+| class for scheduling | priority | Priority is request state, not arbitrary caller metadata. |
 | guard for the memory condition | memory block | The condition has a specific cause and affects additional grants; it is not a general protection mechanism. |
 
 The dashboard uses REQUESTS and REQUEST DETAILS. The `label` field names a
@@ -39,13 +40,13 @@ other than Straylight; lanefather is a separate reusable workflow engine.
 
 ## Compatibility aliases
 
-Command names, options, state formats and JSON version 1 remain compatible:
+The current request format has one representation; the unrelated surfaces below retain their meanings:
 
 - `available` reports queue space; it does not apply memory policy. Dashboard
   `admission` reports admission capacity, which includes memory checks.
 - `advise` recommends a worker budget. Its JSON field `jobs` retains its name;
   `memory_short` remains the wire field for a memory block.
-- `entries`, `held`, `free`, `legacy`, `lease`, `label`, `class` and the other
+- `entries`, `held`, `free`, `legacy`, `lease`, `label` and the other
   published JSON/state keys retain their documented meanings and spellings.
 - `held` / `waiting` are storage states; the dashboard presents held work as
   running. Historical event verbs retain their original spellings.
@@ -58,3 +59,23 @@ Command names, options, state formats and JSON version 1 remain compatible:
 Internal presentation identifiers use requests and memory blocks. Historical
 review reports, fixtures from old versions and measurement artifacts describe
 the versions they recorded; they are not renamed to suggest newer behavior.
+
+## Structured request context
+
+`priority` is a top-level request field, defaulting to `normal`; its values are
+`interactive`, `normal` and `batch`. `ticket` is an optional top-level identifier.
+CLI callers use `--priority` and `--ticket`; library callers use the corresponding
+keyword arguments. Priority and ticket are not accepted as metadata.
+
+The retired `--class`, `meta.class`, `meta.priority` and `meta.ticket` inputs are
+rejected. Request JSON uses version 2 with `priority` and optional `ticket`;
+there is no duplicate `class` field. Installation requires old clients to drain
+and converts persisted history once, outside ordinary reads. No runtime fallback
+interprets the retired fields.
+
+The dashboard shows known caller fields individually: phase, kind, check,
+revision (`sha`), run on (`on`) and session. The remaining custom keys stay in
+`meta`. The lanefather state path is a lookup reference rather than display data.
+The lane lifecycle is labelled `stage`; `phase` belongs to the execution. The
+saved verification result is labelled `receipt`. Version-1 lanefather response
+keys `status` and `checks` retain their compatibility spellings.

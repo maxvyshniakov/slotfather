@@ -15,6 +15,39 @@ remain available to processes that started before an update.
 
 The installed commands run on the interpreter that ran the installer: their `#!/usr/bin/env python3` line becomes that interpreter's path, as invoked, so an agent inside a project's virtual environment does not run slotfather on the project's Python. The installer refuses an interpreter inside a virtual environment, and one older than 3.9; name another with `python3 install.py --python /usr/bin/python3`. Re-run it to switch interpreters.
 
+## Request-format cutover
+
+Update callers before replacing the installed runtime: priority is a top-level
+request field and ticket is optional; reserved metadata aliases are no longer a
+runtime input. Stop submitting old-format work and let its existing holders and
+waiters finish with their original client. Do not stop another agent's work to
+force an upgrade.
+
+The installer holds the installation lock and the current queue lock while it
+checks process identities and publishes commands. It refuses a live entry with
+no top-level priority, an invalid priority, or `class`, `priority` or `ticket` in
+metadata. The refusal names the entry and asks for the old callers to drain;
+registered queue data, command files and retired-path guards remain untouched.
+Failed process inspection or an unavailable start identity also refuses the
+cutover. A PID whose start time differs is a stale record, not that old owner.
+Current-format active leases remain installable and unchanged.
+
+This check covers registered requests. Updating callers and stopping old binary
+launches first prevents an old process from arriving after the guarded snapshot.
+A reinstall cannot replace code already loaded by a running Python process.
+
+After the old clients drain, installation converts `history.jsonl` and
+`history.jsonl.1` once: metadata priority/class becomes top-level priority
+(`normal` when absent), metadata ticket becomes an optional top-level ticket,
+and the reserved metadata keys are removed. Existing top-level values win.
+Measurements and custom tags are preserved. Both files are checked before any
+conversion or package preparation. Originals are saved under
+`~/.local/state/slotfather-migrations/<id>/history/` before atomic file
+replacements; the installer prints that backup path. A repeated install does
+not rewrite already canonical history or create another history backup.
+
+## Retired queue names
+
 The installer also performs the one-time rename migration. It refuses live holders or waiters in either retired queue, preserves the entire earlier machine queue (including saved capacity) when the new queue is absent, and otherwise leaves the existing new queue untouched. Retired contents remain in named `~/.local/state/slotfather-migrations/` backups. Different old and new configurations are both preserved; the existing new configuration stays effective.
 
 Both retired paths, `~/.local/state/machine-slots` and `~/.local/state/straylight-verification/slots`, become regular file guards. Atomic directory/file exchanges ensure old clients cannot recreate an uncoordinated queue between the move and guard creation. Existing intentional guards make a repeated install safe, including while the new queue has active leases. Unrelated files at those paths are refused and preserved. The installer uses the default state locations; coordinate custom queue paths separately.
@@ -22,7 +55,7 @@ Both retired paths, `~/.local/state/machine-slots` and `~/.local/state/strayligh
 The package is prepared and checked before the entry points are replaced atomically; the old
 command name is removed last. If a migration stops after a directory exchange, retain its guards and printed backup paths: the queue contents remain preserved for recovery. This is an explicit installation step, not compatibility logic in normal command execution.
 
-Put `~/.local/bin` on your `PATH`. All participating projects must use the same state directory; saved capacity is shared through that directory. Updating the executable preserves the queue and running leases.
+Put `~/.local/bin` on your `PATH`. All participating projects must use the same state directory; saved capacity is shared through that directory. Updating the executable preserves the queue and current-format running leases; old-format live requests must drain first.
 
 ## Version and remote updates
 
@@ -43,9 +76,9 @@ own remote temporary directory.
 SHA-256 digest of the runtime files. Compare all three fields across machines; a dirty source
 is identified explicitly and cannot be mistaken for the committed revision. Installed metadata
 is saved with the release, so later edits to a checkout do not change an installed version.
-The upgrade test runs the real pre-package client from a frozen, checksum-verified fixture,
-updates while its lease is held, and proves that new clients respect it and the old holder
-still releases it successfully.
+The upgrade test runs the real pre-package client from a frozen, checksum-verified fixture.
+Installation refuses without changing its lease or published commands, the original client
+finishes and releases successfully, and installation then succeeds after the queue drains.
 
 ### For a service user: one queue for several CI runners
 

@@ -113,7 +113,11 @@ def record(directory: Path, entry: dict, outcome: str, status: int | None = None
             "count": entry.get("count"), "pid": entry.get("pid"), "queued": entry.get("since"),
             "granted": entry.get("granted"), "ended": _config.now(), "outcome": outcome,
             "waited": None if queued is None else round((granted or ended) - queued),
-            "ran": None if granted is None else round(ended - granted), "status": status}
+            "ran": None if granted is None else round(ended - granted), "status": status,
+            "priority": _config.priority_of(cast(dict[str, Any], entry))}
+    ticket = _config.ticket_of(cast(dict[str, Any], entry))
+    if ticket is not None:
+        item["ticket"] = ticket
     with contextlib.suppress(_config.SlotError, OSError):
         item.update(cores=_config.cores(), capacity=_config.total())
     item.update(usage or {})

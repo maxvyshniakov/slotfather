@@ -426,7 +426,7 @@ class DetailLayoutTests(unittest.TestCase):
             self.assertEqual(15, line.index(value), line)
             self.assertTrue(line[line.index(label) + len(label):line.index(value)].startswith("  "), line)
 
-    def test_process_table_keeps_space_even_with_a_long_command(self):
+    def test_process_table_shares_the_details_scroll_after_long_text(self):
         tool = load_dashboard()
         now = datetime.datetime.now(datetime.timezone.utc)
         item = dict(label="build", kind="held", count=2, pid=12345, style="h0", cpu=150,
@@ -446,7 +446,13 @@ class DetailLayoutTests(unittest.TestCase):
         cwd = next(i for i,line in enumerate(lines) if "cwd" in line)
         self.assertLessEqual(meta-command, 3)
         self.assertLessEqual(cwd-meta, 3)
-        self.assertIn("\x1b[0m 1.5 of 4 cores", canvas.lines(True)[lane + 2])
+        self.assertIn("\x1b[0m 1.5 of 4 cores", canvas.lines(True)[next(i for i, line in enumerate(lines) if re.search(r"cpu\s", line))])
+        self.assertNotIn("processes", canvas.tables)
+        canvas = tool.Canvas(70, 20)
+        canvas.scroll = {"details": 1000}
+        tool.draw_detail(canvas, 0, 0, 20, 70, {"holders": [item], "waiters": [], "cores": 12, "slots": 6},
+                         0, "/project", now)
+        lines = canvas.render(False).splitlines()
         header = next(line for line in lines if "process" in line and "cpu" in line)
         self.assertEqual(3, header.index("process"))
         self.assertNotIn("processes", header)
@@ -457,13 +463,13 @@ class DetailLayoutTests(unittest.TestCase):
         self.assertTrue(row.rstrip(" │").endswith("12345"))
         item["tree"] = [(1000+i, 0, 1024, f"worker{i}") for i in range(10)]
         canvas = tool.Canvas(70, 20)
-        canvas.scroll = {"processes": 3}
+        canvas.scroll = {"details": 1000}
         tool.draw_detail(canvas, 0, 0, 20, 70, {"holders": [item], "waiters": [], "cores": 12, "slots": 6},
                          0, "/project", now)
         text = canvas.render(False)
-        self.assertIn("worker3", text)
-        self.assertNotIn("worker0", text)
-        self.assertIn("more", text)
+        self.assertIn("worker9", text)
+        self.assertIn("above", text)
+        self.assertNotIn("more", text)
         self.assertNotIn("more", text.splitlines()[-1])
 
 
@@ -516,7 +522,7 @@ class MachineStatusTests(unittest.TestCase):
         self.assertEqual(0,tool.dashboard_admission([waiter],[],6,0,"memory pressure",None,settings))
         self.assertEqual(6,tool.dashboard_admission([],[],6,0,"memory pressure",None,settings))
         self.assertEqual(5,tool.dashboard_admission([waiter],[],6,0,None,None,settings))
-        waiter["meta"]={"class":"batch"}
+        waiter["priority"]="batch"
         self.assertEqual(6,tool.dashboard_admission([waiter],[],6,0,"memory pressure",None,settings),
                          "a normal probe ranked first may use the idle-host exemption")
 
@@ -562,8 +568,8 @@ class MemoryBarTests(unittest.TestCase):
     def test_machine_has_usage_bars_and_a_chart_spanning_the_inner_width(self):
         tool = load_dashboard()
         now = datetime.datetime(2026, 1, 1, 12, tzinfo=datetime.timezone.utc)
-        canvas = tool.Canvas(90, 18)
-        tool.draw_machine(canvas, 0, 0, 18, 90, dict(slots=4, cores=12, averages=(1,2,3),
+        canvas = tool.Canvas(90, 17)
+        tool.draw_machine(canvas, 0, 0, 17, 90, dict(slots=4, cores=12, averages=(1,2,3),
                           advice=dict(unleased_load=0, jobs=2), memory_block=None,
                           memory=dict(level=1, used=768, total=1024, swap_total=512, swap_free=128),
                           history=[(now-datetime.timedelta(hours=1), now, 4)]))
@@ -573,7 +579,7 @@ class MemoryBarTests(unittest.TestCase):
         self.assertIn("used 384 MB of 512 MB", text)
         self.assertNotIn("load avg", text)
         self.assertNotIn("pressure", text)
-        self.assertEqual(6,sum("█" in line for line in lines))
+        self.assertEqual(5,sum("█" in line for line in lines))
         first_chart = next(i for i, line in enumerate(lines) if "█" in line)
         self.assertFalse(lines[first_chart - 1][1:-1].strip(), "gap above chart")
         self.assertFalse(lines[-4][1:-1].strip(), "one gap row before legend")

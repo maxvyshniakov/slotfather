@@ -40,6 +40,7 @@ import random
 import re
 import sys
 import time
+from typing import Any, Callable
 
 
 
@@ -211,17 +212,17 @@ def yieldable(request: dict, cls: str, slots: int) -> bool:
 
 # Orders written only here (rejected)
 
-def short_first(limit: float, bonus: float):
+def short_first(limit: float, bonus: float) -> Callable[[list[dict[str, Any]], Callable[[dict[str, Any]], float | None]], tuple[list[dict[str, Any]], float]]:
     """A short class by estimate: a waiter expected to run under `limit` seconds queues as if it came `bonus` seconds
     earlier, so long work that has waited longer than the bonus is still ahead of it (ageing). Returns the waiters
     in that order (for the window order, which serves them as given) and the bonus; under the backfill order the
     short ones go to plan() as interactive, `bonus` seconds ahead."""
-    def order(waiters, estimate):
-        def short(entry):
+    def order(waiters: list[dict[str, Any]], estimate: Callable[[dict[str, Any]], float | None]) -> tuple[list[dict[str, Any]], float]:
+        def short(entry: dict[str, Any]) -> bool:
             run = estimate(entry)
             return run is not None and run <= limit
-        ordered = sorted(waiters, key=lambda e: (sf_config.seconds(e["since"]) - (bonus if short(e) else 0), e["id"]))
-        return [dict(e, meta={"class": "interactive" if short(e) else "normal"}) for e in ordered], bonus
+        ordered = sorted(waiters, key=lambda e: ((sf_config.seconds(e["since"]) or 0) - (bonus if short(e) else 0), e["id"]))
+        return [dict(e, priority="interactive" if short(e) else "normal") for e in ordered], bonus
     return order
 
 
@@ -332,7 +333,7 @@ class Replay:
                 cls = self.classes[number]
                 waiting[number] = {"id": number, "label": request["label"], "cmd": request["cmd"],
                                    "count": min(request["count"], self.slots), "since": stamp(request["arrival"]),
-                                   "state": "waiting", "meta": {"class": cls},
+                                   "state": "waiting", "priority": cls,
                                    "yieldable": yieldable(request, cls, self.slots)}
                 remaining[number] = self.run_of(request)
                 give_up = request.get("give_up")
@@ -430,7 +431,7 @@ def percentile(values: list[float], q: float) -> float:
 
 def measure(requests: list[dict], results: list[dict], start: float, until: float, replay: Replay) -> dict:
     waits, large, left = [], [], 0
-    classes = {name: {"waits": [], "delays": []} for name in sf_config.CLASSES}
+    classes = {name: {"waits": [], "delays": []} for name in sf_config.PRIORITIES}
     yielded = yields = 0.0
     for request, result in zip(requests, results):
         if request["arrival"] < start or request["arrival"] > until:

@@ -20,7 +20,7 @@ belong to their own context; the relationship is recorded in [terminology](docs/
 | Label family | A group of related request labels used to reuse runtime history. |
 | Runtime estimate | A prediction of how long work will run, based on comparable completed requests or the scheduling fallback. |
 | Queue head | The waiting request whose expected start is protected by the scheduling policy. |
-| Priority class | A request's scheduling priority: interactive, normal or batch. |
+| Priority | A request's scheduling priority: interactive, normal or batch. |
 | Overtaking | A later request starting before an earlier waiting request. |
 | Overtaking window | The initial period in which later requests that fit may start ahead of a waiting request. |
 | Overtaking limit | How long a protected request may wait before later requests in the queue stop passing it. |

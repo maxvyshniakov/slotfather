@@ -16,13 +16,13 @@ from slotfather import state as sf_state
 import json
 import os
 import pathlib
-import subprocess
 import time
 import unittest
 from unittest import mock
+from typing import Any
 
 from test_order import M, PlanCase, holder, runs, stamp, waiter
-from test_slotfather import ROOT, TOOL, WORK, SlotCase
+from test_slotfather import TOOL, WORK, SlotCase
 from test_usage import load
 
 
@@ -33,7 +33,7 @@ YIELDER = ('echo "start $1" >> "$LOG"; while [ ! -e "$RELEASE/$1" ]; do if [ -e 
 
 
 def classed(entry: dict, cls: str, **extra) -> dict:
-    return {**entry, "meta": {"class": cls}, **extra}
+    return {**entry, "priority": cls, **extra}
 
 
 class RankTests(PlanCase):
@@ -90,8 +90,8 @@ class RankTests(PlanCase):
                                           one=3600, short=60))
 
     def test_an_unknown_class_is_normal(self):
-        self.assertEqual("normal", sf_schedule.class_of({"meta": {"class": "urgent"}}))
-        self.assertEqual("normal", sf_schedule.class_of({}))
+        self.assertEqual("normal", sf_config.priority_of({"priority": "urgent"}))
+        self.assertEqual("normal", sf_config.priority_of({}))
 
 
 class YieldAskTests(PlanCase):
@@ -114,11 +114,11 @@ class YieldAskTests(PlanCase):
         self.assertEqual([("gate", "test")], self.asks([self.test], [self.gate, self.other]))
 
     def test_nobody_asks_without_reason(self):
-        cases = {
+        cases: dict[str, Any] = {
             "it has waited less than yield_after": ([classed(waiter("test", 1, -60), "interactive")], None),
             "a normal waiter does not ask": ([waiter("test", 1, -300)], None),
             "the holder did not opt in": ([self.test], {"yieldable": False}),
-            "the holder is not of a lower class": ([self.test], {"meta": {"class": "interactive"}}),
+            "the holder is not of a lower class": ([self.test], {"priority": "interactive"}),
             "the holder was granted less than yield_after ago": ([self.test], {"granted": stamp(-60)}),
             "the holder yielded YIELDS_MAX times": ([self.test], {"yields": sf_config.YIELDS_MAX}),
         }
@@ -212,21 +212,21 @@ class ProtocolTests(SlotCase):
         self.assertEqual(0, self.tool("order", "--yield-after", "1").returncode)
 
     def gate(self, *options, script=YIELDER):
-        return self.request("gate", 4, "sh", "-c", script, "work", "gate", options=("--class", "batch", *options))
+        return self.request("gate", 4, "sh", "-c", script, "work", "gate", options=("--priority", "batch", *options))
 
     def test_a_yieldable_holder_yields_between_steps_and_resumes_after_the_interactive_request(self):
         gate = self.gate("--yieldable")
         self.started("gate")
         time.sleep(1.1)  # a holder is asked only after it held its slots yield_after seconds
-        quick = self.request("quick", 1, options=("--class", "interactive"))
+        quick = self.request("quick", 1, options=("--priority", "interactive"))
         self.started("quick")
         self.assertEqual(["start gate", "yield gate", "start quick"], self.events())
         found = {e["label"]: e for e in json.loads(self.tool("status", "--json").stdout)["entries"]}
-        self.assertEqual(("waiting", "batch", True, 1, 1), (found["gate"]["state"], found["gate"]["class"],
+        self.assertEqual(("waiting", "batch", True, 1, 1), (found["gate"]["state"], found["gate"]["priority"],
                                                              found["gate"]["yieldable"], found["gate"]["yields"],
                                                              found["gate"]["position"]))
-        self.assertEqual(("held", "interactive"), (found["quick"]["state"], found["quick"]["class"]))
-        self.assertRegex(self.status(), r"waiting: 4 slot\(s\) gate .*meta=class=batch yieldable yielded=1 cmd=")
+        self.assertEqual(("held", "interactive"), (found["quick"]["state"], found["quick"]["priority"]))
+        self.assertRegex(self.status(), r"waiting: 4 slot\(s\) gate .*yieldable yielded=1 cmd=")
         self.release("quick")
         self.wait_for(lambda: "resume gate" in self.events(), "the gate to resume")
         self.release("gate")
@@ -249,7 +249,7 @@ class ProtocolTests(SlotCase):
     def test_a_holder_that_did_not_opt_in_is_never_asked(self):
         gate = self.gate()
         self.started("gate")
-        quick = self.request("quick", 1, options=("--class", "interactive"))
+        quick = self.request("quick", 1, options=("--priority", "interactive"))
         self.wait_for(lambda: "waiting: 1 slot(s) quick" in self.status(), "quick to queue")
         time.sleep(2.5)  # past yield_after, several looks
         self.assertEqual([], list((self.state / "queue").glob("*.yield")))
@@ -264,11 +264,11 @@ class ProtocolTests(SlotCase):
         gate = self.gate("--yieldable", script=WORK.replace("$1", "gate"))  # opted in, but never looks
         self.started("gate")
         time.sleep(1.1)
-        quick = self.request("quick", 1, options=("--class", "interactive", "--wait", "4"))
+        quick = self.request("quick", 1, options=("--priority", "interactive", "--wait", "4"))
         self.wait_for(lambda: list((self.state / "queue").glob("*.yield")), "the yield request")
         self.assertIn("yieldable asked-to-yield-for=quick", self.status())
         [entry] = [e for e in json.loads(self.tool("status", "--json").stdout)["entries"] if e["label"] == "gate"]
-        self.assertEqual(("quick", "interactive", 1), (entry["yield_asked"]["label"], entry["yield_asked"]["class"],
+        self.assertEqual(("quick", "interactive", 1), (entry["yield_asked"]["label"], entry["yield_asked"]["priority"],
                                                        entry["yield_asked"]["count"]))
         text = self.tool("dashboard", "--once", "--width", "160", "--height", "40").stdout
         self.assertRegex(text, r"yield +asked to yield for quick")
@@ -280,7 +280,7 @@ class ProtocolTests(SlotCase):
 
     def test_a_client_that_asks_later_says_so_on_its_entry(self):
         self.env["SLOTFATHER_YIELD_AFTER"] = "0"
-        process = self.request("quick", 1, options=("--class", "interactive"))
+        process = self.request("quick", 1, options=("--priority", "interactive"))
         self.started("quick")
         [entry] = [json.loads(p.read_text()) for p in (self.state / "queue").glob("*.json")]
         self.assertEqual(0, entry["yield_after"])
@@ -303,14 +303,14 @@ class ProtocolTests(SlotCase):
         base = {"cmd": "fake", "since": "2026-11-03T00:00:00Z", "granted": "2026-11-03T00:00:00Z", "state": "held"}
         gate = queue / f"{1:010d}-{gate_pid}.json"
         gate.write_text(json.dumps({**base, "pid": gate_pid, "start": gate_start, "count": 2, "label": "gate",
-                                    "yieldable": True, "meta": {"class": "batch"}}))
+                                    "yieldable": True, "priority": "batch"}))
         (queue / f"{2:010d}-{other_pid}.json").write_text(json.dumps(
             {**base, "pid": other_pid, "start": other_start, "count": 2, "label": "other"}))
         asker = queue / f"{3:010d}-{asker_pid}.json"
         asker.write_text(json.dumps({"pid": asker_pid, "start": asker_start, "count": 4, "label": "quick",
                                      "cmd": "fake", "since": "2026-11-03T00:10:00Z", "state": "waiting",
-                                     "meta": {"class": "interactive"}}))
-        sf_state.write(sf_state.marker(gate), {"by": asker.stem, "label": "quick", "class": "interactive", "count": 4,
+                                     "priority": "interactive"}))
+        sf_state.write(sf_state.marker(gate), {"by": asker.stem, "label": "quick", "priority": "interactive", "count": 4,
                                    "at": "2026-11-03T00:12:00Z"})
         with mock.patch.dict(os.environ, {"SLOTFATHER_DIR": str(self.state), "SLOTFATHER_LEGACY_DIRS": "",
                                           "SLOTFATHER_CORES": "12", "SLOTFATHER_MEMORY_GIB": "64",
@@ -324,9 +324,9 @@ class ProtocolTests(SlotCase):
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertIn("no yield requested", result.stderr)
         self.assertEqual(2, self.tool("yield").returncode)
-        self.assertEqual(2, self.tool("run", "--class", "urgent", "--", "true").returncode)
+        self.assertEqual(2, self.tool("run", "--priority", "urgent", "--", "true").returncode)
         self.assertEqual(2, self.tool("run", "--meta", "class=urgent", "--", "true").returncode)
-        self.assertEqual(0, self.tool("run", "--meta", "class=batch", "--", "true").returncode)
+        self.assertEqual(2, self.tool("run", "--meta", "class=batch", "--", "true").returncode)
 
     def test_a_lease_granted_again_by_an_older_client_resumes(self):
         pid, start = self.holder()
@@ -344,49 +344,6 @@ class ProtocolTests(SlotCase):
         self.assertFalse({"yielded_at", "first_granted", "rank"} & set(entry))
 
 
-@unittest.skipUnless((ROOT / ".git").exists(), "needs the git history for the previous slotfather")
-class MixedClassTests(SlotCase):
-    """3e3a621, the slotfather before classes, on the same queue."""
-
-    OLD = "3e3a621"
-
-    def setUp(self):
-        super().setUp()
-        found = subprocess.run(["git", "-C", str(ROOT), "show", f"{self.OLD}:slotfather"], capture_output=True)
-        if found.returncode:
-            self.skipTest(f"{self.OLD} is not in this checkout")
-        self.old = self.tmp / "slotfather-old"
-        self.old.write_bytes(found.stdout)
-        self.old.chmod(0o755)
-        self.env["TOOL"] = TOOL
-
-    def old_tool(self, *args):
-        return subprocess.run([str(self.old), *args], env=self.env, capture_output=True, text=True, timeout=20)
-
-    def test_the_old_version_reads_the_saved_order_until_a_class_knob_changes(self):
-        self.tool("order", "backfill")
-        self.assertTrue(self.old_tool("order").stdout.startswith("backfill:"), "the defaults save no new keys")
-        self.tool("order", "--batch", "600")
-        self.assertTrue(self.old_tool("order").stdout.startswith("window:"),
-                        "an older client refuses keys it does not know and falls back to the window order")
-
-    def test_the_old_version_lists_a_yielded_lease_as_a_waiter(self):
-        self.tool("order", "--yield-after", "1")
-        gate = self.request("gate", 4, "sh", "-c", YIELDER, "work", "gate",
-                            options=("--class", "batch", "--yieldable"))
-        self.started("gate")
-        time.sleep(1.1)
-        quick = self.request("quick", 1, options=("--class", "interactive"))
-        self.started("quick")
-        listing = self.old_tool("status").stdout
-        self.assertIn("waiting: 4 slot(s) gate", listing)
-        self.assertIn("1 of 4 slots held", listing)
-        self.assertEqual("0", self.old_tool("available").stdout.strip())
-        self.release("quick")
-        self.wait_for(lambda: "resume gate" in self.events(), "the gate to resume")
-        self.release("gate")
-        for process in (gate, quick):
-            self.finish(process)
 
 
 class StatsTests(unittest.TestCase):

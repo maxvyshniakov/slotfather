@@ -42,7 +42,6 @@ def load_scene(advance=False):
     import importlib
     dashboard=importlib.reload(importlib.import_module('slotfather.dashboard'))
     dashboard.HISTORY_WINDOW=60  # short demo zoom; the legend reports seconds per column
-    dashboard.MACHINE_HEIGHT-=1  # five chart rows expose eighth-cell heights for six slots
     origin=model['updated']
     started=time.monotonic()
     history_anchor=origin+dt.timedelta(seconds=10 if advance else 0)

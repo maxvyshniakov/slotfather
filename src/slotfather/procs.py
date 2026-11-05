@@ -125,10 +125,10 @@ def read_leases(processes: dict[int, Process], entries: list[tuple[Path, dict[st
         if holder is None or start and " ".join(start.split()) != holder.start:
             continue
         meta = config.meta_of(entry)
-        klass = meta.get("class")
+        priority = config.priority_of(entry)
         leases.append({"id": path.stem, "lease": str(path), "state": entry["state"],
                        "count": entry["count"], "label": entry.get("label"), "pid": holder.pid,
-                       "start": holder.start, "class": klass if klass in config.CLASSES else "normal",
+                       "start": holder.start, "priority": priority, "ticket": config.ticket_of(entry),
                        "meta": meta, "legacy": old})
     return leases
 
@@ -232,7 +232,7 @@ def query(pid: int | None = None, cwd: str | None = None, directory: Path | None
                         "leases": [{**lease, "via": "tree" if lease["pid"] in [number, *chain] else "env"}
                                    for lease in leases if lease["pid"] in [number, *chain]
                                    or lease["lease"] in marked.get(number, set())]})
-    return {"v": 1, "query": {"pid": pid, "cwd": cwd, "start": processes[pid].start if pid in processes else None},
+    return {"v": 2, "query": {"pid": pid, "cwd": cwd, "start": processes[pid].start if pid in processes else None},
             "cwd_unknown": unknown, "lease_unknown": lease_unknown, "processes": records}
 
 

@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """slotfather-stats: request resource use and machine occupancy; `slotfather stats` runs it.
 
-  slotfather stats [--since WHEN] [--label GLOB] [--by both|label|kind|meta.KEY] [--top N] [--json]
+  slotfather stats [--since WHEN] [--label GLOB] [--by both|label|kind|priority|ticket|meta.KEY] [--top N] [--json]
 
 Reads history.jsonl (one line per request that left the queue; version 2 lines carry what a `run` used) and
 machine.jsonl (samples of the machine while leases ran), each with its rotated .1 part. WHEN is an age (90m, 36h,
 7d) or a local date or time (2026-11-02, 2026-11-02T15:00); GLOB matches labels (fnmatch). Requests group by label
 and by command kind, the program and its first argument (`bun run-browser-checks.mjs`, `verify.sh --checks [95]`),
-or by one key of the lease metadata (`--by meta.ticket`; requests without that key group under "-"):
+or by one key of the lease metadata (`--by ticket` or `--by meta.KEY`; requests without that key group under "-"):
 per group the median and 90th percentile of wait and run, and the cores used per slot held, CPU seconds over wall
 seconds times slots. The machine part gives the share of sampled time the one-minute load stood over the cores
 (more runnable threads than cores) and under them, the CPU busy share, and how often a slot's worth of cores sat
@@ -22,6 +22,7 @@ from pathlib import Path
 import re
 import sys
 import time
+from typing import Any, Iterable, cast
 
 
 from . import config as _config
@@ -30,7 +31,7 @@ from . import state as _state
 
 
 GAP = 60.0  # seconds; a longer gap between machine samples means no lease ran, and counts as this long
-USAGE = "usage: slotfather stats [--since WHEN] [--label GLOB] [--by both|label|kind|meta.KEY] [--top N] [--json]"
+USAGE = "usage: slotfather stats [--since WHEN] [--label GLOB] [--by both|label|kind|priority|ticket|meta.KEY] [--top N] [--json]"
 
 
 class StatsError(Exception):
@@ -212,28 +213,34 @@ def sweeps(items: list[dict]) -> dict:
 
 
 def summarize(directory: Path | None = None, since: float | None = None, label: str | None = None,
-              by: str = "both", moment: float | None = None) -> dict:
+              by: str = "both", moment: float | None = None) -> dict[str, Any]:
     directory = directory or _config.state_dir()
     moment = time.time() if moment is None else moment
-    items = []
-    for item in _state.history_items(directory):
+    items: list[dict[str, Any]] = []
+    for item in cast(Iterable[dict[str, Any]], _state.history_items(directory)):
         ended = _config.seconds(item.get("ended"))
         if since is not None and (ended is None or ended < since):
             continue
         if label is not None and not fnmatch.fnmatchcase(str(item.get("label")), label):
             continue
         items.append(item)
-    groups = {}
+    groups: dict[tuple[Any, Any], list[dict[str, Any]]] = {}
     meta_key = by[5:] if by.startswith("meta.") else None
+    field = by if by in ("priority", "ticket") else None
     for item in items:
-        if meta_key:
+        if field:
+            value = _config.priority_of(item) if field == "priority" else _config.ticket_of(item)
+            key = (value, None)
+        elif meta_key:
             key = (_config.meta_of(item).get(meta_key), None)
         else:
             key = (item.get("label") if by != "kind" else None, kind(item.get("cmd")) if by != "label" else None)
         groups.setdefault(key, []).append(item)
     rows = []
     for (name, what), members in groups.items():
-        row = {"label": None, "kind": None, "meta": {meta_key: name}} if meta_key else {"label": name, "kind": what}
+        row: dict[str, Any] = {"label": None, "kind": None, "meta": {meta_key: name}} if meta_key else {"label": name, "kind": what}
+        if field:
+            row = {"label": None, "kind": None, field: name}
         rows.append({**row, **usage_of(members)})
     rows.sort(key=lambda r: (-r["slot_hours"], -r["requests"]))
     try:
@@ -278,7 +285,7 @@ def local(stamp) -> str:
     return "?" if moment is None else time.strftime("%m-%d %H:%M", time.localtime(moment))
 
 
-def report(summary: dict, top: int = 25) -> str:
+def report(summary: dict[str, Any], top: int = 25) -> str:
     o, h, m = summary["overall"], summary["held"], summary["machine"]
     lines = [f"slotfather stats · {o['requests']} requests"
              + (f" ended {local(summary['first'])} to {local(summary['last'])}" if summary["first"] else "")
@@ -292,12 +299,16 @@ def report(summary: dict, top: int = 25) -> str:
                      f"every slot held {share(h['all_held'])} of the time")
     meta_key = summary["by"][5:] if summary["by"].startswith("meta.") else None
 
-    def first(row) -> str:
+    field: str | None = str(summary["by"]) if summary["by"] in ("priority", "ticket") else None
+    grouped = bool(meta_key or field)
+    def first(row: dict[str, Any]) -> str:
+        if field:
+            return "-" if row[field] is None else str(row[field])
         if meta_key:
             value = row["meta"].get(meta_key)
             return "-" if value is None else str(value)
         return str(row["label"])
-    title = summary["by"].upper() if meta_key else "LABEL"
+    title = str(summary["by"]).upper() if grouped else "LABEL"
     width = max([len(first(r)) for r in summary["groups"][:top]] + [len(title)])
     width = min(width, 34)
     kinds = max([len(str(r["kind"] or "")) for r in summary["groups"][:top]] + [4])
@@ -305,7 +316,7 @@ def report(summary: dict, top: int = 25) -> str:
     head = []
     if summary["by"] != "kind":
         head.append(f"{title:<{width}}")
-    if summary["by"] not in ("label",) and not meta_key:
+    if summary["by"] not in ("label",) and not grouped:
         head.append(f"{'KIND':<{kinds}}")
     head.append(f"{'RUNS':>5} {'WAIT p50':>8} {'p90':>6} {'RUN p50':>7} {'p90':>6} {'SLOTS':>5} {'CORES':>5} "
                 f"{'PER SLOT':>8} {'PEAK MB':>7}")
@@ -314,7 +325,7 @@ def report(summary: dict, top: int = 25) -> str:
         cells = []
         if summary["by"] != "kind":
             cells.append(f"{first(row)[:width]:<{width}}")
-        if summary["by"] != "label" and not meta_key:
+        if summary["by"] != "label" and not grouped:
             cells.append(f"{str(row['kind'])[:kinds]:<{kinds}}")
         cells.append(f"{row['requests']:>5} {span(row['wait_p50']):>8} {span(row['wait_p90']):>6} "
                      f"{span(row['run_p50']):>7} {span(row['run_p90']):>6} {number(row['slots_p50'], 0):>5} "
@@ -343,9 +354,9 @@ def report(summary: dict, top: int = 25) -> str:
                         else f"; least available memory {m['memory_available_mb_min']} MB"))
     else:
         lines.append("no machine samples in range")
-    w = summary.get("sweeps") or {}
+    w = cast(dict[str, Any], summary.get("sweeps") or {})
     if w.get("runs"):
-        found = w.get("last_found") or {}
+        found = cast(dict[str, Any], w.get("last_found") or {})
         lines.append(f"sweeps: {w['runs']} ({w['live']} live); stopped "
                      + ", ".join(f"{w['stopped'][c]} {c}" for c in SWEPT)
                      + f", {w['failed']} failed, {w['freed_mb']:.0f} MB resident freed; the last "
@@ -366,8 +377,9 @@ def main(argv: list[str] | None = None) -> int:
                 since = parse_since(argv.pop(0))
             elif option == "--label" and argv:
                 label = argv.pop(0)
-            elif option == "--by" and argv and (argv[0] in ("both", "label", "kind") or (
-                    argv[0].startswith("meta.") and _config.META_KEY.fullmatch(argv[0][5:]))):
+            elif option == "--by" and argv and (argv[0] in ("both", "label", "kind", "priority", "ticket") or (
+                    argv[0].startswith("meta.") and argv[0][5:] not in ("class", "priority", "ticket")
+                    and _config.META_KEY.fullmatch(argv[0][5:]))):
                 by = argv.pop(0)
             elif option == "--top" and argv and argv[0].isdigit():
                 top = int(argv.pop(0))

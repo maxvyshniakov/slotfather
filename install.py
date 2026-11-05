@@ -33,12 +33,13 @@ import pwd
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
 import uuid
-from typing import Any
+from typing import Any, Iterator, cast
 
 MIN_PYTHON = (3, 9)
 ENV_SHEBANG = b"#!/usr/bin/env python3\n"
@@ -54,7 +55,7 @@ class InstallError(Exception):
 
 
 @contextmanager
-def lock(path):
+def lock(path: Path) -> Iterator[None]:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a") as handle:
         try:
@@ -64,19 +65,19 @@ def lock(path):
         yield
 
 
-def live_processes():
+def live_processes() -> dict[int, str]:
     # Linux: the C locale, as slotfather's own ps (procps writes lstart in the locale's words).
     env = {**os.environ, "LC_ALL": "C"} if sys.platform.startswith("linux") else None
     result = subprocess.run(["ps", "-axo", "pid=,stat=,lstart="], capture_output=True, text=True, env=env)
     if result.returncode:
-        raise InstallError("cannot establish whether old queue processes are live: ps failed")
-    table = {}
+        raise InstallError("cannot establish whether queue processes are live: ps failed")
+    table: dict[int, str] = {}
     for row in result.stdout.splitlines():
         parts = row.split(None, 2)
         if len(parts) == 3 and parts[0].isdigit() and not parts[1].startswith("Z"):
             table[int(parts[0])] = parts[2].strip()
     if os.getpid() not in table:
-        raise InstallError("cannot establish old queue idleness: ps did not identify this installer")
+        raise InstallError("cannot establish queue idleness: ps did not identify this installer")
     return table
 
 
@@ -91,6 +92,171 @@ def require_idle(directory, table):
             raise InstallError(f"cannot establish old queue idleness from {path}: {error}") from None
         if pid in table and (not start or table[pid] == start):
             raise InstallError(f"live old {state} entry at {path}; let holders and waiters drain before installing")
+
+
+def require_current_format(directory: Path, table: dict[int, str]) -> None:
+    """The caller holds the queue lock: live clients must already use canonical request fields."""
+    for path in (directory / "queue").glob("*.json"):
+        try:
+            entry: dict[str, Any] = json.loads(path.read_text())
+            pid, start, state = entry["pid"], entry["start"], entry["state"]
+            if type(pid) is not int or pid <= 0 or not isinstance(start, str) or state not in ("held", "waiting"):
+                raise ValueError("unrecognized queue entry")
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            raise InstallError(f"cannot establish current queue format from {path}: {error}") from None
+        live_start = table.get(pid)
+        if live_start is None:
+            continue
+        if start and " ".join(start.split()) != " ".join(live_start.split()):
+            continue  # The PID was reused; this stale record is not the process now running.
+        if not start:
+            raise InstallError(f"cannot establish process identity at {path}; let holders and waiters drain "
+                               "before installing")
+        raw_meta = entry.get("meta", {})
+        if not isinstance(raw_meta, dict):
+            raise InstallError(f"cannot establish current queue format from {path}: metadata is not a mapping")
+        meta = cast(dict[str, Any], raw_meta)
+        priority = entry.get("priority")
+        if (not isinstance(priority, str) or priority not in ("interactive", "normal", "batch")
+                or any(key in meta for key in ("class", "priority", "ticket"))):
+            raise InstallError(f"live old-format {state} entry at {path}; update its caller and let old-format "
+                               "holders and waiters drain before installing; no running work was stopped")
+
+
+def reserve_current_queue(directory: Path, locks: ExitStack, created_guards: list[tuple[Path, int]]) -> bool:
+    """Lock an existing queue through publication, or reserve an absent path against concurrent creation."""
+    while True:
+        if directory.is_symlink():
+            raise InstallError(f"new queue must be a real directory: {directory}")
+        if directory.is_dir():
+            locks.enter_context(lock(directory / ".lock"))
+            require_current_format(directory, live_processes())
+            return False
+        if directory.exists():
+            raise InstallError(f"new queue path is not a directory; preserve it and recover before retrying: {directory}")
+        try:
+            inode = make_guard(directory)
+            created_guards.append((directory, inode))
+            return True
+        except FileExistsError:
+            continue  # A client won creation: lock and inspect its queue before any other installation work.
+
+
+def history_ticket(value: object) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, int) and not isinstance(value, bool):
+        value = str(value)
+    if not isinstance(value, str) or len(value) > 200 or not value.isprintable():
+        raise ValueError("ticket is not a short printable identifier")
+    value = value.strip()
+    if not value or value.lower() == "none":
+        return None
+    return value[1:] if value.startswith("#") and value[1:].isdigit() else value
+
+
+def history_bytes(path: Path) -> bytes:
+    """Migration reads only regular files, never follows a history symlink."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                raise InstallError(f"history migration requires a regular file: {path}")
+            return handle.read()
+    except OSError as error:
+        raise InstallError(f"cannot read history for migration at {path}: {error}") from None
+
+
+def history_updates(directory: Path | None) -> list[tuple[str, bytes, bytes]]:
+    """Plan the complete finite conversion before any history or release is changed."""
+    updates: list[tuple[str, bytes, bytes]] = []
+    if directory is None:
+        return updates
+    for name in ("history.jsonl", "history.jsonl.1"):
+        path = directory / name
+        if path.is_symlink():
+            raise InstallError(f"history migration refuses a symlink: {path}")
+        if not path.exists():
+            continue
+        original = history_bytes(path)
+        try:
+            lines = original.decode("utf-8").splitlines(keepends=True)
+        except UnicodeError as error:
+            raise InstallError(f"cannot migrate {path}: {error}") from None
+        converted: list[str] = []
+        for number, line in enumerate(lines, 1):
+            if not line.strip():
+                converted.append(line)
+                continue
+            try:
+                raw = json.loads(line)
+                if not isinstance(raw, dict):
+                    raise ValueError("history record is not an object")
+                record = cast(dict[str, Any], raw)
+                updated = dict(record)
+                raw_meta = record.get("meta")
+                if raw_meta is not None and not isinstance(raw_meta, dict):
+                    raise ValueError("history metadata is not a mapping")
+                meta = cast(dict[str, Any], raw_meta) if raw_meta is not None else {}
+                priority = record["priority"] if "priority" in record else meta.get("priority", meta.get("class", "normal"))
+                if priority not in ("interactive", "normal", "batch"):
+                    raise ValueError(f"unsupported priority {priority!r}")
+                updated["priority"] = priority
+                if "ticket" in record:
+                    updated["ticket"] = history_ticket(record["ticket"])
+                elif "ticket" in meta:
+                    ticket = history_ticket(meta["ticket"])
+                    if ticket is not None:
+                        updated["ticket"] = ticket
+                if isinstance(raw_meta, dict):
+                    updated["meta"] = {key: value for key, value in meta.items()
+                                       if key not in ("class", "priority", "ticket")}
+                if updated == record:
+                    converted.append(line)
+                else:
+                    ending = "\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n") else ""
+                    converted.append(json.dumps(updated, ensure_ascii=False, separators=(",", ":")) + ending)
+            except (ValueError, TypeError) as error:
+                raise InstallError(f"cannot migrate {path} line {number}: {error}") from None
+        payload = "".join(converted).encode("utf-8")
+        if payload != original:
+            updates.append((name, original, payload))
+    return updates
+
+
+def migrate_history(directory: Path, updates: list[tuple[str, bytes, bytes]], backup: Path) -> None:
+    """Back up all originals before replacing any file; the current queue lock remains held."""
+    if not updates:
+        return
+    for name, original, _ in updates:
+        if history_bytes(directory / name) != original:
+            raise InstallError(f"history changed during installation at {directory / name}; retry")
+    saved = backup / "history"
+    pending: list[tuple[Path, Path]] = []
+    try:
+        saved.mkdir(parents=True, mode=0o700)
+        for name, original, payload in updates:
+            with (saved / name).open("xb") as handle:
+                os.fchmod(handle.fileno(), 0o600)
+                handle.write(original)
+                handle.flush()
+                os.fsync(handle.fileno())
+            target = directory / name
+            with tempfile.NamedTemporaryFile(dir=directory, prefix=".history-migration-", delete=False) as handle:
+                path = Path(handle.name)
+                pending.append((path, target))
+                handle.write(payload)
+                handle.flush()
+                os.fchmod(handle.fileno(), target.stat().st_mode & 0o777)
+                os.fsync(handle.fileno())
+        for path, target in pending:
+            os.replace(path, target)
+    except OSError as error:
+        raise InstallError(f"history conversion stopped; original files are preserved at {saved}: {error}") from None
+    finally:
+        for path, _ in pending:
+            path.unlink(missing_ok=True)
+    print(f"Migrated request fields in {', '.join(name for name, _, _ in updates)}; originals saved at {saved}")
 
 
 def exchange(first, second):
@@ -111,7 +277,7 @@ def exchange(first, second):
         raise InstallError(f"atomic queue retirement failed for {first}: {os.strerror(number)}")
 
 
-def make_guard(path):
+def make_guard(path: Path) -> int:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("xb") as handle:
         handle.write(GUARD)
@@ -313,10 +479,11 @@ def install(home: Path, source: Path, python: str, bin_dir: Path | None = None,
     if old_command.is_dir() and not old_command.is_symlink():
         raise InstallError(f"old command is a directory; leaving it unchanged: {old_command}")
     release = None
-    created_guards = []
+    created_guards: list[tuple[Path, int]] = []
     changing = False
     with lock(state / ".slotfather-install.lock"), ExitStack() as locks:
         try:
+            new_guard = reserve_current_queue(destination, locks, created_guards)
             old_directories = []
             # Reserve absent old paths before checking idleness. An old client can
             # no longer create a queue while the other paths are being checked.
@@ -343,18 +510,8 @@ def install(home: Path, source: Path, python: str, bin_dir: Path | None = None,
             table = live_processes()
             for old in old_directories:
                 require_idle(old, table)
-            if destination.is_symlink():
-                raise InstallError(f"new queue must be a real directory: {destination}")
-            new_guard = False
-            if not destination.exists():
-                try:
-                    inode = make_guard(destination)
-                    created_guards.append((destination, inode))
-                    new_guard = True
-                except FileExistsError:
-                    pass
-            if not new_guard and not destination.is_dir():
-                raise InstallError(f"new queue path is not a directory; preserve it and recover before retrying: {destination}")
+            history_source = destination if not new_guard else old_paths[0] if old_paths[0] in old_directories else None
+            updates = history_updates(history_source)
             if (source.parent / "src/slotfather").is_dir():
                 release = install_package(home, source.parent, destination if pinned else None, cgroup, bin_dir)
             backup = state / "slotfather-migrations" / uuid.uuid4().hex
@@ -373,10 +530,12 @@ def install(home: Path, source: Path, python: str, bin_dir: Path | None = None,
             if new_guard:
                 empty = backup / "new-queue"
                 empty.mkdir(parents=True)
+                locks.enter_context(lock(empty / ".lock"))
                 exchange(destination, empty)
                 changing = True
                 empty.unlink()  # This is now the temporary guard, never queue data.
             changing = True
+            migrate_history(destination, updates, backup)
             # The companions (dashboard, stats, sweep) first: an executable that names a missing one is the shorter-lived
             # mismatch.
             for name in reversed(COMMANDS):

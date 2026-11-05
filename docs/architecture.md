@@ -44,20 +44,21 @@ A pinned installation shares one user's directory even when a service changes `H
 
 A structural migration must preserve these files and active leases. Adding data is safe only
 when old readers can ignore it and old writers can still release their leases. A breaking
-schema needs a distinct migration, validation and coexistence test; moving Python code is
+schema needs a distinct migration, validation and an explicit live-client cutoff; moving Python code is
 not a reason to rewrite queue state. Derived caches may be rebuilt rather than migrated.
 
 ## Stable surfaces
 
-- Command names, options, exit codes and signal forwarding remain compatible.
-- `status --json` stays at version 1. Process queries have a separate versioned response.
+- The documented CLI and JSON request format is current; retired metadata-field aliases are rejected.
+- `status --json` and `procs --json` use version 2 with priority and ticket request fields.
 - Process identity is a PID plus its start time. A recycled PID must never inherit a lease
   or permission to stop a process.
 - Installed commands bind to an immutable package release; replacement entry points do not
   change code underneath an already running old client. Releases are retained while old
   clients may still use them.
 - `slotfather version` identifies the installed source so local and remote installations can
-  be compared. Installation does not take over queue admission or cancel running work.
+  be compared. Installation does not take over queue admission or cancel running work. Breaking request-format
+  installation refuses live old-format clients and proceeds only after they have drained.
 
 Executable-file internals are not the package API. External tools should use documented JSON
 commands; Python integrations should import the module that owns the behavior they use.

@@ -190,10 +190,6 @@ def history_estimates(directory: Path) -> Estimates:
     return Estimates(runs)
 
 
-def class_of(entry: dict) -> str:
-    """interactive, normal or batch: the entry's metadata `class`, normal when it has none or another word."""
-    value = _config.meta_of(entry).get("class")
-    return value if value in _config.CLASSES else "normal"
 
 
 def rank_time(entry: dict, settings: dict) -> float:
@@ -206,7 +202,7 @@ def rank_time(entry: dict, settings: dict) -> float:
         return float(behind)
     queued = _config.seconds(entry.get("since"))
     queued = math.inf if queued is None else queued
-    cls = class_of(entry)
+    cls = _config.priority_of(cast(dict[str, Any], entry))
     return queued - settings.get("interactive", 0.0) if cls == "interactive" else \
         queued + settings.get("batch", 0.0) if cls == "batch" else queued
 
@@ -388,7 +384,7 @@ def yield_asks(waiters: list[dict], held: list[dict], slots: int, moment: float,
     if not after or settings["order"] != "backfill":
         return []
     estimate = estimate or (lambda entry: None)
-    level = {name: n for n, name in enumerate(_config.CLASSES)}
+    level = {name: n for n, name in enumerate(_config.PRIORITIES)}
     asked_ids = {id(entry) for entry in asked}
     holding, found, granted = list(held), [], []
 
@@ -400,7 +396,7 @@ def yield_asks(waiters: list[dict], held: list[dict], slots: int, moment: float,
         return moment + max(run - ran, settings["overrun"] * ran)
 
     for entry in ranked(waiters, settings):
-        if class_of(entry) not in _config.ASKERS or any(entry is g for g in granted):
+        if _config.priority_of(cast(dict[str, Any], entry)) not in _config.ASKERS or any(entry is g for g in granted):
             continue
         own = entry.get("yield_after")  # its client's environment asks later, or never (0)
         wait_for = max(after, float(own)) if type(own) in (int, float) and own > 0 else \
@@ -418,10 +414,10 @@ def yield_asks(waiters: list[dict], held: list[dict], slots: int, moment: float,
             have, when = have + count, end
         if have >= entry["count"] and when - moment <= after:
             continue  # its slots are expected soon anyway
-        candidates = [h for h in holding if h.get("yieldable") and level[class_of(h)] > level[class_of(entry)]
+        candidates = [h for h in holding if h.get("yieldable") and level[_config.priority_of(cast(dict[str, Any], h))] > level[_config.priority_of(cast(dict[str, Any], entry))]
                       and int(h.get("yields") or 0) < _config.YIELDS_MAX
                       and moment - (_config.seconds(h.get("resumed") or h.get("granted")) or moment) >= after]
-        candidates.sort(key=lambda h: (id(h) not in asked_ids, -level[class_of(h)], -expected_end(h)))
+        candidates.sort(key=lambda h: (id(h) not in asked_ids, -level[_config.priority_of(cast(dict[str, Any], h))], -expected_end(h)))
         chosen, need = [], entry["count"] - free
         for h in candidates:
             if need <= 0:
