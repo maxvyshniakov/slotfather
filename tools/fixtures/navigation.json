@@ -1,0 +1,1193 @@
+{
+  "provenance": {
+    "source": "Completed local Slotfather history and nearest machine sample",
+    "historySha256": "d3faa0a71f3e76cbadcb4c3b64c34d92745d6549d233c3182fa6e2a66633a0a6",
+    "capturedAt": "2026-11-04T09:59:39+00:00",
+    "machineAt": "2026-11-04T09:59:36.700000+00:00",
+    "redactions": "Home paths shortened, PIDs consistently remapped, secret-bearing commands omitted.",
+    "limitations": "CPU and memory per lane are recorded run averages, not instantaneous samples. Historical process names and physical memory usage are unavailable; omitted.",
+    "machineSha256": "70d2514aa5214e8fb443c3d1852b52ee2515b040fcfed0bfcbac68f01a0084ea"
+  },
+  "model": {
+    "directory": "(frozen demo)",
+    "slots": 6,
+    "saved": true,
+    "cores": 12,
+    "averages": [
+      31.0,
+      28.71,
+      27.25
+    ],
+    "advice": {
+      "unleased_load": 20.71
+    },
+    "holders": [
+      {
+        "label": "lane-644-build-once",
+        "count": 1,
+        "pid": 10000,
+        "since": "2026-11-04T09:04:55+00:00",
+        "granted": "2026-11-04T09:24:29+00:00",
+        "cmd": "~/straylight/.claude/worktrees/agent-afa3816b08f8cf012/verify.sh --checks desktop-tests --keep-going --jobs 1",
+        "meta": "lane=644-build-once,ticket=644,phase=check,class=normal",
+        "cpu": 110.1,
+        "rss": 2684314,
+        "procs": 516,
+        "tree": [],
+        "queue": "",
+        "kind": "held",
+        "passable": false,
+        "asked": "",
+        "yieldable": false,
+        "yields": 0
+      },
+      {
+        "label": "lane-465-state-definitions-review-fixes",
+        "count": 1,
+        "pid": 10001,
+        "since": "2026-11-04T09:41:05+00:00",
+        "granted": "2026-11-04T09:42:39+00:00",
+        "cmd": "~/straylight/.claude/worktrees/agent-a604013621f30731a/verify.sh --checks syntax:build-volume-click.sh,syntax:install-control-app.sh,syntax:create-local-signing-identity.sh,syntax:build-domain-module.sh,python-syntax:routing,tools/swift-test-coverage.py,tools/file-length-ratchet.py,tools/source-map-check.py,tools/port-probe-check.py,tools/rust-layer-check.py,tools/main-hop-check.py,tools/tis-thread-check.py,tools/actions-column-check.py,tools/source-patch-check.py,release-notes,tools/perf-budget-check.py,tools/gate-triage.py,tools/owner-decisions-check.py,test-release-notes,domain-build,production-domain-tests,cargo:straylight-core,native-consumers,tools/test-compile-commands.py,test-configuration-commands.py,test-web-server.py,tools/android-tv/test_worker.py,test-media-lifecycle.py,swift-tests,ha-discovery,test-caffeinate:compile,test-caffeinate,native-input-typecheck,remote-input-build,system-media,test-native-plex-socket.py,test-media-playback:compile,test-media-playback,hid-typecheck,ble-typecheck,test-ulanzi-hid-reports:compile,test-ulanzi-hid-reports,cargo:straylight-link-linux,tools/rust-msrv-check.py,gate-vectors:compile,gate-vectors,codec-vectors:compile,codec-vectors,tools/host-journeys.py,app-build,app-signature,app-commit,app-version,desktop-tests --keep-going --jobs 1",
+        "meta": "lane=465-state-definitions-review-fixes,ticket=465,phase=check,class=normal",
+        "cpu": 107.4,
+        "rss": 1649152,
+        "procs": 1062,
+        "tree": [],
+        "queue": "",
+        "kind": "held",
+        "passable": false,
+        "asked": "",
+        "yieldable": false,
+        "yields": 0
+      },
+      {
+        "label": "desktop",
+        "count": 2,
+        "pid": 10002,
+        "since": "2026-11-04T09:55:44+00:00",
+        "granted": "2026-11-04T09:55:44+00:00",
+        "cmd": "node scripts/test.mjs --test-concurrency=2 tests/action-application-target.test.mjs tests/action-card-initialization.test.mjs tests/action-catalog.test.mjs tests/action-contract.test.mjs tests/action-creation.test.mjs tests/action-palette.test.mjs tests/action-problems-parity.test.mjs tests/action-recipients.test.mjs tests/action-targets.test.mjs tests/action-type-menu.test.mjs tests/activity-native.test.mjs tests/activity-presentation.test.mjs tests/activity-watch-native.test.mjs tests/agent-app.test.mjs tests/agent-contract-params.test.mjs tests/agent-contract.test.mjs tests/ambient-accent.test.mjs tests/android-tv-collection.test.mjs tests/application-assets.test.mjs tests/application-picker.test.mjs tests/branch-editor.test.mjs tests/branch-ui.test.mjs tests/browser-offline.test.mjs tests/browser-timeouts.test.mjs tests/browser.test.mjs tests/canvas-arrangement.test.mjs tests/canvas-clipboard-browser.test.mjs tests/canvas-clipboard.test.mjs tests/canvas-editing.test.mjs tests/canvas-edits.test.mjs tests/canvas-elements-lint.test.mjs tests/canvas-feedback.test.mjs tests/canvas-focus.test.mjs tests/canvas-geometry.test.mjs tests/canvas-gesture-lifetime.test.mjs tests/canvas-gesture.test.mjs tests/canvas-intent.test.mjs tests/canvas-movement.test.mjs tests/canvas-navigation.test.mjs tests/canvas-pan-performance.test.mjs tests/canvas-phone.test.mjs tests/canvas-pointer.test.mjs tests/canvas-rendering.test.mjs tests/canvas-selection.test.mjs tests/canvas-toolbar.test.mjs tests/canvas-viewport-adapter.test.mjs tests/canvas-viewport.test.mjs tests/color-picker-apply.test.mjs tests/configuration-boundary.test.mjs tests/configuration-edits.test.mjs tests/configuration-flows.test.mjs tests/configuration-record-edits.test.mjs tests/configuration-sync.test.mjs tests/connection-recovery.test.mjs tests/connection-routing.test.mjs tests/context-activity.test.mjs tests/control-hud-tabs-ui.test.mjs tests/current-host-contract.test.mjs tests/desktop-lifecycle.test.mjs tests/desktop-navigation.test.mjs tests/dev-workspace.test.mjs tests/dialog-focus.test.mjs tests/dialog-submit.test.mjs tests/display-controls.test.mjs tests/document-transport.test.mjs tests/draft-storage.test.mjs tests/duration-input.test.mjs tests/edit-session.test.mjs tests/editor-draft-pending-restore.test.mjs tests/editor-draft.test.mjs tests/editor-feedback.test.mjs tests/editor-interactions.test.mjs tests/electron-bridge-interrupted.test.mjs tests/electron-bridge.test.mjs tests/electron-host-cache.test.mjs tests/electron-host-clients.test.mjs tests/electron-host-proof.test.mjs tests/electron-pending-edits.test.mjs tests/electron-test-launch.test.mjs tests/execution-ui.test.mjs tests/execution.test.mjs tests/field-hints.test.mjs tests/graph-branch-preview.test.mjs tests/graph-movement.test.mjs tests/header-blur.test.mjs tests/home-assistant-actions.test.mjs tests/home-assistant-fields.test.mjs tests/home-assistant-states-ui.test.mjs tests/home-assistant-view.test.mjs tests/home-assistant-widget-input.test.mjs tests/host-access.test.mjs tests/host-capabilities.test.mjs tests/host-peers.test.mjs tests/host-references.test.mjs tests/host-switching.test.mjs tests/host-transport-interrupted.test.mjs tests/hosts-activity.test.mjs tests/huds-ui.test.mjs tests/huds.test.mjs tests/icon-accent.test.mjs tests/idle-rendering.test.mjs tests/import-home-assistant-entities.test.mjs tests/import-voice.test.mjs tests/input-modes-ui.test.mjs tests/input-modes.test.mjs tests/integration.test.mjs tests/keyboard-actions.test.mjs tests/launcher-actions.test.mjs tests/launcher-destination.test.mjs tests/launcher-editing.test.mjs tests/launcher-editor.test.mjs tests/launcher-geometry.test.mjs tests/launcher-home-assistant.test.mjs tests/launcher-layout-role.test.mjs tests/launcher-model.test.mjs tests/launcher-overlay.test.mjs tests/launcher-presentation.test.mjs tests/launcher-preview.test.mjs tests/launcher-scroll.test.mjs tests/launcher-widget-editor.test.mjs tests/launcher-widget-groups.test.mjs tests/layout-activation.test.mjs tests/linux-host-browser.test.mjs tests/linux-host-editing.test.mjs tests/listening-presets.test.mjs tests/live-native.test.mjs tests/live-relay.test.mjs tests/live-states.test.mjs tests/live-store.test.mjs tests/mac-control-capabilities.test.mjs tests/mac-control-editor.test.mjs tests/mcp-connection.test.mjs tests/mcp-server.test.mjs tests/mcp-write-tools.test.mjs tests/media-control.test.mjs tests/media-settings.test.mjs tests/memory-agent.test.mjs tests/memory-live.test.mjs tests/modules.test.mjs tests/native-live.test.mjs tests/native-snapshots.test.mjs tests/navigation-hud.test.mjs tests/network-access.test.mjs tests/observation-commands.test.mjs tests/offline-drafts.test.mjs tests/outcome-outputs.test.mjs tests/owner-decisions.test.mjs tests/packaging.test.mjs tests/page-visit.test.mjs tests/pending-edits-idb-commit.test.mjs tests/pending-edits-tabs.test.mjs tests/pending-edits-trusted-host.test.mjs tests/pending-edits.test.mjs tests/preset-installation.test.mjs tests/primary-layout.test.mjs tests/processor-card-addon.test.mjs tests/processor-volume.test.mjs tests/projector-graph-ui.test.mjs tests/properties-panel.test.mjs tests/proposed-drafts.test.mjs tests/release-notes.test.mjs tests/remote-binding-editing.test.mjs tests/remote-catalog.test.mjs tests/remote-contexts.test.mjs tests/remote-drawings.test.mjs tests/remote-hardware-settings.test.mjs tests/remote-host-picker.test.mjs tests/remote-integration-step.test.mjs tests/remote-layout-editor.test.mjs tests/remote-microphone.test.mjs tests/remote-routes.test.mjs tests/remote-scenario-step.test.mjs tests/remote-state-step.test.mjs tests/remote-state-transport.test.mjs tests/remotes.test.mjs tests/request-deadlines.test.mjs tests/requirements.test.mjs tests/revision-conflict.test.mjs tests/ring-rotation.test.mjs tests/routing.test.mjs tests/runtime-device-transport.test.mjs tests/scenario-current-contract.test.mjs tests/scenario-header.test.mjs tests/scenes-ui.test.mjs tests/scoped-editing.test.mjs tests/script-parameter-fields.test.mjs tests/script-parameter-values.test.mjs tests/sections.test.mjs tests/selection-feedback.test.mjs tests/settings-draft-guard.test.mjs tests/settings-pending-writes.test.mjs tests/settle.test.mjs tests/setup.test.mjs tests/shell-sections.test.mjs tests/sid-kit-source.test.mjs tests/sid-kit-update.test.mjs tests/sidebar-create.test.mjs tests/sidebar-drag.test.mjs tests/sidebar-persistence.test.mjs tests/sidebar-primary-action.test.mjs tests/sidebar-remotes.test.mjs tests/sign-in.test.mjs tests/snapshot-current-contract.test.mjs tests/snapshots-ui.test.mjs tests/state-action.test.mjs tests/state-transport.test.mjs tests/states-grid.test.mjs tests/states-ui.test.mjs tests/story-catalog.test.mjs tests/story-client.test.mjs tests/storybook.test.mjs tests/system-volume.test.mjs tests/test-runner.test.mjs tests/test-services.test.mjs tests/tidy-layout.test.mjs tests/touch-bindings.test.mjs tests/ui-preferences-ui.test.mjs tests/ui-preferences.test.mjs tests/ui-rules-lint.test.mjs tests/unapplied-changes.test.mjs tests/unit-revisions.test.mjs tests/voice-binding-ui.test.mjs tests/voice-binding.test.mjs tests/window-action.test.mjs tests/window-chrome.test.mjs",
+        "meta": "",
+        "cpu": 99.8,
+        "rss": 1554022,
+        "procs": 119,
+        "tree": [],
+        "queue": "",
+        "kind": "held",
+        "passable": false,
+        "asked": "",
+        "yieldable": false,
+        "yields": 0
+      }
+    ],
+    "waiters": [
+      {
+        "label": "prof51",
+        "count": 6,
+        "pid": 10003,
+        "since": "2026-11-04T09:36:22+00:00",
+        "granted": null,
+        "cmd": "node profile.mjs",
+        "meta": "",
+        "cpu": null,
+        "rss": 0,
+        "procs": 0,
+        "tree": [],
+        "queue": "",
+        "kind": "waiting",
+        "passable": false,
+        "asked": "",
+        "yieldable": false,
+        "yields": 0
+      },
+      {
+        "label": "lane-555-host-rename-names",
+        "count": 1,
+        "pid": 10004,
+        "since": "2026-11-04T09:59:29+00:00",
+        "granted": null,
+        "cmd": "~/straylight/.claude/worktrees/agent-a1c75285bdf2cd615/verify.sh --checks syntax:build-volume-click.sh,syntax:install-control-app.sh,syntax:create-local-signing-identity.sh,syntax:build-domain-module.sh,python-syntax:routing,tools/swift-test-coverage.py,tools/file-length-ratchet.py,tools/source-map-check.py,tools/port-probe-check.py,tools/rust-layer-check.py,tools/main-hop-check.py,tools/tis-thread-check.py,tools/actions-column-check.py,tools/source-patch-check.py,release-notes,tools/perf-budget-check.py,tools/gate-triage.py,tools/owner-decisions-check.py,test-release-notes,domain-build,production-domain-tests,cargo:straylight-core,native-consumers,tools/test-compile-commands.py,test-configuration-commands.py,test-web-server.py,tools/android-tv/test_worker.py,test-media-lifecycle.py,swift-tests,ha-discovery,test-caffeinate:compile,test-caffeinate,native-input-typecheck,remote-input-build,system-media,test-native-plex-socket.py,test-media-playback:compile,test-media-playback,hid-typecheck,ble-typecheck,test-ulanzi-hid-reports:compile,test-ulanzi-hid-reports,cargo:straylight-link-linux,tools/rust-msrv-check.py,gate-vectors:compile,gate-vectors,codec-vectors:compile,codec-vectors,tools/host-journeys.py,app-build,app-signature,app-commit,app-version,desktop-tests --keep-going --jobs 1",
+        "meta": "lane=555-host-rename-names,ticket=555,phase=check,class=normal",
+        "cpu": null,
+        "rss": 0,
+        "procs": 0,
+        "tree": [],
+        "queue": "",
+        "kind": "waiting",
+        "passable": false,
+        "asked": "",
+        "yieldable": false,
+        "yields": 0
+      }
+    ],
+    "used": 4,
+    "free": 2,
+    "guard": null,
+    "admission": 0,
+    "order": "backfill",
+    "start": null,
+    "limit": 2700,
+    "memory": {
+      "level": 2.0,
+      "total": null,
+      "used": null,
+      "swap_total": 8192,
+      "swap_free": 1258
+    },
+    "events": [
+      {
+        "when": "2026-11-04T07:59:39+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "straylight-core",
+        "pid": 21139
+      },
+      {
+        "when": "2026-11-04T08:09:10+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "lane-644-build-once",
+        "pid": 21140
+      },
+      {
+        "when": "2026-11-04T08:10:09+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "straylight-link-linux",
+        "pid": 21141
+      },
+      {
+        "when": "2026-11-04T08:11:29+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "straylight-link-linux",
+        "pid": 21141
+      },
+      {
+        "when": "2026-11-04T08:11:58+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "straylight-link-linux",
+        "pid": 21142
+      },
+      {
+        "when": "2026-11-04T08:12:03+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "straylight-link-linux",
+        "pid": 21142
+      },
+      {
+        "when": "2026-11-04T08:12:27+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "straylight-link-linux",
+        "pid": 21143
+      },
+      {
+        "when": "2026-11-04T08:12:32+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "straylight-link-linux",
+        "pid": 21143
+      },
+      {
+        "when": "2026-11-04T08:12:37+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "straylight-link-linux",
+        "pid": 21144
+      },
+      {
+        "when": "2026-11-04T08:12:37+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "straylight-link-linux",
+        "pid": 21144
+      },
+      {
+        "when": "2026-11-04T08:13:18+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "644 repro action-targets",
+        "pid": 21147
+      },
+      {
+        "when": "2026-11-04T08:14:45+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "agent-a0f998f4c57cd4c0e",
+        "pid": 21145
+      },
+      {
+        "when": "2026-11-04T08:15:22+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "agent-a0f998f4c57cd4c0e",
+        "pid": 21145
+      },
+      {
+        "when": "2026-11-04T08:15:53+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "agent-a0f998f4c57cd4c0e",
+        "pid": 21146
+      },
+      {
+        "when": "2026-11-04T08:15:54+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "agent-a0f998f4c57cd4c0e",
+        "pid": 21146
+      },
+      {
+        "when": "2026-11-04T08:17:53+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "644 repro action-targets",
+        "pid": 21147
+      },
+      {
+        "when": "2026-11-04T08:17:53+00:00",
+        "verb": "granted",
+        "count": 2,
+        "delta": 2,
+        "label": "agent-a0f998f4c57cd4c0e",
+        "pid": 21148
+      },
+      {
+        "when": "2026-11-04T08:20:03+00:00",
+        "verb": "released",
+        "count": 2,
+        "delta": -2,
+        "label": "agent-a0f998f4c57cd4c0e",
+        "pid": 21148
+      },
+      {
+        "when": "2026-11-04T08:20:56+00:00",
+        "verb": "granted",
+        "count": 2,
+        "delta": 2,
+        "label": "agent-a0f998f4c57cd4c0e",
+        "pid": 21149
+      },
+      {
+        "when": "2026-11-04T08:22:11+00:00",
+        "verb": "released",
+        "count": 2,
+        "delta": -2,
+        "label": "agent-a0f998f4c57cd4c0e",
+        "pid": 21149
+      },
+      {
+        "when": "2026-11-04T08:23:37+00:00",
+        "verb": "granted",
+        "count": 2,
+        "delta": 2,
+        "label": "agent-a0f998f4c57cd4c0e",
+        "pid": 21150
+      },
+      {
+        "when": "2026-11-04T08:23:41+00:00",
+        "verb": "released",
+        "count": 2,
+        "delta": -2,
+        "label": "agent-a0f998f4c57cd4c0e",
+        "pid": 21150
+      },
+      {
+        "when": "2026-11-04T08:24:54+00:00",
+        "verb": "granted",
+        "count": 2,
+        "delta": 2,
+        "label": "agent-a0f998f4c57cd4c0e",
+        "pid": 21151
+      },
+      {
+        "when": "2026-11-04T08:25:42+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "tests",
+        "pid": 21152
+      },
+      {
+        "when": "2026-11-04T08:25:55+00:00",
+        "verb": "released",
+        "count": 2,
+        "delta": -2,
+        "label": "agent-a0f998f4c57cd4c0e",
+        "pid": 21151
+      },
+      {
+        "when": "2026-11-04T08:26:18+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "tests",
+        "pid": 21152
+      },
+      {
+        "when": "2026-11-04T08:27:45+00:00",
+        "verb": "granted",
+        "count": 2,
+        "delta": 2,
+        "label": "agent-a0f998f4c57cd4c0e",
+        "pid": 21153
+      },
+      {
+        "when": "2026-11-04T08:27:47+00:00",
+        "verb": "released",
+        "count": 2,
+        "delta": -2,
+        "label": "agent-a0f998f4c57cd4c0e",
+        "pid": 21153
+      },
+      {
+        "when": "2026-11-04T08:32:42+00:00",
+        "verb": "granted",
+        "count": 2,
+        "delta": 2,
+        "label": "agent-a0f998f4c57cd4c0e",
+        "pid": 21156
+      },
+      {
+        "when": "2026-11-04T08:32:49+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "tests",
+        "pid": 21154
+      },
+      {
+        "when": "2026-11-04T08:32:49+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "tests",
+        "pid": 21154
+      },
+      {
+        "when": "2026-11-04T08:35:03+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "lane-465-state-definitions-review-fixes",
+        "pid": 21155
+      },
+      {
+        "when": "2026-11-04T08:35:40+00:00",
+        "verb": "released",
+        "count": 2,
+        "delta": -2,
+        "label": "agent-a0f998f4c57cd4c0e",
+        "pid": 21156
+      },
+      {
+        "when": "2026-11-04T08:35:41+00:00",
+        "verb": "granted",
+        "count": 6,
+        "delta": 6,
+        "label": "lane-491-electron-stop-flake-alone",
+        "pid": 21157
+      },
+      {
+        "when": "2026-11-04T09:06:32+00:00",
+        "verb": "released",
+        "count": 6,
+        "delta": -6,
+        "label": "lane-491-electron-stop-flake-alone",
+        "pid": 21157
+      },
+      {
+        "when": "2026-11-04T09:06:32+00:00",
+        "verb": "granted",
+        "count": 6,
+        "delta": 6,
+        "label": "lane-465-state-definitions-review-fixes-alone",
+        "pid": 21158
+      },
+      {
+        "when": "2026-11-04T09:23:29+00:00",
+        "verb": "released",
+        "count": 6,
+        "delta": -6,
+        "label": "lane-465-state-definitions-review-fixes-alone",
+        "pid": 21158
+      },
+      {
+        "when": "2026-11-04T09:23:29+00:00",
+        "verb": "granted",
+        "count": 2,
+        "delta": 2,
+        "label": "agent-a0f998f4c57cd4c0e",
+        "pid": 21159
+      },
+      {
+        "when": "2026-11-04T09:23:29+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "tests",
+        "pid": 21167
+      },
+      {
+        "when": "2026-11-04T09:23:29+00:00",
+        "verb": "granted",
+        "count": 2,
+        "delta": 2,
+        "label": "lane-456-rename-compat-review-fixes",
+        "pid": 21171
+      },
+      {
+        "when": "2026-11-04T09:23:29+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "post-merge-491-electron-stop-flake",
+        "pid": 21183
+      },
+      {
+        "when": "2026-11-04T09:23:32+00:00",
+        "verb": "released",
+        "count": 2,
+        "delta": -2,
+        "label": "agent-a0f998f4c57cd4c0e",
+        "pid": 21159
+      },
+      {
+        "when": "2026-11-04T09:23:32+00:00",
+        "verb": "granted",
+        "count": 2,
+        "delta": 2,
+        "label": "data-grid",
+        "pid": 21160
+      },
+      {
+        "when": "2026-11-04T09:24:23+00:00",
+        "verb": "released",
+        "count": 2,
+        "delta": -2,
+        "label": "data-grid",
+        "pid": 21160
+      },
+      {
+        "when": "2026-11-04T09:24:23+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "data-grid-wt-51-proto",
+        "pid": 21161
+      },
+      {
+        "when": "2026-11-04T09:24:23+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "agent-a604013621f30731a",
+        "pid": 21162
+      },
+      {
+        "when": "2026-11-04T09:24:29+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "data-grid-wt-51-proto",
+        "pid": 21161
+      },
+      {
+        "when": "2026-11-04T09:24:29+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "lane-644-build-once",
+        "pid": 10000
+      },
+      {
+        "when": "2026-11-04T09:24:59+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "agent-a604013621f30731a",
+        "pid": 21162
+      },
+      {
+        "when": "2026-11-04T09:24:59+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "data-grid-wt-51-proto",
+        "pid": 21163
+      },
+      {
+        "when": "2026-11-04T09:25:04+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "data-grid-wt-51-proto",
+        "pid": 21163
+      },
+      {
+        "when": "2026-11-04T09:25:04+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "data-grid-wt-51-proto",
+        "pid": 21164
+      },
+      {
+        "when": "2026-11-04T09:25:22+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "data-grid-wt-51-proto",
+        "pid": 21164
+      },
+      {
+        "when": "2026-11-04T09:25:33+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "agent-a604013621f30731a",
+        "pid": 21165
+      },
+      {
+        "when": "2026-11-04T09:26:58+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "agent-a604013621f30731a",
+        "pid": 21165
+      },
+      {
+        "when": "2026-11-04T09:26:58+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "sb-dev",
+        "pid": 21166
+      },
+      {
+        "when": "2026-11-04T09:27:00+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "sb-dev",
+        "pid": 21166
+      },
+      {
+        "when": "2026-11-04T09:27:00+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "tests",
+        "pid": 21167
+      },
+      {
+        "when": "2026-11-04T09:27:00+00:00",
+        "verb": "granted",
+        "count": 2,
+        "delta": 2,
+        "label": "agent-a0f998f4c57cd4c0e",
+        "pid": 21168
+      },
+      {
+        "when": "2026-11-04T09:27:31+00:00",
+        "verb": "released",
+        "count": 2,
+        "delta": -2,
+        "label": "agent-a0f998f4c57cd4c0e",
+        "pid": 21168
+      },
+      {
+        "when": "2026-11-04T09:27:31+00:00",
+        "verb": "granted",
+        "count": 2,
+        "delta": 2,
+        "label": "data-grid-wt-51-proto",
+        "pid": 21169
+      },
+      {
+        "when": "2026-11-04T09:30:51+00:00",
+        "verb": "released",
+        "count": 2,
+        "delta": -2,
+        "label": "data-grid-wt-51-proto",
+        "pid": 21169
+      },
+      {
+        "when": "2026-11-04T09:30:51+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "tests",
+        "pid": 21170
+      },
+      {
+        "when": "2026-11-04T09:30:51+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "agent-a604013621f30731a",
+        "pid": 21177
+      },
+      {
+        "when": "2026-11-04T09:33:13+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "tests",
+        "pid": 21170
+      },
+      {
+        "when": "2026-11-04T09:33:13+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "agent-a1c75285bdf2cd615",
+        "pid": 21173
+      },
+      {
+        "when": "2026-11-04T09:35:48+00:00",
+        "verb": "released",
+        "count": 2,
+        "delta": -2,
+        "label": "lane-456-rename-compat-review-fixes",
+        "pid": 21171
+      },
+      {
+        "when": "2026-11-04T09:35:48+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "data-grid-wt-51-proto",
+        "pid": 21172
+      },
+      {
+        "when": "2026-11-04T09:35:48+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "agent-ae72d94beb6f08961",
+        "pid": 21175
+      },
+      {
+        "when": "2026-11-04T09:35:53+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "data-grid-wt-51-proto",
+        "pid": 21172
+      },
+      {
+        "when": "2026-11-04T09:36:54+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "straylight-core",
+        "pid": 21174
+      },
+      {
+        "when": "2026-11-04T09:37:02+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "agent-a1c75285bdf2cd615",
+        "pid": 21173
+      },
+      {
+        "when": "2026-11-04T09:37:02+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "post-merge-456-rename-compat-review-fixes",
+        "pid": 21193
+      },
+      {
+        "when": "2026-11-04T09:37:31+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "straylight-core",
+        "pid": 21174
+      },
+      {
+        "when": "2026-11-04T09:38:11+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "straylight-core",
+        "pid": 21176
+      },
+      {
+        "when": "2026-11-04T09:39:05+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "agent-ae72d94beb6f08961",
+        "pid": 21175
+      },
+      {
+        "when": "2026-11-04T09:39:05+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "agent-a1c75285bdf2cd615",
+        "pid": 21178
+      },
+      {
+        "when": "2026-11-04T09:39:06+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "straylight-core",
+        "pid": 21176
+      },
+      {
+        "when": "2026-11-04T09:39:39+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "agent-a604013621f30731a",
+        "pid": 21177
+      },
+      {
+        "when": "2026-11-04T09:39:39+00:00",
+        "verb": "granted",
+        "count": 2,
+        "delta": 2,
+        "label": "data-grid-wt-photos",
+        "pid": 21179
+      },
+      {
+        "when": "2026-11-04T09:42:08+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "agent-a1c75285bdf2cd615",
+        "pid": 21178
+      },
+      {
+        "when": "2026-11-04T09:42:08+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "agent-a0f998f4c57cd4c0e",
+        "pid": 21184
+      },
+      {
+        "when": "2026-11-04T09:42:38+00:00",
+        "verb": "released",
+        "count": 2,
+        "delta": -2,
+        "label": "data-grid-wt-photos",
+        "pid": 21179
+      },
+      {
+        "when": "2026-11-04T09:42:39+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "agent-ae72d94beb6f08961",
+        "pid": 21180
+      },
+      {
+        "when": "2026-11-04T09:42:39+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "lane-465-state-definitions-review-fixes",
+        "pid": 10001
+      },
+      {
+        "when": "2026-11-04T09:44:59+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "agent-ae72d94beb6f08961",
+        "pid": 21180
+      },
+      {
+        "when": "2026-11-04T09:44:59+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "agent-a1c75285bdf2cd615",
+        "pid": 21181
+      },
+      {
+        "when": "2026-11-04T09:45:09+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "agent-a1c75285bdf2cd615",
+        "pid": 21181
+      },
+      {
+        "when": "2026-11-04T09:45:17+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "agent-a1c75285bdf2cd615",
+        "pid": 21182
+      },
+      {
+        "when": "2026-11-04T09:45:53+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "agent-a1c75285bdf2cd615",
+        "pid": 21182
+      },
+      {
+        "when": "2026-11-04T09:45:54+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "agent-ae72d94beb6f08961",
+        "pid": 21190
+      },
+      {
+        "when": "2026-11-04T09:46:08+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "post-merge-491-electron-stop-flake",
+        "pid": 21183
+      },
+      {
+        "when": "2026-11-04T09:46:38+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "agent-a1c75285bdf2cd615",
+        "pid": 21192
+      },
+      {
+        "when": "2026-11-04T09:47:04+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "agent-a0f998f4c57cd4c0e",
+        "pid": 21184
+      },
+      {
+        "when": "2026-11-04T09:47:04+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "agent-a0f998f4c57cd4c0e",
+        "pid": 21185
+      },
+      {
+        "when": "2026-11-04T09:47:07+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "agent-a0f998f4c57cd4c0e",
+        "pid": 21185
+      },
+      {
+        "when": "2026-11-04T09:47:07+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "agent-a0f998f4c57cd4c0e",
+        "pid": 21186
+      },
+      {
+        "when": "2026-11-04T09:47:10+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "agent-a0f998f4c57cd4c0e",
+        "pid": 21186
+      },
+      {
+        "when": "2026-11-04T09:47:11+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "agent-a0f998f4c57cd4c0e",
+        "pid": 21187
+      },
+      {
+        "when": "2026-11-04T09:47:13+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "agent-a0f998f4c57cd4c0e",
+        "pid": 21187
+      },
+      {
+        "when": "2026-11-04T09:47:14+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "agent-a0f998f4c57cd4c0e",
+        "pid": 21188
+      },
+      {
+        "when": "2026-11-04T09:47:17+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "agent-a0f998f4c57cd4c0e",
+        "pid": 21188
+      },
+      {
+        "when": "2026-11-04T09:47:17+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "agent-a0f998f4c57cd4c0e",
+        "pid": 21189
+      },
+      {
+        "when": "2026-11-04T09:47:21+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "agent-a0f998f4c57cd4c0e",
+        "pid": 21189
+      },
+      {
+        "when": "2026-11-04T09:48:30+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "agent-ae72d94beb6f08961",
+        "pid": 21190
+      },
+      {
+        "when": "2026-11-04T09:48:31+00:00",
+        "verb": "granted",
+        "count": 2,
+        "delta": 2,
+        "label": "data-grid",
+        "pid": 21191
+      },
+      {
+        "when": "2026-11-04T09:49:34+00:00",
+        "verb": "released",
+        "count": 2,
+        "delta": -2,
+        "label": "data-grid",
+        "pid": 21191
+      },
+      {
+        "when": "2026-11-04T09:51:24+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "agent-a1c75285bdf2cd615",
+        "pid": 21192
+      },
+      {
+        "when": "2026-11-04T09:51:40+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "post-merge-456-rename-compat-review-fixes",
+        "pid": 21193
+      },
+      {
+        "when": "2026-11-04T09:51:40+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "agent-a1c75285bdf2cd615",
+        "pid": 21195
+      },
+      {
+        "when": "2026-11-04T09:52:25+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "desktop",
+        "pid": 21194
+      },
+      {
+        "when": "2026-11-04T09:52:30+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "desktop",
+        "pid": 21194
+      },
+      {
+        "when": "2026-11-04T09:52:53+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "agent-a1c75285bdf2cd615",
+        "pid": 21195
+      },
+      {
+        "when": "2026-11-04T09:53:08+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "agent-a1c75285bdf2cd615",
+        "pid": 21196
+      },
+      {
+        "when": "2026-11-04T09:53:54+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "agent-ae72d94beb6f08961",
+        "pid": 21202
+      },
+      {
+        "when": "2026-11-04T09:54:02+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "agent-a1c75285bdf2cd615",
+        "pid": 21196
+      },
+      {
+        "when": "2026-11-04T09:54:06+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "agent-a1c75285bdf2cd615",
+        "pid": 21198
+      },
+      {
+        "when": "2026-11-04T09:54:54+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "desktop",
+        "pid": 21197
+      },
+      {
+        "when": "2026-11-04T09:55:00+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "desktop",
+        "pid": 21197
+      },
+      {
+        "when": "2026-11-04T09:55:24+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "desktop",
+        "pid": 21199
+      },
+      {
+        "when": "2026-11-04T09:55:26+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "agent-a1c75285bdf2cd615",
+        "pid": 21198
+      },
+      {
+        "when": "2026-11-04T09:55:31+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "desktop",
+        "pid": 21199
+      },
+      {
+        "when": "2026-11-04T09:55:41+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "agent-a1c75285bdf2cd615",
+        "pid": 21200
+      },
+      {
+        "when": "2026-11-04T09:55:44+00:00",
+        "verb": "granted",
+        "count": 2,
+        "delta": 2,
+        "label": "desktop",
+        "pid": 10002
+      },
+      {
+        "when": "2026-11-04T09:57:15+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "agent-a1c75285bdf2cd615",
+        "pid": 21200
+      },
+      {
+        "when": "2026-11-04T09:57:20+00:00",
+        "verb": "granted",
+        "count": 1,
+        "delta": 1,
+        "label": "agent-a1c75285bdf2cd615",
+        "pid": 21201
+      },
+      {
+        "when": "2026-11-04T09:58:33+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "agent-a1c75285bdf2cd615",
+        "pid": 21201
+      },
+      {
+        "when": "2026-11-04T09:59:35+00:00",
+        "verb": "released",
+        "count": 1,
+        "delta": -1,
+        "label": "agent-ae72d94beb6f08961",
+        "pid": 21202
+      }
+    ],
+    "updated": "2026-11-04T09:59:39+00:00"
+  },
+  "machine_samples": [
+    {
+      "at": "2026-11-04T09:59:36.700000+00:00",
+      "averages": [
+        31.0,
+        28.71,
+        27.25
+      ],
+      "memory": {
+        "level": 2.0,
+        "swap_total": 8192,
+        "swap_free": 1258
+      }
+    },
+    {
+      "at": "2026-11-04T09:59:52.820000+00:00",
+      "averages": [
+        28.65,
+        28.3,
+        27.13
+      ],
+      "memory": {
+        "level": 2.0,
+        "swap_total": 8192,
+        "swap_free": 1258
+      }
+    }
+  ]
+}

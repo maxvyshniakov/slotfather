@@ -61,6 +61,7 @@ class DashboardTests(SlotCase):
                 self.assertIn("live", text.splitlines()[-1])
 
     def test_admission_is_available_slots_not_worker_advice_and_honours_memory_gates(self):
+        self.env["SLOTFATHER_LOADAVG"] = "0"
         def model():
             with mock.patch.dict(os.environ,self.env,clear=True):
                 return load_dashboard().dashboard_model()
@@ -72,7 +73,7 @@ class DashboardTests(SlotCase):
         state=model()
         self.assertEqual(3,state["free"])
         self.assertEqual(0,state["admission"],"low swap blocks additional work despite free slots")
-        self.assertEqual(1,state["advice"]["jobs"],"worker advice is not admission permission")
+        self.assertEqual(3,state["advice"]["jobs"],"three free worker slots are advice, not memory admission permission")
         self.memory.write_text("8000 1\n")
         self.assertEqual(3,model()["admission"])
         self.release("memory-gate-owner")
@@ -471,7 +472,7 @@ class SlotBarTests(unittest.TestCase):
     def test_each_slot_is_solid_with_only_a_gap_between_slots(self):
         tool = load_dashboard()
         canvas = tool.Canvas(120, 3)
-        tool.draw_slots(canvas, 0, 2, 116, dict(slots=3, used=2, waiters=[],
+        tool.draw_slots(canvas, 0, 2, 116, dict(slots=3, used=2, waiters=[dict(count=3)],
                         holders=[dict(count=2, kind="held", style="h0", label="build")]))
         line = canvas.render(False).splitlines()[0]
         self.assertEqual("🮅" * 38 + "  " + "🮅" * 37 + "  " + "🮅" * 37, line[2:118])

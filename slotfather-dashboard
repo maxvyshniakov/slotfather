@@ -239,7 +239,7 @@ def sgr(style: str, selected: bool) -> str:
     elif fore is not None:
         codes.append(f"38;5;{fore}")
     if selected:
-        codes.append("48;2;40;44;52")
+        codes.append("48;2;56;62;74")
     codes += ["7"] if "r" in flags else []
     return "\x1b[" + ";".join(codes) + "m"
 
@@ -672,9 +672,8 @@ def draw_header(canvas: Canvas, model: dict | None, paused: bool, error: str | N
 
 def draw_slots(canvas: Canvas, y: int, x: int, width: int, model: dict) -> None:
     """Solid slots spread across the widget, with two-cell gaps and right-aligned free label."""
-    slots, waiters = model["slots"], model["waiters"]
-    queue_width = min(20, width // 4) if waiters else 0
-    area = max(0, width - (queue_width + 2 if waiters else 0))
+    slots = model["slots"]
+    area = max(0, width)
     gap = 2 if area >= slots + 2 * (slots - 1) else 1 if area >= 2 * slots - 1 else 0
     cell, remainder = divmod(max(0, area - gap * (slots - 1)), slots)
     widths = [cell + (index < remainder) for index in range(slots)]
@@ -701,14 +700,6 @@ def draw_slots(canvas: Canvas, y: int, x: int, width: int, model: dict) -> None:
     for index, (label_x, label, style) in enumerate(labels):
         limit = labels[index + 1][0] - 2 if index + 1 < len(labels) else label_end
         canvas.put(y + 1, label_x, label, style, max(0, limit - label_x))
-    if waiters:
-        cursor = canvas.put(y, x + area + 2, "queue ", "dim", queue_width)
-        end = x + width
-        for index, waiter in enumerate(waiters):
-            if cursor + waiter["count"] + 4 > end:
-                canvas.put(y, cursor, f"+{len(waiters) - index}", "warn", max(0, end - cursor))
-                break
-            cursor = canvas.put(y, cursor, "▒" * waiter["count"], "warn") + 1
 
 
 def draw_lanes(canvas: Canvas, y: int, x: int, height: int, width: int, model: dict, selected: int,
@@ -1003,7 +994,7 @@ def draw_help(canvas: Canvas) -> None:
              ("  r            refresh now", "text"), ("  ?            close this help", "text"),
              ("  q            quit (Esc closes this help)", "text"), ("", "text"), ("Reading it", "title"),
              ("  🮅  a held slot; one colour per lease; ▶ marks the selected row", "text"),
-             ("  legacy colour: earlier queue     dim: free slot     ▒  queued demand", "text"),
+             ("  legacy colour: earlier queue     dim: free slot", "text"),
              ("  CPU USE / SHARE: cores the lease's commands use / cores its slots stand for", "text"),
              ("  yellow: holding slots while nearly idle    red: well above its share", "text"),
              ("  load 1m / 5 / 15: runnable + waiting tasks, averaged; not CPU busy %", "text"),

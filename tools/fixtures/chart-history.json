@@ -1,0 +1,149 @@
+{
+  "provenance": {
+    "source": "Completed Slotfather history.jsonl grant/end events",
+    "sourceEnd": "2026-11-04T01:09:03+00:00",
+    "note": "A recorded short interval is time-aligned with the illustrative demo scene. Heights and event spacing are preserved."
+  },
+  "steps": [
+    {
+      "start": -321.0,
+      "end": -146.0,
+      "held": 6
+    },
+    {
+      "start": -146.0,
+      "end": -144.0,
+      "held": 6
+    },
+    {
+      "start": -144.0,
+      "end": -132.0,
+      "held": 6
+    },
+    {
+      "start": -132.0,
+      "end": -106.0,
+      "held": 6
+    },
+    {
+      "start": -106.0,
+      "end": -105.0,
+      "held": 3
+    },
+    {
+      "start": -105.0,
+      "end": -104.0,
+      "held": 5
+    },
+    {
+      "start": -104.0,
+      "end": -102.0,
+      "held": 6
+    },
+    {
+      "start": -102.0,
+      "end": -90.0,
+      "held": 5
+    },
+    {
+      "start": -90.0,
+      "end": -82.0,
+      "held": 4
+    },
+    {
+      "start": -82.0,
+      "end": -80.0,
+      "held": 5
+    },
+    {
+      "start": -80.0,
+      "end": -66.0,
+      "held": 5
+    },
+    {
+      "start": -66.0,
+      "end": -63.0,
+      "held": 4
+    },
+    {
+      "start": -63.0,
+      "end": -60.0,
+      "held": 3
+    },
+    {
+      "start": -60.0,
+      "end": -59.0,
+      "held": 4
+    },
+    {
+      "start": -59.0,
+      "end": -48.0,
+      "held": 3
+    },
+    {
+      "start": -48.0,
+      "end": -45.0,
+      "held": 4
+    },
+    {
+      "start": -45.0,
+      "end": -42.0,
+      "held": 5
+    },
+    {
+      "start": -42.0,
+      "end": -40.0,
+      "held": 6
+    },
+    {
+      "start": -40.0,
+      "end": -39.0,
+      "held": 5
+    },
+    {
+      "start": -39.0,
+      "end": -32.0,
+      "held": 5
+    },
+    {
+      "start": -32.0,
+      "end": -29.0,
+      "held": 5
+    },
+    {
+      "start": -29.0,
+      "end": -25.0,
+      "held": 6
+    },
+    {
+      "start": -25.0,
+      "end": -18.0,
+      "held": 5
+    },
+    {
+      "start": -18.0,
+      "end": -11.0,
+      "held": 4
+    },
+    {
+      "start": -11.0,
+      "end": -9.0,
+      "held": 5
+    },
+    {
+      "start": -9.0,
+      "end": -5.0,
+      "held": 4
+    },
+    {
+      "start": -5.0,
+      "end": -4.0,
+      "held": 5
+    },
+    {
+      "start": -4.0,
+      "end": 0.0,
+      "held": 4
+    }
+  ]
+}

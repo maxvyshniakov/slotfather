@@ -1,10 +1,14 @@
 # slotfather
 
-A machine-wide queue for expensive builds, test suites, and agent work. Projects sharing a computer use one capacity budget instead of starting independent worker pools.
+One queue for expensive work on a shared machine. Builds, tests and agents take
+slots before they start, so separate projects share one capacity budget.
 
-The executable is a standalone Python 3.9+ script using only the standard library; the optional live view (`slotfather-dashboard`), the statistics (`slotfather-stats`) and the sweep (`slotfather-sweep`) are separate scripts, kept apart so the queue code stays small. It requires POSIX process and file-lock facilities; it is exercised on macOS and Linux (procps-ng `ps`; the suite runs in a `python:3.12` container). macOS supplies its memory-pressure level and swap; Linux supplies `MemAvailable`, swap and PSI from `/proc` (see Linux). Other hosts continue without observations their OS does not expose.
+![Slotfather dashboard: navigating active and waiting tasks](assets/dashboard.webp)
 
 ## Install
+
+Requires Python 3.9+ on macOS or Linux. The installed commands use only the Python
+standard library; Linux needs procps-compatible `ps`.
 
 ```sh
 gh repo clone maxvyshniakov/slotfather
@@ -12,356 +16,90 @@ cd slotfather
 python3 install.py
 ```
 
-The installed commands run on the interpreter that ran the installer: their `#!/usr/bin/env python3` line becomes that interpreter's path, as invoked, so an agent inside a project's virtual environment does not run slotfather on the project's Python. The installer refuses an interpreter inside a virtual environment, and one older than 3.9; name another with `python3 install.py --python /usr/bin/python3`. Re-run it to switch interpreters.
+Put `~/.local/bin` on your `PATH`. Re-running the installer updates the commands
+without cancelling running work. It pins them to the installer’s interpreter,
+so a project’s virtual environment does not change their Python.
 
-The installer also performs the one-time rename migration. It refuses live holders or waiters in either retired queue, preserves the entire earlier machine queue (including saved capacity) when the new queue is absent, and otherwise leaves the existing new queue untouched. Retired contents remain in named `~/.local/state/slotfather-migrations/` backups. Different old and new configurations are both preserved; the existing new configuration stays effective.
+[Installation, migration and service accounts](docs/installation.md)
 
-Both retired paths, `~/.local/state/machine-slots` and `~/.local/state/straylight-verification/slots`, become regular file guards. Atomic directory/file exchanges ensure old clients cannot recreate an uncoordinated queue between the move and guard creation. Existing intentional guards make a repeated install safe, including while the new queue has active leases. Unrelated files at those paths are refused and preserved. The installer uses the default state locations; coordinate custom queue paths separately.
-
-The executable is replaced atomically and the old command name is removed last. If a migration stops after a directory exchange, retain its guards and printed backup paths: the queue contents remain preserved for recovery. This is an explicit installation step, not compatibility logic in normal command execution.
-
-Put `~/.local/bin` on your `PATH`. All participating projects must use the same state directory; saved capacity is shared through that directory. Updating the executable preserves the queue and running leases.
-
-### For a service user: one queue for several CI runners
-
-`python3 install.py --user NAME [--bin DIR] [--cgroup PATH]` installs for NAME (another user needs root): the queue is NAME's `~/.local/state/slotfather`, written into the installed `slotfather` as its default state directory, so every process that runs these commands shares that one queue whatever its `HOME` (a job that moves `HOME` still queues with the rest; `SLOTFATHER_DIR` still overrides). `--bin DIR` puts the commands in DIR instead of `~/.local/bin`, such as `/usr/local/bin`, which a systemd service's and the GitHub runner's `PATH` already hold. Under root, the paths the installer creates in NAME's home (the queue, the retired-path guards, the install lock) are given to NAME; commands outside that home stay root's, so jobs cannot rewrite them (a failure part-way still hands over what was created). `--cgroup PATH` writes in the cgroup v2 path the leases share (see Linux), so every client of the installed command, also a shell outside that cgroup, sizes and guards by it. Another user's queue is read only: run by any other user (root through the guest agent, say), `run`, `yield` and saving `slots` or `order` are refused with the user to run them as (`sudo -u NAME slotfather ...`), and `status`, `history`, `stats`, `available`, `advise`, the dashboard and `slots`/`order` without changes create and remove nothing (a dead holder's entry is left out, not reaped).
-
-The CI runner VM110 (Ubuntu, 6 vCPU, 12 GiB, no swap, nine `actions.runner.*` services as `runner`, #653), from a checkout of this repository on the VM:
-
-```sh
-sudo python3 install.py --user runner --bin /usr/local/bin --cgroup /ci.slice/ci-runners.slice
-sudo -u runner slotfather slots memory 5   # 2 slots (saved: one per 5 GiB of 10 GiB in /ci.slice/ci-runners.slice)
-sudo -u runner sh -c 'cd /tmp && slotfather run -n 1 -- slotfather status'
-slotfather status                          # as root: read only
-```
-
-`slots` refuses changes while any lease is held or waits, so save it while the runners are idle. If the runners' shared drop-in sets `SLOTFATHER_DIR`, point it at this same `/home/runner/.local/state/slotfather` (the pinned default; another directory would need its own `slots` save); `SLOTFATHER_CGROUP=/ci.slice/ci-runners.slice` there is optional, since the installed command names the slice. Sid-Kit's and Data Grid's `scripts/heavy.sh` find `slotfather` on `PATH` and queue their heavy steps from then on; the runner services need no restart (each job looks the command up when it starts).
-
-## Use
+## Run work
 
 ```sh
 slotfather run -n 1 --label tests -- python3 -m unittest discover
 slotfather run -n 2 -- make build
 slotfather run -n all -- ./benchmark.sh
-slotfather run -n 1 --label lane-650 --meta ticket=650 --meta lane=lane-650 --meta phase=verify -- ./verify.sh
-slotfather run -n 1 --class interactive -- node scripts/pre-push.mjs
-slotfather run -n 4 --class batch --yieldable -- ./verify.sh --checks ...   # its client runs `slotfather yield`
-slotfather status
-slotfather status --json --pid 4242
-slotfather history 50
-slotfather stats --since 24h
-slotfather available
-slotfather available --label tests -- python3 -m unittest discover
-slotfather advise --max 4
-slotfather advise --exclusive
-slotfather order
-slotfather sweep                      # what was left behind on the machine (dry run)
 ```
 
-`run` waits for capacity, holds a lease while its command runs, and returns the command's exit status. The default request is one slot. `--wait SECONDS` bounds the wait and returns 75 if capacity does not arrive (the entry says when, so a waiter that would give up before its turn holds nobody back; see Ordering); a missing executable returns 127 and a signal returns 128 plus its number.
+A request waits until it can start, holds its slots while the command runs, then
+returns the command’s exit status. Nested calls reuse the ancestor’s lease.
+Use `--wait 60` to give up after a minute with exit code 75.
 
-The automatic capacity is `max(1, cores // 3)`: four slots on a 12-core machine. A request larger than the machine's capacity takes every slot. Requests are served in arrival order, except that a later request that fits may start before a waiter that does not (see Ordering): freely for `SLOTFATHER_OVERTAKE_WINDOW` seconds after that waiter queued (default 600), and after that only when the history says it will be done before the waiter can start. An all-slot request starts no later than its limit (45 minutes) plus the overrun of what passed it, unless its own `--wait` ends first (then, before its limit, requests that fit pass it once even the held leases' usual runs would end after it gives up) or requests rank ahead of it by class: then it starts once those that came within the class offsets after it (up to an hour for a batch request) have run (see Classes). Use one slot for a suite or build, two for half this 12-core machine, and `all` for a benchmark requiring isolation; a waiting `-n all` request says so on stderr.
-
-Nested invocations inherit a live ancestor's lease rather than waiting for another one. Dead holders and reused PIDs are detected using process IDs and process start times. New leases wait while macOS reports low free swap or memory-pressure warning, or Linux reports little available memory, low free swap or memory stalls (see Linux), except that an otherwise idle machine can start one request. With swap turned off there is no swap to run short of, so only the other signals hold leases back.
-
-`advise` prints a JSON worker-budget decision. It uses the lower of the one- and five-minute load averages, subtracts the CPU share explained by held slots, and reserves the rest for unleased work. The 15-minute tail is recorded but does not shrink a new run after earlier work ended. `--exclusive` assumes the caller will wait for every slot; it is advice, not a lease.
-
-State lives in `~/.local/state/slotfather/`; `queue.log` records grants, releases, and reaping. `history.jsonl` has one JSON line per request that left the queue: label, command, directory, slots, queue, grant and end times, seconds waited and run, the outcome (`released`, `left` after giving up, or `reaped`), `until` for a request with `--wait` (when it would give up) and, for `run`, the exit status and what the command used (see Statistics). Past 4 MB it becomes `history.jsonl.1`, replacing the previous one, so at most two files' worth is kept; readers take `.1` first. `history [N]` lists the last N (default 20). `status` lists holders and waiters.
-
-**Lease metadata.** `run --meta key=value` (repeatable; the library's `acquire(..., meta={...})`) says who asked and why: `ticket`, `lane`, `phase`, `model`, a `session`, whatever a client finds useful. Keys are lowercase words of at most 32 characters (`a-z`, digits, `_ . -`), values printable text of at most 200, at most 16 keys; a later key replaces an earlier one. The metadata is stored on the queue entry and in the request's history line (`"meta": {...}`), and shown by `status` and `history` (`meta=ticket=650,lane=lane-650` before `cmd=`), in the dashboard's LANE DETAILS panel, and grouped by `stats --by meta.KEY`. A nested `run` that inherits a lease runs under that lease's metadata and adds none of its own. Older clients read past the field: they list, grant (keeping it on the entry) and release such entries as before; only a request an older client reaps leaves a history line without its metadata.
-
-**`status --json`** is the queue for programs, such as a guard that must not kill another holder's lease: `{"v": 1, "slots", "held", "free", "entries": [...], "legacy": [...]}`, each entry `{"id", "lease", "state", "count", "label", "pid", "pgid", "start", "since", "granted", "cmd", "cwd", "meta", "tree", "class", "yieldable", "yields", "yield_asked", "position"}` (the last five: see Polite preemption). `id` is the entry's name, `lease` its path (the value of `SLOTFATHER_LEASE` in the lease's command), `pid` the holder (`slotfather run`, or the process that called `acquire()`), `pgid` its process group, `tree` the holder and its live descendants. `status --json --pid PID` keeps only the entries PID belongs to, each with `via`: `"tree"` (the holder or one of its descendants) or `"env"` (it left the tree, by a double fork or `setsid` and launchd adopting it, but its environment carries the lease's `SLOTFATHER_LEASE`; macOS shows the environment only of the user's own processes that are not Apple platform binaries), and adds `"query": {"pid", "start"}`, the process's start time as `ps -o lstart=` prints it (`null`: not running), so a guard can check that the pid was not reused before it acts. An empty list means the process belongs to no lease of this queue as far as can be seen. The extracted version also reads leases in Straylight's earlier queue during migration; old clients do not see new leases, so retire old wrappers before relying on mutual isolation.
-
-## Dashboard
+A slot is a scheduling budget, **not a CPU or memory limit**. By default, capacity
+is the lower of one slot per three cores and one per 4 GiB of memory, with a
+minimum of one. On Linux, a limited cgroup can determine the memory budget.
 
 ```sh
-slotfather                           # in a terminal: the live view; ? lists keys, q quits
-slotfather dashboard --interval 5    # the same, refreshing every 5 s instead of every second
-slotfather dashboard --once          # one snapshot as text (add --width/--height, --color)
+slotfather slots           # show capacity and how it was chosen
+slotfather slots 6         # save a shared capacity of six, while the queue is idle
+slotfather slots reset     # return to automatic sizing
 ```
 
-Plain `slotfather` opens the dashboard only when both its input and output are a terminal; without one, as from a script or an agent, it prints the usage and exits 2 as before.
+Requests normally follow arrival order. Short work can pass a request that does
+not fit, subject to the queue’s backfill rules. Low memory or swap can delay new
+work; an otherwise idle machine can still start its first request.
 
-SLOTS is the top widget of the left column: each slot uses the upper-three-quarters block `🮅` (U+1FB85), slots fill the available width with two-cell gaps; the free label is right-aligned so the last owner label can extend below unused slots. Free slots are dim, and queued demand follows the capacity bar without a repeated next-request label. LANES combines active leases followed by ordered waiting requests, with one blank non-selectable separator row when both groups exist. The common columns are lane, status, slots, time, CPU use/share and PID. Time means elapsed run time for active leases and elapsed wait time for pending requests; waiting lanes show a dash for CPU. The entire table shares one viewport. In the waiting head's LANE DETAILS, `start est` is the estimated head start (not a guarantee), `backfill by` is when other work must finish to pass the head, and `pass until` is the deadline for allowing such work ahead. Secondary columns disappear on narrow terminals. LANE DETAILS shows the chosen entry's command, directory and busiest processes. MACHINE shows a memory/swap health and admission status row, a gap, the load/memory/swap bars, and held-slot history. EVENTS is the log tail, newest first. One status line at the bottom has the app name and keys on the left, and the last update time followed by live/pause/copy status right-aligned; no state-directory path or admission-status banner appears above the widgets.
+[Capacity and configuration](docs/configuration.md) ·
+[Ordering, priorities and cooperative yielding](docs/scheduling.md)
 
-The table headers sit in their top borders; values and empty messages share the same inset, with at least two cells between columns. Widgets have one blank row above and below their content and two spaces at each side; the selection cursor sits in the left margin. Only the selected LANES row has a bright `▶` cursor and a soft background; a space precedes the triangle and the label starts immediately after it. Text keeps its semantic colours. Horizontal CPU/load, memory and swap bars use compact `■` cells with vertical breathing room between rows, with dim cells for the empty track and no partial-width cells. EVENTS uses time, event, slots, optional detail, label, then PID (`gave up` or a reaped process state). In LANE DETAILS, `owner pid` identifies the `slotfather run` lease owner and `cwd` its directory. The process table shows that owner and its descendants, busiest first, with the process name first and PID last. `lane` and `status` have separate rows. The muted `command` and `meta` fields each wrap to at most three rows immediately before `cwd`; shorter panels shrink these blocks to preserve the process table. Widget titles use the terminal's bright text colour, while CPU bar numbers use normal text. For a lease running longer than two minutes below 10% of its reserved CPU share, status adds `idle for 1m 32s`. This duration counts continuously observed low CPU since the dashboard first saw it, resets on activity or a new grant, and restarts after a dashboard pause, copy mode or sampling failure. Click a visible LANES row to select it; the mouse wheel scrolls the table under the pointer, including EVENTS and the nested process table, without changing the selected lease. Keyboard navigation skips the group separator and brings selection back into view. Selection follows the stable lease identity when a waiting request starts and moves into the active group. Press `m` to turn off mouse reporting for native terminal text selection; updates freeze while copying. Press `m` again to restore mouse interaction and live updates. Overflow counts use the padding rows: `↑ N above` at the top and `↓ N more` at the bottom, without taking data rows or touching the frame. The terminal mouse mode is restored on exit.
+## Watch the queue
 
-MACHINE's `load 1m` is the operating system's load average, compared with the core count, **not CPU busy percentage**; its caption is `loaded X of Y cores`, and X can exceed Y. `unleased` is the advice model's estimate, `max(0, min(load1, load5) - held_slots × cores_per_slot)`, not a measurement of individual unleased processes. `admission: N` is the maximum slots a generic new request could receive immediately under the queue policy (unknown run time uses the scheduler fallback), not a worker count or a reservation. `no admission` means zero: queue order, occupied slots or a memory gate block new work. Like the queue, the display still allows the first lease on an idle host even when memory or swap is low. Memory and swap bars show `used X of Y`. The memory bar carries pressure status through colour: accent for normal, red for warning or critical, and dim when unknown; there is no separate pressure row. The top status row independently shows `memory ok/low` and `swap ok/low` (`off` or `unknown` where appropriate), estimated unleased cores and admission. Normal statuses are white, blocked/low statuses red, unknown statuses dim. RAM status uses pressure or available-memory/PSI/cgroup limits and excludes swap-only failures. On macOS, physical memory in use is active + wired + compressor pages (inactive cache excluded); on Linux it is total minus available memory. When totals are unavailable, the panel keeps the available pressure/free-swap facts instead of inventing a percentage. The held-slots histogram is at most six terminal rows tall and spans the full inner width, with a blank row above it, and a blank row separating it from its scale and statistics below, and uses peak values in fixed wall-clock buckets (`s/col` gives their duration); historical peaks move together only at a bucket boundary, and the newest bucket is incomplete. The chart covers roughly the last hour; blank columns mean zero slots held. Bar heights use eighth-cell block characters, with a height-based gradient from accent blue at the base to orange at full capacity. One blank row separates the histogram from its summary, and one blank row separates the summary from the lower frame. Slot labels sit directly below their bars; the glyph itself leaves a quarter-cell gap above the labels, with no extra blank row. Its summary uses the full trailing hour: average occupancy, peak slots, and time at full capacity.
+Run `slotfather` in a terminal to open the live dashboard.
 
-`slotfather dashboard` runs `slotfather-dashboard` from beside the `slotfather` executable with the same interpreter; nothing of it loads during queue admission. The dashboard only reads the queue (like `status`, a refresh reaps dead entries); it never grants, cancels or kills anything.
-
-## Statistics
-
-```sh
-slotfather stats                      # every request in the history, grouped by label and command kind
-slotfather stats --since 24h --by kind
-slotfather stats --since 2026-11-02 --label 'lane-*' --json
-```
-
-While `run`'s command runs, its holder looks at the command's process tree: first after half a second, then each interval half as long again, up to `SLOTFATHER_SAMPLE_MAX` seconds (default 10), and once more after the command exits. One `ps` over the machine per look; nothing per second.
-
-- **CPU** (`cpu`, seconds of user plus system time) is the command's own rusage from `wait4`, which already holds every descendant that a parent inside the tree reaped, short-lived ones included, plus `cpu_detached`: processes that left the tree. A child whose parent exits is adopted by launchd and its CPU never reaches the command's rusage, so it stays the lease's and counts its last sampled CPU time; so does a child of launchd started during the lease whose environment carries the lease's `SLOTFATHER_LEASE` (macOS shows the environment of the user's own processes that are not Apple platform binaries). Processes born and gone between two looks outside the reaped tree are missed, as is a child that exits while its parent never waits for it and the parent then exits (launchd reaps the zombie), and work done by daemons (Docker's VM, launchd services) is not the lease's.
-- **Memory**: `rss_peak_mb` and `rss_mean_mb`, the sum of resident memory over the tree at each look (time-weighted mean; shared pages count once per process). The peak is at least the largest single process from rusage.
-- `wall` (seconds, monotonic), `processes` seen, `samples` taken, and the machine's `cores` and `capacity` at release. Lines carry `"v": 2`; lines written before (no `v`, no usage) still read and count in waits and runs. Nested runs record nothing of their own; leases taken by an older slotfather or through the library `acquire()` record no usage.
-
-While leases run, holders also append a machine sample to `machine.jsonl` at most every `SLOTFATHER_MACHINE_EVERY` seconds (default 15; shared between holders by the file's age and a lock of its own, never the queue lock): load averages, the cumulative CPU ticks (busy is the change between samples), the memory-pressure level and free-memory percentage, swap, and the slots held. It rotates like the history.
-
-`stats` groups requests by label and by command kind (or, with `--by meta.KEY`, by that metadata key; requests without it group under `-`) (program and first argument: `bun run-browser-checks.mjs`, `verify.sh --checks [95]` for a list of 95 checks) and gives, per group, the median and 90th-percentile wait and run, typical slots, mean cores used (CPU seconds over wall seconds), **cores used per slot held** (CPU seconds over wall seconds times slots) and the peak resident memory. Below it: the same over every measured lease, and the slots at which that use would fill the cores; the mean slots held while any lease ran and how often all were held; and from the machine samples, the share of time the one-minute load stood over the cores (more runnable threads than cores) and under them, the mean CPU busy share, how often a slot's worth of cores sat idle, busy cores per held slot (includes work without a lease), memory pressure and the least free swap. `--json` prints all of it; `--top N` limits the table.
-
-**Choosing capacity.** `slotfather slots N` should make the slots' use fill the cores without holding the load over them: with *c* cores used per slot held, *cores / c* slots fill the machine. Check the machine part too: much time over the cores with all slots held means fewer slots; a slot's cores often idle while requests wait means more.
-
-## Sweep
-
-```sh
-slotfather sweep                        # dry run: what would be stopped, reported and spared
-slotfather sweep --json                 # the same for programs
-slotfather sweep --live                 # stop the safe classes (removed, orphan)
-slotfather sweep --live --dev-servers   # and stale dev servers
-slotfather sweep --live --pid 4242      # only this process (and its tree)
-slotfather sweep config                 # show the settings; config KEY VALUE ... saves; config reset
-slotfather sweep --plist --live > ~/Library/LaunchAgents/com.slotfather.sweep.plist
-```
-
-Agents and sessions leave processes behind: a verify run in the background of an agent that finished, a `tail -f` of a task's output, a Storybook started for a review, a browser daemon of a removed worktree, containers of a frozen project in a restart loop (straylight#661: swap full at 6.7 of 7.2 GB). `slotfather sweep` (`slotfather-sweep` beside the queue, like the statistics) finds them in five classes:
-
-| Class | What | Default age | `--live` |
-| --- | --- | --- | --- |
-| `removed` | any process whose working directory is gone (nothing at its path, or another directory there now; on Linux the kernel's `(deleted)` or no links left), or a process of an `orphan` or `dev-server` kind whose command names a path under home or a temporary directory whose directory is gone (a removed worktree). Lists in a word (`-cp a.jar:b.jar`, `NODE_PATH=a:b`, `--paths=a,b`) are split; a directory the sweep may not read (launchd without Full Disk Access under `~/Documents`, `~/Desktop`, iCloud) is unknown, never gone | `removed_age` 10 min | stops |
-| `orphan` | a process adopted by launchd or init (ppid 1; on Linux also a user's `systemd`) of a known dev kind: vitest, jest, Storybook tests, Playwright, agent-browser, headless Chromium, Puppeteer, `cargo test` and test binaries, rustc, `swift test`/`build`, pytest, an esbuild service, `tail -f`/`-F`, and node/bun/deno/npm/python/make/shell runs whose script (the first word after the runner's options and `run`/`exec`, a `-m` module, a shell's `-c` command) or the word right after it is `verify`, `test`, `smoke`, `e2e` or a `*.test.*` file, or `node --test`; another argument (`--directory ~/tests`) does not count | `orphan_age` 2 h | stops |
-| `dev-server` | `storybook dev`, vite, `next dev`, `astro dev`, webpack serve whose parent chain reaches no live session (a process with a terminal, an agent CLI, tmux, sshd, a CI runner, or a GUI app other than the Claude and ChatGPT/Codex desktop apps, whose previews outlive their conversation) and in whose checkout (the nearest directory with `.git`) no session works | `dev_server_age` 8 h | stops only with `--dev-servers` |
-| `container` | a container with a restart policy, at least `container_restarts` (3) restarts, created at least `container_minutes` (30) ago, and restarting now or started again within them | | reports only (a frozen project is the owner's call) |
-| `memory` | while free swap is under `swap_free_mb` (1024) or `swap_free_pct` (20%) of the swap, or the memory guard holds new leases: the `memory_top` (8) largest resident processes, each with its class or its lease | | reports only |
-
-A browser daemon (agent-browser, Chromium, Playwright, Puppeteer) is adopted by launchd by design and a live session may still drive it: it is spared while a session works in its checkout. **A live session's children** (an agent's background shells and tasks, a terminal's jobs, anything below a live session) are reported, never stopped, whatever their class: the session's owner stops them. The report lists them per session (`under live session pid N: K child(ren) reported only`, each with its age and command from its loop on) and `--json` marks them `"under_session": true`. One exception: a `removed` process whose working directory a sweep has seen gone for `session_removed_age` (6 h) is stopped, since the worktree it waits on will not come back. The time counts from the first sweep that saw that process (pid and start time) with its directory gone, kept in `sweep-state.json` beside the queue (a `--no-log` run records nothing), not from the process's start: a session whose worktree was cleaned an hour ago keeps its long-running children. Never when the session itself works in that removed checkout (its MCP and language servers), and a path into a removed directory in the command alone never qualifies.
-
-**Self-matching waits.** A `pgrep -f PATTERN` loop (`until ! pgrep -f "lane check X"; do sleep 20; done`) whose own command line matches PATTERN gets a note (report only; `--json`: `"self_matching"`, each with the pids it finds as `matched_by`). Linux's pgrep finds the loop itself, so it never ends; macOS's skips its own ancestors but finds every other process carrying the pattern, so two waits for the same thing keep each other alive (on 2026-11-04 the orchestrator's session held 40 such waits, up to 35 h old). Write `pgrep -f "[l]ane check X"`, which matches the lane but not the loop.
-
-**Never touched.** A process inside a live lease of this queue or an earlier one: in its holder's tree, or carrying the lease's `SLOTFATHER_LEASE` after it left the tree (the rule of `status --json --pid` and the lease guard), and every process whose tree holds one; such an item is listed as `spared` with the lease's label. Also never: other users' processes, processes with a terminal, sessions (claude, codex, tmux, screen, sshd, a CI runner), a tree with a session in it, system processes (`/System`, `/usr/libexec`, `/usr/sbin`, systemd), app bundles that are no dev kind, launchd jobs of the user (`launchctl list`, and `launchctl print gui/UID`, so that a sweep from ssh or cron sees the GUI LaunchAgents) and systemd services' main processes (`systemctl show -p MainPID`, `systemctl --user` for a unit under `user@UID.service`; when the manager cannot be asked, every process in the service is taken as the service's), on Linux processes in another mount namespace (a container run with the user's uid, whose paths mean nothing on the host), and the sweep and its ancestors.
-
-A lease's processes that left its tree are known by `SLOTFATHER_LEASE` in their environment, which macOS shows only for the user's processes that are not Apple platform binaries (`sf.carrying`): a `/bin/sh` or `zsh` double-forked out of a lease is not seen as the lease's, so it can be stopped when it is classed `orphan` or `removed`. Its holder's tree and every non-platform program (node, bun, python from Homebrew or uv) are spared as above.
-
-**Stopping** sends SIGTERM to the process and its descendants (the user's own), waits up to `grace` seconds (10), then SIGKILL to what is left; before each signal it checks that the pid still has the start time the sweep saw, so a reused pid is never signalled. A candidate inside another that stops goes with it. Results: `stopped` (TERM sufficed), `killed`, `gone` (ended or reused before the stop), `failed` (exit status 1). Without `--live` nothing is signalled; `--dev-servers` in a dry run shows what `--live --dev-servers` would stop. `--pid PID` (repeatable) limits the candidates to those processes; it also skips the containers.
-
-**Log.** Every sweep appends one JSON line to `sweep.jsonl` beside the queue (`{"v": 1, "at", "live", "dev_servers", "settings", "items": [...], "containers", "memory", "found", "stopped", "would_stop", "spared", "failed", "freed_mb"}`, each item with its class, kind, pid, start, age, command, working directory, tree, resident MB, reason and action), rotated at 4 MB like the history; a stop is also written to `queue.log` (`sweep stopped orphan pid ...`), so the dashboard's EVENTS show it. `--no-log` leaves a dry run out. `slotfather stats` adds a `sweeps` line (`--json`: `"sweeps"`): runs, live runs, processes stopped per class, failures, resident memory freed, and what the last run found. A second sweep while one runs exits at once (`sweep.lock`).
-
-**Settings** live in `sweep.json` beside the queue, like `capacity.json` and `order.json`: `slotfather sweep config` shows them, `slotfather sweep config orphan_age 3h grace 5 classes removed,orphan,container` saves (ages take seconds or `90s`, `30m`, `2h`, `1d`; `classes` is a comma list of the enabled classes, `none` for none), `config reset` restores the defaults. Keys the sweep does not know (a newer slotfather's) are ignored with a warning on stderr. A file that cannot be read or holds a bad value gives the defaults and says so, and then `--live` stops nothing: it reports what it would do, prints the error on stderr also under `--quiet`, and exits 3 (`--json`: `"live_refused": true`, `"settings_error"`); the next `config KEY VALUE` replaces the broken file. In another user's queue the sweep reads only: `--live` and settings changes are refused (run them as that user), and a dry run writes no log.
-
-**Hourly.** `slotfather sweep --plist [--live [--dev-servers]] [--interval S]` prints a launchd agent (`com.slotfather.sweep`, every 3600 s and at load, background priority) that runs `slotfather sweep --quiet` with the PATH (so `docker` is found) and `SLOTFATHER_DIR` of the shell that printed it; `--quiet` prints only stops and failures, into `sweep.out` beside the queue. Without `--live` the agent only logs dry runs. Install on the Mac (after `python3 install.py`):
-
-```sh
-slotfather sweep --plist --live > ~/Library/LaunchAgents/com.slotfather.sweep.plist
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.slotfather.sweep.plist
-launchctl kickstart gui/$(id -u)/com.slotfather.sweep     # once now; then `slotfather stats` shows it
-# to remove: launchctl bootout gui/$(id -u)/com.slotfather.sweep
-```
-
-**Linux** (VM110, as `runner`): working directories come from `/proc/PID/cwd` of processes in the sweep's own mount namespace (`(deleted)` or no links left mark a removed one), services from systemd, swap and the guard from `/proc` as for the queue; there is no launchd, so run it from cron or a systemd timer, e.g. `17 * * * * /usr/local/bin/slotfather sweep --quiet --live` in `runner`'s crontab. Without Docker (or without access to its socket) the container class says `not checked` and the rest runs; Docker is only asked, never started.
-
-## Ordering
-
-`grant()` runs in every client that looks at the queue (each waiter, every few seconds, and each release), and it starts the waiters `plan()` picks:
-
-1. Waiters are taken in arrival order, moved by their class (see Classes below); each that fits starts.
-2. A waiter that does not fit lets later requests that fit start first for `SLOTFATHER_OVERTAKE_WINDOW` seconds after it queued (600), as before.
-3. The first waiter past its window that does not fit is the **head**. Its start is reserved: the moment the held leases' expected ends free enough slots for it. A later request that fits starts before it only if three times (*safety*) its expected run ends by that moment and by the time the head will have waited its *limit* (2700 s), or if it takes only spare slots: those the head will not need at that moment even if the leases expected to run on past it are the largest ones (EASY backfill, made independent of which lease ends first). From the limit on nothing passes: the head holds everyone back as the window order did.
-4. A waiter whose client gives up first is no head (`run --wait`, the library's `acquire(wait=...)`, writes the moment on its entry as `until`): when it has not yet waited its limit and even the held leases' expected runs, taken without overrun, free its slots only after it gives up, it would leave without running, so the next waiter past its window that does not fit is the head instead and requests that fit pass it. It keeps its head while any held lease's run is unknown (it may end any moment) or slots are held in an earlier queue, and from its limit on, as before; it still starts if its slots come free before it gives up. A lease back in the queue after a yield keeps its head whatever its first wait said. Older clients read past `until` and hold back for such a waiter as before.
-
-Expected runs come from `history.jsonl` (its last megabyte, read only when a request fits behind a head and kept in `estimates.json` beside it until the history changes, so other processes, releases and `available` read the small file; a file another version wrote is worked out again): the median of the last 20 released runs of the closest earlier kind of request, trying in turn the same label and command kind (`stats`' kind: program and first argument, with a runner's `run` target, a shell's `-c` command and no `env VAR=…`), the same label family (the label up to its ticket or agent id: `lane`, `post-merge`) and kind, that family with a check list of about the same size (`verify.sh --checks` of 128 to 255 checks), the kind under any label, about that size under any label, the same label, and the same family. Reaped leases and requests that gave up are left out: a reaped lease's time runs to whenever a look noticed its holder had died (an orphan of a hung CI job kept its slot for 2800 s), and one that gave up never ran. This leans the estimates short for a kind whose runs are often killed after real work (a CI job cancelled or timed out late in its run): only its runs that finished count. A request like nothing before counts as running the *fallback* (3600 s), so with the default limit it passes a head only into spare slots. A held lease past its expected run is expected to run on for the *overrun* share (half) of what it has run so far, because a run that overran its kind tends to be a long one.
-
-`available` and `advise` answer for a request of unknown run (the fallback) unless given the command: `slotfather available --label L -- COMMAND...`, `slotfather advise [--max N] --label L -- COMMAND...`; `advise` reports the run it expected as `run_estimate` (`null`: unknown).
-
-**Settings.** `slotfather order` shows the order and its numbers; `slotfather order backfill|window`, `--safety X` (at least 1), `--limit S` (0: no limit), `--fallback S`, `--overrun X`, and the classes' `--interactive S`, `--batch S` and `--yield-after S` (see below) save them for every client in `order.json` beside the queue, like `slots` saves capacity, and `slotfather order reset` restores the defaults. They take effect at the next look at the queue, also while it is busy. Every client's look grants for the whole queue, so a client's environment can only tighten them: `SLOTFATHER_QUEUE=window`, or a higher `SLOTFATHER_BACKFILL_SAFETY` or `_FALLBACK`, a lower `_OVERRUN` or a lower nonzero `_LIMIT`, a lower `SLOTFATHER_PRIORITY_INTERACTIVE` or `_BATCH` (classes move requests less), a higher `SLOTFATHER_YIELD_AFTER` or `0` (nobody is asked); looser values are ignored. A saved file that cannot be read gives the window order. The class knobs are written to `order.json` only when they differ from their defaults: a slotfather before them refuses a file with keys it does not know and falls back to the window order, and `slotfather order` says so when it saves one.
-
-**When an estimate is wrong.** A request that runs longer than expected delays the head by the difference. The limit bounds it: no request passes a head after the limit, and none that is expected to end after it, so beyond the leases it waited for, the head waits only for the overrun of what passed it. An overestimate only keeps a request behind the head, as the window order did. The replays below with estimates halved, doubled and scattered (each one off by a random factor, e^N(0,1)) keep the longest wait of large requests at the current order's.
-
-**Mixed versions.** Queue entries, `history.jsonl` and every output (`status`, `available`, `advise`, `slots`, `history`, the lease variables and nesting) are unchanged, so old and new clients share one queue. An older client grants by its own order whenever it looks, so until every client is updated the queue admits what either order allows: a new client's look starts a short request an old one would hold back, and an old client's look keeps today's behaviour for what the new order would refuse. Straylight's vendored `tools/slotfather` predates the history, so its runs are not in the estimates until it uses this one.
-
-**Falling back.** `slotfather order window` restores the order before #643 for every client of this version at their next look, without classes or yield requests; `SLOTFATHER_QUEUE=window` does it for one client. `slotfather order --yield-after 0` keeps the classes and asks nobody to yield; `--interactive 0 --batch 0` keeps backfill without classes. Installing the previous version from a checkout of `bfa114b` (or `3e3a621`, backfill without classes) with `python3 install.py` also works; the queue and history need nothing.
-
-### Classes
-
-`run --class interactive|normal|batch` (the same as `--meta class=...`; the library's `acquire(meta={"class": ...})`) says how much someone waits for the request. **interactive** is work a person or agent waits on at once: a pre-push check, a single test. **batch** is work nobody waits on minute by minute: full gates, post-merge smokes, measurements (`-n all` gets no class of its own: say `--class batch`). Everything else, and every request that names no class, is **normal**.
-
-The class moves where a waiter stands in the order, by a fixed offset that is also its ageing: an interactive waiter queues as if it came *interactive* seconds (1800) earlier, a batch one as if it came *batch* seconds (1800) later. So a batch request is ahead of every normal request that comes more than 30 minutes after it and of every interactive one that comes more than an hour after it; nothing waits behind newer work for longer than that. The window order (`slotfather order window`) has no classes.
-
-Classes change only the order in which `plan()` takes the waiters; the window, the head and its reservation then work as before on that order, and the window and the limit count from when a request really queued. The head is the first waiter in class order that is past its window and does not fit; a request that ranks ahead of it is not passing it, so the limit alone no longer bounds a head's wait. The bound becomes: a head starts by its limit plus the overrun of what passed it, or, if later, once every request that ranks ahead of it has run, and only requests that came within the class offsets after it can rank ahead (for a batch head, normal ones within *batch* seconds, interactive ones within *batch + interactive*: an hour). So a batch `-n all` measurement under a steady stream of interactive checks waits up to an hour plus the run of the last check that came within that hour, plus its overrun; the replay test has that trace. An interactive request that does not fit becomes the head in its turn and gets the head's reservation. A lease that yielded and does not fit becomes a head too; its limit counts from when it yielded.
-
-### Polite preemption
-
-A holder that opted in (`run --yieldable`, `acquire(..., yieldable=True)`) can be asked to give its slots back for a while; it is never stopped, killed or signalled, and a holder that did not opt in is never asked. An **interactive** waiter asks when it has waited *yield_after* seconds (120), does not fit, and by the held leases' expected ends would not get its slots within another *yield_after*. It asks only yieldable holders of a lower class that have held their slots *yield_after* seconds since their last grant and have yielded fewer than two times; only as many as it needs (first those already asked, then batch before normal, then the one expected to run longest); and only when the queue would then start it, with the asked holders back among the waiters. Every look decides again: a request no longer needed (the waiter started or left) is withdrawn.
-
-The waiter's own client may ask later or never (`SLOTFATHER_YIELD_AFTER`); that rides on its queue entry as `yield_after`, and every client's look decides yield requests by the saved settings and those entries alone, so clients with different environments do not write and withdraw each other's requests. A holder asked to yield checks once more that the waiter would then start, and keeps its slots when it would not. The request is a file beside the holder's queue entry, `<entry>.yield`, whose path the lease's command gets in `SLOTFATHER_YIELD`; it holds `{"by", "label", "class", "count", "at"}` of the waiter that asked. `slotfather yield` from inside the lease (the library's `lease.yield_slots()`) yields if asked and the waiter still waits: the lease goes back to the queue (the same entry and holder, state `waiting`) just behind that waiter, pinned there whatever its class (it is half done and holds its memory), the queue grants at once so the waiter starts, and the command returns when the lease is granted again with its slots. Without a request it returns at once, saying `no yield requested`; it exits 0 either way. A nested `slotfather run` under a yielded lease waits until the lease is back. `status` shows `yieldable`, `asked-to-yield-for=LABEL` and `yielded=N`; `status --json` adds `class`, `yieldable`, `yields`, `yield_asked` (the request or `null`) and `position` (a waiter's place in the order the queue serves); the dashboard's LANE DETAILS panel shows the request; `queue.log` records asks, withdrawals and yields. The history line of a lease that yielded carries `yields` and `yielded` (seconds back in the queue); its wait and run count from its first grant, and `stats` leaves the yielded time out of cores per slot.
-
-#### What a client implements to be preemptible
-
-Straylight's `tools/verify.py` and `tools/heavy.py` and Sid-Kit's `scripts/heavy.sh` and `scripts/verify.mjs` are the intended clients; they are not changed here.
-
-1. **Opt in when taking the lease**: `slotfather run --yieldable --class batch ... -- COMMAND` (Sid-Kit's `heavy.sh`), or, for a client that holds its lease in-process (Straylight's `verify.py` through `tools/slot_lease.py`), `acquire(count, label, command, yieldable=True, meta={"class": "batch", ...})`.
-2. **Look for a request between steps**, whenever a step ends and none of the lease's own work runs: Straylight between checks, Sid-Kit between `verify.mjs` steps. The look is one `stat`: `[ -e "$SLOTFATHER_YIELD" ]` in a shell, `os.path.exists(os.environ.get("SLOTFATHER_YIELD", ""))` in Python, `lease.yield_requested()` in-process. With parallel jobs (`--jobs N`), stop starting new steps once a request is seen and let the running ones finish first.
-3. **Yield**: run `slotfather yield` (in-process `lease.yield_slots()`); it blocks while the lease is back in the queue. Then go on with the next step, with the same slots. Nothing has to be undone: a yield happens between steps. **If `slotfather yield` exits non-zero** (in-process: raises `SlotError`), the lease is gone (its holder was reaped, the queue removed) or the command did not run inside it: stop, and do not run further steps unleased. Exit 0 means the lease is held, whether or not it yielded.
-4. **Never** yield in the middle of a step or a measurement (a measurement does not opt in), never kill or signal a process to make room, and do not start new work under the lease while yielding.
-
-A client may ignore a request: the waiter then waits as it would have, and the request is withdrawn once it is no longer needed.
-
-**Mixed versions.** A slotfather before classes (`3e3a621` and earlier, Straylight's vendored copy) ignores them and the requests: its looks grant in arrival order, so until every client runs this version a waiter may start as either order allows. It lists a yielded lease as a waiter and may grant it again before the waiter it yielded to; `slotfather yield` then returns as usual. Since the yield itself grants at once, the waiter normally starts before an older client looks.
-
-### How the order was chosen
-
-`tools/replay.py` replays the recorded queue through each order in an event simulation: arrivals, ends, requests that gave up (after the wait they had), and a look every 10 s while anyone waits; the memory guard is ignored. `window` and `backfill` run the queue's own `plan()`. Requests whose slotfather wrote no history (Straylight's vendored copy) are taken from `queue.log` and placed by their queue sequence number; one that gave up and starts in a replay runs the median of its kind.
-
-Recorded queue of 2026-11-02 14:21 to 2026-11-03 01:47 UTC (232 requests on 6 slots: 189 from the history, 32 only in `queue.log`, 11 live). Replayed through the current order, the 189 recorded waits come out at 26.0 h against 27.7 h recorded, mean absolute error 50 s, 94% within 60 s; the misses are periods when the memory guard held the queue. Waits in seconds; *≥3* is requests of three or more slots; *idle* is slot-hours free while someone waited, *fit-idle* while a waiter would have fitted them.
-
-| Order | total h | mean | p90 | max | ≥3 mean | ≥3 max | idle | fit-idle |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| window 600 s (before #643) | 33.4 | 525 | 2143 | 4083 | 1670 | 3911 | 13.7 | 12.3 |
-| strict FIFO (window 0) | 53.9 | 847 | 3314 | 5043 | 1990 | 4871 | 14.1 | 13.7 |
-| **backfill (shipped)** | **26.5** | **417** | **1911** | **4083** | **1569** | **3911** | **12.4** | **9.2** |
-| backfill without the window | 37.9 | 595 | 2885 | 4160 | 1595 | 3988 | 12.7 | 9.8 |
-| backfill, safety 1.5 | 28.0 | 440 | 2080 | 4481 | 1626 | 4156 | 12.2 | 8.0 |
-| backfill without the limit | 25.1 | 395 | 1915 | 4570 | 1676 | 4438 | 12.2 | 8.0 |
-| backfill for `-n all` heads only | 26.7 | 419 | 1911 | 4083 | 1569 | 3911 | 12.4 | 9.3 |
-| short class (≤ 5 min jumps 30 min ahead) + window | 26.7 | 420 | 1886 | 4059 | 1527 | 3520 | 13.5 | 10.2 |
-| short class + backfill | 24.6 | 386 | 1882 | 4059 | 1461 | 3520 | 12.5 | 9.1 |
-| backfill knowing every run exactly | 22.3 | 351 | 1806 | 4029 | 1571 | 3857 | 12.7 | 9.0 |
-| backfill, estimates halved | 25.8 | 405 | 1911 | 4083 | 1569 | 3911 | 12.0 | 8.0 |
-| backfill, estimates doubled | 26.5 | 417 | 1911 | 4083 | 1569 | 3911 | 12.4 | 9.2 |
-| backfill, estimates scattered | 29.8 | 1560 | 3911 | 382 | 884 | 3911 | 136 | 852 | 3729 | 0 |
-| the same without the limit | 26.4 | 416 | 1845 | 6054 | 1657 | 6054 | 12.6 | 8.3 |
-
-Backfill cuts the total wait by a fifth and the time slots sat idle while a waiter fitted them by a quarter, without a longer wait for any large request. Requests that gave up waiting drop from 38 to 20. In the #643 incident (requests that arrived 00:48 to 01:40, behind a 6-slot request blocked by one overrunning 1-slot lane check) the total wait falls from 7.3 h to 4.2 h; with exact run times it would have been 2.4 h, so better estimates (more v2 history, Straylight on this version) are the next gain.
-
-Rejected:
-
-- **Backfill without the overtaking window** (pure EASY): every waiter that does not fit becomes a head at once and long requests stop passing it; worse than today (37.9 h).
-- **No limit** waits slightly less on this trace (25.1 h) but lets the wait of a large request grow with every misestimated run (6054 s with scattered estimates). A **lower safety factor** (1.5) admits more of those overruns (4481 s).
-- **Backfill only around `-n all`**: the same numbers as for every head, with a special case more.
-- **A short-job class with ageing** (a request expected under 5 minutes queues as if it came 30 minutes earlier): on top of backfill it saves a further 7% and the longest large wait, but it reorders the queue that `status` shows, and old clients ignore the class, so its effect would depend on which client looks. Worth revisiting once every client runs this version.
-- **Booking by measured use** (packing slots by the cores a kind uses) needs a day of v2 usage lines; leases used 0.4 cores per slot in #635's first sample, so capacity, not order, is the lever there.
-- A **per-command `--estimate`** flag: callers do not know their run time better than the history.
-
-#### How the classes were chosen
-
-The same replay, with a class for each recorded request from its label and command (`classify()`: interactive for pre-push checks, one test file or name pattern, a single tool test; batch for gates of 50 or more checks, post-merge smokes, Sid-Kit's `verify.mjs`, old-client lane gates, `-n all` and labels that say measure, baseline, profile, stress, repro or probe; normal otherwise) and gates of Straylight and Sid-Kit taken as yieldable. An asked holder yields at the end of its step, a uniform time up to 300 s. Queue of 2026-11-02 14:21 to 2026-11-03 03:30 UTC (328 requests on 6 slots); the current order replays the recorded waits within 60 s for 89% of them. Waits in seconds; *batch max* includes the time a batch request yielded.
-
-| Order | total h | p90 | ≥3 max | interactive mean | p90 | max | normal mean | batch mean | batch max | yields |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| window (before #643) | 40.0 | 1881 | 3911 | 631 | 2132 | 3911 | 244 | 944 | 3729 | 0 |
-| backfill (`3e3a621`) | 30.5 | 1560 | 3911 | 382 | 884 | 3911 | 147 | 861 | 3729 | 0 |
-| **classes 1800/1800 + yields after 120 s (shipped)** | **26.3** | **1324** | **3880** | **157** | **358** | **1895** | **93** | **926** | **3880** | **6** |
-| classes only | 26.9 | 1324 | 3880 | 186 | 596 | 1895 | 98 | 926 | 3880 | 0 |
-| yields only | 29.9 | 1560 | 3911 | 361 | 884 | 3911 | 142 | 861 | 3729 | 5 |
-| interactive ahead only | 33.1 | 1597 | 3704 | 275 | 864 | 2386 | 184 | 978 | 3849 | 0 |
-| batch behind only | 28.3 | 1464 | 3880 | 269 | 828 | 1895 | 99 | 932 | 3880 | 0 |
-| offsets 600 s | 30.1 | 1597 | 3957 | 236 | 884 | 1895 | 133 | 967 | 3957 | 6 |
-| batch 3600 s behind | 27.5 | 1378 | 4829 | 159 | 354 | 1895 | 79 | 1008 | 4829 | 6 |
-| normal waiters ask too | 25.8 | 1192 | 3880 | 154 | 358 | 1895 | 81 | 926 | 3880 | 9 |
-| steps up to 600 s | 26.6 | 1324 | 3880 | 167 | 495 | 1895 | 97 | 926 | 3880 | 5 |
-| shipped, estimates scattered | 27.5 | 1373 | 4428 | 171 | 612 | 1895 | 97 | 965 | 4428 | 5 |
-| backfill, estimates scattered | 29.8 | 1560 | 3911 | 382 | 884 | 3911 | 136 | 852 | 3729 | 0 |
-| a short class by estimate (≤ 5 min, 30 min ahead) | 28.8 | 1507 | 3520 | 348 | 884 | 3247 | 112 | 876 | 3770 | 0 |
-
-Classes with yields cut the total wait by 14% (30.5 to 26.3 h) and interactive waits by more than half (mean 382 to 157 s, p90 884 to 358 s, longest 3911 to 1895 s); normal work waits less too. Batch work pays for it, inside the hour the offsets bound: its mean wait grows by 8% (861 to 926 s) and its longest by 4% (3729 to 3880 s), by 19% with scattered estimates. Most of the gain comes from holding batch work back; yields add little to the total but halve what classes leave of the interactive p90 (596 to 358 s), at 6 yields in 13 hours that gave back 0.07 slot-hours. In the #643 incident window the total wait stays at 4.5 h: there the head was a measurement that every class waits behind (in the fixture copied during the incident, with the runs then still going estimated, it falls from 4.6 to 3.2 h).
-
-Rejected:
-
-- **Interactive ahead only** waits longer than backfill alone (33.0 h): checks that jump ahead of gates' heads delay those heads and everyone behind them. **Smaller offsets** (600 s) gain nothing (30.0 h); **batch 3600 s behind** lets the longest batch wait grow to 4829 s and waits longer in total (27.5 h).
-- **Normal waiters asking too**: 0.5 h less in total for half again as many yields, of gates that nobody waits on at a terminal.
-- **A short class by estimate** (no client change needed; the rejected row of the backfill table): 28.8 h and an interactive mean twice the shipped one; a kind's first run is classed wrongly, and old clients ignore it as they ignore classes.
-- **Shrinking instead of yielding** (`yield --keep N`): the replay cannot tell how long a gate runs on fewer slots (leases used about 0.4 cores per slot in #635's sample, so a shrink might cost nothing or the gate's whole parallelism), so it is not offered.
-- **A signal to the holder** (SIGUSR1, SIGTERM) instead of a file: a holder that installed no handler dies of it; a file asks only clients that look. **Stopping** a holder (SIGSTOP) or killing it: never.
-- **Batch and normal waiters asking**, and asks for `-n all`: preemption is for work someone is waiting on.
-
-#### Waiters that give up, and the safety factor (2026-11-03)
-
-The queue of 2026-11-02 14:21 to 2026-11-03 14:14 UTC (667 requests on 6 slots: 630 from the history), and the part of it from 01:41, when backfill had been installed (no client sent a class, so the rows without classes are what ran). Twice that day a Straylight lane's `-n all --wait 1800` rerun waited behind a 1-slot gate that ran on for nearly two hours; as the head it held fitting smokes back for twenty minutes each, then gave up without running.
-
-The history before `until` does not say which requests had a wait, and a replay that gives one only to those that gave up never shows a head given up on that would have started. So `--families` gives every request of a label family that ever gave up that family's longest give-up as its wait (unless it waited longer and so had none), and it leaves then if not granted. Totals in hours, the longest wait of a request of three or more slots in seconds; *scattered* is the mean (and range) over six random errors per request (e^N(0,1)); halved and doubled scale every estimate.
-
-| Order (`--families`) | from 01:41: exact | scattered | halved | doubled | over the day: exact | scattered | halved | doubled | ≥3 max, halved |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `1708378` (installed) | 17.4 | 18.3 (16.8–20.9) | 20.9 | 18.3 | 44.2 | 44.1 (42.8–46.3) | 47.2 | 45.1 | 3911 |
-| reaped runs left out | 17.4 | 18.3 (16.8–20.9) | 20.9 | 18.3 | 44.2 | 44.1 (42.8–46.3) | 47.2 | 45.1 | 3911 |
-| **and a head that gives up first holds nobody (shipped)** | **16.7** | **17.8 (15.8–20.2)** | **20.9** | **17.1** | **43.5** | **43.5 (41.1–45.6)** | **47.2** | **43.9** | **3911** |
-| the same, safety 2 | 18.2 | 16.6 (15.1–19.5) | 17.4 | 16.3 | 43.9 | 41.1 (39.7–42.9) | 41.7 | 42.5 | 4187 |
-
-The Mac's history holds no reaped run with a time, so leaving them out changes nothing here. A head that gives up first saves 2–4% and never adds a give-up (8 from 01:41 and 29 over the day in every row). Safety 2 waits less whenever the estimates are off (5–12%), more with the medians as they were (18.2 against 16.7 h from 01:41), and with estimates halved lets the longest wait of a large request grow (4187 against 3911 s). It is not saved as the default; `slotfather order --safety 2` sets it.
-
-Re-run after more history: `python3 tools/replay.py` (or `--since/--until` for a period, `--families`, `--json`).
-
-## Linux
-
-The same script runs on Linux; what differs (#653):
-
-- **The queue's cgroup.** Leases often share a cgroup v2 limit rather than the machine: on VM110 the nine runner services (`MemoryMax=6G` each) sit in `ci-runners.slice` (`MemoryMax=10G`). The queue's cgroup is `SLOTFATHER_CGROUP` (a path such as `/ci.slice/ci-runners.slice`, under `/sys/fs/cgroup`), else the one `install.py --cgroup` wrote in, else the one `slots memory|lower` saved in `capacity.json`, else the caller's outermost cgroup with a `memory.max` (from `/proc/self/cgroup`: the slice, not the one service; without a named cgroup, a client in no limited cgroup, such as a root shell, sees the machine instead, so name it). Its limit, the smallest `memory.max` on its path from the root, is the memory budget (`MemTotal` is not, there), its `memory.pressure` replaces `/proc/pressure/memory`, and its headroom, `memory.max` less the working set (`memory.current` less `inactive_file`, the page cache it can drop at once), is checked like `MemAvailable`. A client outside it (an admin's shell, a Docker container, which runs outside the slice) uses the named or saved cgroup, so it counts the same slots. `slots memory|lower` saved without any cgroup with a limit says so on stderr: its count then follows each client's `MemTotal`. On cgroup v1 (no `0::` line in `/proc/self/cgroup`) and on hybrid hierarchies whose memory controller is on v1 (the unified directory has no `memory.max`), and for cgroups without a limit, nothing of the cgroup is read: the budget is `MemTotal`, pressure `/proc/pressure/memory`, headroom `MemAvailable`.
-- **Memory guard.** Instead of macOS's pressure level, a new lease waits, while another runs, when `MemAvailable` in `/proc/meminfo` is under `SLOTFATHER_MIN_AVAILABLE_MB` (default 1024; kernels before 3.14 without `MemAvailable`: `MemFree + Cached + Buffers`; it stays a guard of its own, since a VM's balloon can take the machine below the cgroup's limit), when the queue's cgroup has less than that left under its limit, when PSI (the cgroup's, else `/proc/pressure/memory`) says tasks stalled on memory for at least `SLOTFATHER_MAX_PSI_SOME` percent of the last 10 s (`some avg10`, default 10) or all of them for `SLOTFATHER_MAX_PSI_FULL` (`full avg10`, default 5), or, where swap is on (zram included), when `SwapFree` is under the swap floor. A kernel without PSI (built without it, `psi=0`, or a container that hides it) leaves the available-memory and swap checks. As on macOS the guard decides only when a lease starts: it cannot stop one that grows after it started; capacity by memory and per-service `MemoryMax` do that.
-- **Processes.** procps-ng takes the same `ps -axo` flags; ps runs in the C locale so every client writes a holder's start time alike. A process's own CPU comes from `/proc/PID/stat` (clock ticks; procps' `time` counts whole seconds), its environment, for the lease it carries, from `/proc/PID/environ` (the user's own processes; all of them for root). `status --json --pid` and the usage of a lease's tree work as on macOS, with init in launchd's place: an orphan reparented to pid 1 is followed, and its CPU counted, as one adopted by launchd. Gap: an orphan adopted by another child subreaper (`systemd --user`, a container init that is not pid 1) and born and orphaned between two looks is not seen; one seen in the tree before is still followed. `ru_maxrss` is in kB there, bytes on macOS.
-- **Machine samples** carry `memory_available_mb`, `psi_some` and `psi_full` (and `cgroup`, `cgroup_max_mb`, `cgroup_available_mb` for the queue's cgroup), and `memory_free_pct` is `MemAvailable`'s share; `pressure` is `null`. `stats` counts PSI at the guard's limits as memory pressure above normal and reports the least available memory. The dashboard's memory line shows available memory and PSI.
-- **Yield, classes, backfill, metadata** use only the queue's files and work unchanged. `run` with `SLOTFATHER_POLICY=background` uses `nice` (no `taskpolicy`).
-
-## Configuration
-
-`-n` selects how many slots one command requests; it does not change the total capacity:
-
-```sh
-slotfather run -n 3 -- make build
-```
-
-Use the shared capacity command:
-
-```sh
-slotfather slots             # show effective capacity and saved/automatic mode
-slotfather slots 6           # save six slots for every future client
-slotfather slots memory 5    # one slot per 5 GiB of memory
-slotfather slots lower 4     # the lower of the CPU budget and one slot per 4 GiB
-slotfather slots reset       # restore automatic capacity
-```
-
-A saved value persists across shells and process restarts in `capacity.json` under the shared state directory. No shell export or per-process total override is needed.
-
-**Capacity modes** (#653). The CPU budget is `max(1, cores // 3)`; the memory budget for *G* GiB per slot is `max(1, floor(round(memory_GiB) / G))`, the memory counted in whole GiB (Linux's `MemTotal` is a little under the size a VM was given: 11.7 for 12). On Linux the memory is the limit of the queue's cgroup where it has one (see Linux), else `MemTotal`, which shrinks when a VM's balloon takes memory. A capacity that shrinks under waiters never strands them: a request larger than the capacity takes every slot when it starts (its holder's `SLOTFATHER_COUNT` and the history say how many), and `-n all` takes the capacity at its grant, also when it grew. The automatic default is the lower of the CPU budget and the memory budget at 4 GiB per slot: four slots on the 12-core, 32 GiB Mac (CPU-bound), two on a 6-core, 12 GiB VM, three on a 16-core machine with 12 GiB (memory-bound). Heavy leases on the Mac peaked at 2–3 GiB of summed resident memory per slot in the median and 6 GiB at most (the history of 2026-11-03; summed RSS counts shared pages once per process, so it overstates). `slots memory G` uses the memory budget alone, for a host where running out of memory kills jobs while too many runnable threads only slow them, such as a CI runner without swap; `slots lower G` the lower of both budgets. Both follow the machine: they save the mode, *G* and, on Linux, the saver's limited cgroup (`"cgroup"`), and every client works the count out again from that cgroup wherever it runs, so a VM given more memory gets more slots without a new save. They also save the count they give at the time as `slots`, which slotfather 0af7546 and older read alone (an older client keeps that count after the machine changes). Where the memory cannot be read the saved count holds (the automatic default: the CPU budget). `status`, `available`, `advise` and `run -n all` use the resulting count; `advise` adds `capacity_mode`, `gib_per_slot`, `memory_gib` and `memory_short` (why new leases would wait for memory now, or `null`; the job count does not shrink for it).
-
-**VM110** (#653: 6 vCPU, 11.7 GiB, no swap, about 1 GiB in use with nine idle runner services and the guest agent; the nine services in `ci-runners.slice` with `MemoryMax=10G`, each with `MemoryMax=6G`): `slotfather slots memory 5` with the command installed `--cgroup /ci.slice/ci-runners.slice`: two slots of the slice's 10 GiB, whatever the balloon does to `MemTotal` (the guard still reads `MemAvailable`). The Sid-Kit job that ran it out of memory had three headless Chromium renderers of 0.5–1.4 GiB each, about 5 GiB with the browser and Bun processes; on the Mac a 2-slot Sid-Kit browser run peaked at 4.3–9.2 GiB and 1-slot Vitest runs at 3.6–6.2 GiB. One heavy job is therefore about 5 GiB and two just fit: with two slots, Sid-Kit's and Data Grid's 2- and 3-slot browser checks and verifies (`heavy.sh 2`, `3`) run alone and two 1-slot jobs share the VM, with the Linux guard (under 1 GiB available, or memory stalls) holding a third start and per-service `MemoryMax` as the hard stop. The automatic default also gives two there, but by the CPU budget (`6 // 3`); `memory 5` keeps the count tied to memory when vCPUs are added and gives three at 16 GiB. Raise it (`memory 4`, three slots) only once runs under the queue show leases peaking well under 4 GiB per slot (`slotfather stats` on the VM).
-
-Capacity changes and reset are refused while any live holder or waiter exists, including a live entry in a migration queue. Let the queue drain and retry; existing work is never cancelled. Publication is atomic and uses the same lock as queue admission. `run -n all` resolves capacity when it joins the queue and again when it is granted (the entry's `all`), so it keeps its exclusive meaning across a settings change or a memory capacity that moved.
-
-| Variable | Purpose |
+| Widget | Shows |
 | --- | --- |
-| `SLOTFATHER_DIR` | Shared queue directory. |
-| `SLOTFATHER_CORES` | Core-count override for capacity and advice. |
-| `SLOTFATHER_MEMORY_GIB` | Memory-size override, in GiB, for the memory budget. |
-| `SLOTFATHER_POLICY` | `normal` (default), `background` (low QoS), or `bypass` (runs without a lease). |
-| `SLOTFATHER_MIN_FREE_SWAP_MB` | Free-swap floor; default 512 MB. Ignored while swap is off. |
-| `SLOTFATHER_MIN_AVAILABLE_MB` | Linux: `MemAvailable` floor; default 1024 MB. |
-| `SLOTFATHER_CGROUP` | Linux: the queue's cgroup v2 path (`/ci.slice/ci-runners.slice`); default the one `install.py --cgroup` wrote in, else the one saved with the capacity, else the caller's outermost limited cgroup. |
-| `SLOTFATHER_MAX_PSI_SOME`, `_FULL` | Linux: PSI memory `avg10` limits in percent; defaults 10 and 5; `0` turns one off. |
-| `SLOTFATHER_LEGACY_DIRS` | Colon-separated old queues; defaults to `~/.local/state/straylight-verification/slots`. Empty disables migration reads. |
-| `SLOTFATHER_POLL` | How often a waiter checks its own entry, and its first interval between full looks at the queue, in seconds; default 2. |
-| `SLOTFATHER_POLL_MAX` | Longest interval between a waiter's full looks (each runs `ps` under the queue lock); default 10. The interval grows by half while the reason to wait stays the same. A release grants waiters at once, so the backoff only delays reaping a crashed holder and recovery from memory pressure. |
-| `SLOTFATHER_OVERTAKE_WINDOW` | Seconds after it queued during which a waiter that does not fit lets later requests that fit start first; default 600. With `window` and `0`, requests are served strictly in arrival order. |
-| `SLOTFATHER_QUEUE` | `window`: this client grants by the order before #643 whatever `slotfather order` saved (see Ordering). |
-| `SLOTFATHER_BACKFILL_SAFETY`, `_LIMIT`, `_FALLBACK`, `_OVERRUN` | Tighten this client's backfill below what `slotfather order` saved (higher safety or fallback, lower overrun or nonzero limit); looser values are ignored. |
-| `SLOTFATHER_PRIORITY_INTERACTIVE`, `_BATCH` | Move this client's classes less than `slotfather order` saved (seconds; lower values only; 0: not at all). |
-| `SLOTFATHER_YIELD_AFTER` | Ask holders to yield later than saved (seconds; higher values only), or `0`: this client's looks ask nobody. |
-| `SLOTFATHER_SAMPLE_MAX` | Longest interval, in seconds, between a holder's looks at its command's process tree; default 10. |
-| `SLOTFATHER_MACHINE_EVERY` | Seconds between machine samples while leases run; default 15. |
-| `SLOTFATHER_LOADAVG` | Advice test/diagnostic override: one number or `load1 load5 load15`. |
-| `SLOTFATHER_MEMORY_FILE` | Memory test seam: file containing `free_swap_MB pressure_level`; it replaces both the macOS and the Linux signals. |
-| `SLOTFATHER_CGROUP_ROOT` | Linux test seam: the cgroup v2 mount, default `/sys/fs/cgroup`. |
-| `SLOTFATHER_PROC` | Linux test seam: a directory read as `/proc` for `meminfo`, `pressure/memory` and `PID/environ` (and the Linux paths then run on any host). |
+| SLOTS | Occupied and free capacity; colours identify active tasks. |
+| LANES | Active tasks, then waiting requests. Select either to see details. |
+| LANE DETAILS | Command, status, resource use and the busiest processes. |
+| MACHINE | Admission status, load, memory, swap and occupied-slot history. |
+| EVENTS | Recent grants, releases and abandoned requests. |
 
-A command receives `SLOTFATHER_LEASE` and `SLOTFATHER_COUNT` for its existing lease, and a yieldable lease's command `SLOTFATHER_YIELD`, the path of its yield request (see Polite preemption). Do not fabricate these values to skip queue admission.
+Use **↑/↓** or click to select, the mouse wheel to scroll a table, **m** to
+freeze updates for native text selection, **?** for help and **q** to quit.
 
-## Verify
+```sh
+slotfather status                  # a plain-text queue summary
+slotfather status --json --pid 4242 # find a process’s lease
+slotfather dashboard --once         # a dashboard snapshot for scripts
+```
+
+[Reading the dashboard](docs/dashboard.md) ·
+[JSON status and metadata](docs/api.md)
+
+## Inspect usage and leftover processes
+
+```sh
+slotfather history 20
+slotfather stats --since 24h --by kind
+slotfather available
+slotfather advise --max 4
+slotfather sweep
+```
+
+`available` reports slots a new request can get now. `advise` suggests a worker
+budget from observed load; it does not reserve capacity. `sweep` is a dry run by
+default. Only `sweep --live` stops eligible leftover processes.
+
+[Statistics](docs/statistics.md) · [Sweep](docs/sweep.md) ·
+[Linux and cgroups](docs/linux.md)
+
+## Development
 
 ```sh
 slotfather run -n 1 -- python3 -m unittest discover -s tests -v
 ```
 
-Installer tests use isolated home directories and real live-process entries to check refusal, preservation, file guards, and repeated installation. Queue tests observe commands and queue admission using independent temporary state, controlled release files, and real child processes. They cover FIFO fairness, the overtaking window, backfill past a head (through real processes, and with a client of the previous version on the same queue), the run history and its rotation, exclusive requests, nesting, stale leases, memory guard, CLI outcomes, legacy migration, load advice, and persistent shared capacity changes. Class tests decide `plan()` and `yield_asks()` on fixed queues (offsets and ageing, a yielded lease behind its asker, who asks whom and when not), check the class settings and what a client's environment may change, run the whole protocol through real processes (a yieldable gate yields between steps and resumes, a holder that did not opt in is never asked, a request is shown and withdrawn when its waiter leaves), and run the previous version beside it; the replay test checks that classes with yields wait less on the recorded queue without holding batch work back beyond the offsets, and that a gate yields to a pre-push check and resumes in a small trace. Metadata tests run requests with `--meta` through status, `status --json` (lease, process group, tree, `--pid`), the history, a nested run, the dashboard, `stats --by meta.KEY`, and the previous version on the same queue. Linux tests (#653) parse `/proc/meminfo` and `/proc/pressure/memory` fixtures of a 12 GiB VM (`tests/fixtures/proc`: calm, little available memory, stalled, thrashing, zram swap nearly full, no PSI, a kernel without `MemAvailable`, a process in a runner service) and VM110's runner cgroups (`tests/fixtures/cgroup`: the slice calm, full, full of page cache, stalled), find the shared slice and size and guard by it, also from a client outside it and on a ballooned VM, take the smallest limit on a cgroup's path, run requests larger than a capacity that shrank under them (window and backfill) and `-n all` at a capacity that grew, refuse changes to another user's queue and read it without creating files (as root in the container, against a queue owned by nobody), decide the guard from them, run it through real processes with a `/proc` the test switches between fixtures, check the capacity math (whole-GiB rounding, the automatic lower budget, saved modes, unknown memory, invalid files), the `slots memory|lower` commands with `available` and `advise`, an older client reading the saved count, the lease in `/proc/PID/environ`, `/proc/PID/stat` CPU, and on Linux the real procps tables. Installer tests also install pinned to a user's queue with `--bin` and `--cgroup`, hand root-owned paths to the user, and, as root in a disposable container with `SLOTFATHER_TEST_USERADD=1`, install for a new user who then runs a lease. To run the suite on Linux from a Mac (a worktree also needs its main checkout's `.git` at the same path):
+The animation uses the real dashboard and input handling, a historical queue,
+and separately recorded workload metrics. It is an illustrative demo, not a
+recording of those historical processes. [Regenerate media](docs/media.md).
 
-```sh
-slotfather run -n 1 -- docker run --rm --user 1000:1000 -e HOME=/tmp/h -v "$PWD:$PWD:ro" -w "$PWD/tests" python:3.12 \
-  sh -c 'mkdir -p $HOME && git config --global --add safe.directory "*" && python3 -m unittest discover -s .'
-```
-
-Sweep tests (#662) decide the classes on fake process tables (with the review's cases: lists and output paths in commands, unreadable directories, a fake `/proc` with another mount namespace and `(deleted)`, user and GUI-domain services, the runner's script, settings that fail closed, the state of first sightings, and `stop()` when a pid's start time changes before SIGTERM or between it and SIGKILL) (the incident's commands and their kinds, removed directories and paths, orphans past and under their age, every exemption, leases by tree and by environment, sessions above and beside dev servers, browser daemons in a session's checkout, nested candidates, enabled classes and `--pid`), containers in a restart loop and the memory report from fake facts, the text report, settings, the launchd agent and the stats line; and through real processes the tests start themselves, always limited with `--pid`: an orphan by a double fork reported and then stopped, a process in a removed directory stopped and one that ignores SIGTERM killed, a leased process, its holder and a leased orphan spared, and a dry run over the whole machine that signals nothing; children of a stand-in live session (python run as `claude`) reported until their working directory has been gone `session_removed_age`, then the one in a removed directory stopped and the one that only names a removed path kept; and two waits for one pattern that never end, each noted with the other. Usage tests account fake process tables (reaped children, orphans that outlive their parent, launchd children carrying the lease, reused pids, memory), measure a real tree with a burning orphan under `run`, and check `stats` over old and new history lines and machine samples. Order tests decide `plan()` on fixed queues (window, reservation, fallback, overrun, limit, spare slots when leases end out of order, a head whose client gives up first), check the estimates (reaped and abandoned leases left out), their cache and command kinds, the saved settings and what a client's environment may change, and `available`/`advise` for a given command; the replay test runs the recorded queue of 2026-11-02/03 in `tests/fixtures/replay` (commands cut to their kind) and checks that the current order reproduces the recorded waits and that backfill waits less without a longer wait for large requests, also with scattered estimates; a small trace checks that a long request does not take a slot the head needs when leases end out of order.
+[Verification](docs/testing.md) · [Scheduler experiments](docs/scheduler-experiments.md)
