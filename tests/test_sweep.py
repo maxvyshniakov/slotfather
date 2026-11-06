@@ -56,7 +56,9 @@ class KindTests(unittest.TestCase):
         python = "/Library/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python"
         cases = {
             f"{python} /work/verify.py": ("runner", None),
+            f"{python} /work/slotfather run -n 1 -- sleep 120": ("runner", None),
             f"{python} /work/server.py": (None, None),
+            f"{python} /work/server.py run": (None, None),
             "node /w/repo-kit-wt-656/src/cli.mjs verify": ("runner", None),
             "tail -n +1 -f /Users/m/.claude/tasks/abc.output": ("tail-f", None),
             "tail -F /var/log/x": ("tail-f", None),

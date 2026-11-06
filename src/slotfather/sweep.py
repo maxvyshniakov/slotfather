@@ -147,7 +147,11 @@ def orphan_kind(cmd: str) -> str | None:
         return "tail-f"
     base = re.sub(r"[\d.]+$", "", base) or base
     if base in RUNNERS:
-        for n, word in enumerate(runner_script(parts)):
+        script = runner_script(parts)
+        if base in ("python", "Python") and len(script) == 2 and os.path.basename(script[0]) == "slotfather" \
+                and script[1] == "run":
+            return "runner"
+        for n, word in enumerate(script):
             if word == "--test":
                 return "runner"
             if base in SHELLS and ("/" not in word and "." not in word or n):
