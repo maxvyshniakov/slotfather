@@ -417,7 +417,8 @@ class DetailLayoutTests(unittest.TestCase):
         model: dict[str, Any] = dict(holders=[], waiters=[item], free=4, used=2, slots=6,
                                     memory_block=None, order="window", start=None, limit=0)
         canvas = tool.Canvas(90, 24)
-        tool.draw_detail(canvas, 0, 0, 24, 90, model, 0, None, moment)
+        with mock.patch.object(tool, "today", return_value=moment.date()):
+            tool.draw_detail(canvas, 0, 0, 24, 90, model, 0, None, moment)
         lines = canvas.render(False).splitlines()
         for label, value in (("label", "first"), ("status", "waiting"), ("queued", "10:00:00"),
                              ("free", "4 of 6 slots"), ("pass until", "10:10:00"),
