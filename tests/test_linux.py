@@ -107,7 +107,7 @@ class LinuxGuardTests(unittest.TestCase):
                 with mock.patch.object(sf_platform, "sysctl", side_effect=lambda name: {
                         "vm.swapusage": "total = 2048.00M  used = 1900.00M  free = 148.00M  (encrypted)",
                         "kern.memorystatus_vm_pressure_level": "1"}.get(name)):
-                    self.assertEqual("free swap 148 MB is under 512 MB", sf_platform.memory_short())
+                    self.assertIsNone(sf_platform.memory_short(), "normal macOS pressure permits swap growth")
 
     def test_machine_samples_carry_available_memory_and_psi(self):
         directory = pathlib.Path(tempfile.mkdtemp(prefix="slotfather-machine-"))

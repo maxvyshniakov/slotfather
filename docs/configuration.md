@@ -30,7 +30,7 @@ Capacity changes and reset are refused while any live holder or waiter exists, i
 | `SLOTFATHER_CORES` | Core-count override for capacity and advice. |
 | `SLOTFATHER_MEMORY_GIB` | Memory-size override, in GiB, for the memory budget. |
 | `SLOTFATHER_POLICY` | `normal` (default), `background` (low QoS), or `bypass` (runs without a lease). |
-| `SLOTFATHER_MIN_FREE_SWAP_MB` | Free-swap floor; default 512 MB. Ignored while swap is off. |
+| `SLOTFATHER_MIN_FREE_SWAP_MB` | Free-swap floor; default 512 MB. Linux: ignored while swap is off. macOS: fallback only when the kernel pressure level is unavailable; normal pressure permits allocated swap to grow, warning/critical pressure blocks new grants regardless of free swap. |
 | `SLOTFATHER_MIN_AVAILABLE_MB` | Linux: `MemAvailable` floor; default 1024 MB. |
 | `SLOTFATHER_CGROUP` | Linux: the queue's cgroup v2 path (`/ci.slice/ci-runners.slice`); default the one `install.py --cgroup` wrote in, else the one saved with the capacity, else the caller's outermost limited cgroup. |
 | `SLOTFATHER_MAX_PSI_SOME`, `_FULL` | Linux: PSI memory `avg10` limits in percent; defaults 10 and 5; `0` turns one off. |

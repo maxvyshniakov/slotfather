@@ -80,7 +80,8 @@ def alive(entry: dict, table: dict) -> bool:
 
 
 def memory_short() -> str | None:
-    """Why new leases should wait for memory, or None. macOS: free swap and the kernel's memory-pressure level;
+    """Why new leases should wait for memory, or None. macOS: the kernel's memory-pressure level, with a
+    free-swap fallback when pressure is unavailable (allocated swap can grow while pressure is normal);
     Linux: free swap, MemAvailable and PSI (linux_short())."""
     seam = _config.setting("MEMORY_FILE")  # test seam: "<free swap MB> <pressure level>"
     if seam:
@@ -92,6 +93,11 @@ def memory_short() -> str | None:
         return linux_short(linux_memory())
     else:
         free, level = swap_free_mb(), pressure_level()
+    if not seam and sys.platform == "darwin" and level is not None:
+        if level > _config.MAX_PRESSURE_LEVEL:
+            return f"memory pressure level {level:.0f} (warning or critical)"
+        if level == 1:  # vm.swapusage is the current allocation, not macOS's expandable swap limit.
+            return None
     floor = _config.number_setting("MIN_FREE_SWAP_MB", _config.MIN_FREE_SWAP_MB)
     if free is not None and free < floor:
         return f"free swap {free:.0f} MB is under {floor:.0f} MB"
