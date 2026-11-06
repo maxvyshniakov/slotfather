@@ -177,7 +177,7 @@ class DashboardTests(SlotCase):
             while time.monotonic() < deadline:
                 if select.select([master], [], [], .1)[0]:
                     try:
-                        screen.extend(os.read(master, 65536))
+                        screen.extend(os.read(master, 1024))  # PTYs can split a frame before the request table.
                     except OSError:
                         # Linux reports PTY EIO just before waitpid observes the exit.
                         if process.poll() is None:
@@ -200,7 +200,9 @@ class DashboardTests(SlotCase):
         self.started("click-target")
         screen.clear()
         os.write(master, b"r")
-        read_until(lambda text: re.search(r"label\s+click-target",text) and re.search(r"status\s+running",text))
+        # A split PTY read can contain the details before the selected request row.
+        read_until(lambda text: re.search(r"label\s+click-target",text) and re.search(r"status\s+running",text)
+                   and "▶click-target" in text)
         selected = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", screen.decode("utf-8", "replace"))
         self.assertIn("▶click-target", selected,
                       "the same lease stays selected after moving into the active group")

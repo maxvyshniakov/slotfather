@@ -53,7 +53,10 @@ SHELL = proc(50, 1, "/usr/bin/some-daemon")  # a live parent that is no session
 
 class KindTests(unittest.TestCase):
     def test_commands_of_the_incident_and_the_kinds_they_get(self):
+        python = "/Library/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python"
         cases = {
+            f"{python} /work/verify.py": ("runner", None),
+            f"{python} /work/server.py": (None, None),
             "node /w/repo-kit-wt-656/src/cli.mjs verify": ("runner", None),
             "tail -n +1 -f /Users/m/.claude/tasks/abc.output": ("tail-f", None),
             "tail -F /var/log/x": ("tail-f", None),
@@ -150,6 +153,8 @@ class PlanTests(unittest.TestCase):
                  proc(103, 1, "node /w/node_modules/vitest/vitest.mjs run", uid=0),
                  proc(104, 1, "/usr/libexec/trustd"),
                  proc(105, 1, "/Applications/Notes.app/Contents/MacOS/Notes"),
+                 proc(106, 1, "/Library/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/"
+                              "Contents/MacOS/Python /work/server.py"),
                  proc(999, 1, "python3 slotfather-sweep")]
         s = snap(procs, cwds={p.pid: sweep.Cwd(gone, True) for p in procs}, managed={102}, gone=(gone,))
         self.assertEqual({}, plan(s))

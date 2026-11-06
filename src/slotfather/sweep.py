@@ -104,7 +104,7 @@ ORPHAN_KINDS = (
     ("esbuild", re.compile(r"(^|/)esbuild\s.*--service")),
 )
 SHELLS = ("sh", "bash", "zsh", "dash")
-RUNNERS = ("node", "bun", "deno", "npm", "npx", "pnpm", "yarn", "tsx", "python", "uv", "make") + SHELLS
+RUNNERS = ("node", "bun", "deno", "npm", "npx", "pnpm", "yarn", "tsx", "python", "Python", "uv", "make") + SHELLS
 RUNNER_WORD = re.compile(r"^(verify|test|tests|run-tests|smoke|e2e|heavy|run-browser-checks|browser-checks)$")
 DEV_SERVERS = (
     ("storybook-dev", re.compile(r"(^|[\s/])(storybook\s+dev|start-storybook)(\s|$)")),
